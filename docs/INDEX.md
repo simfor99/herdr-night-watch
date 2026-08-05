@@ -1,0 +1,106 @@
+# Herdr-Nachtwächter - Wartungsdokumentation
+
+> **Produkt:** Herdr-Nachtwächter
+> **Status:** In Betrieb, Quellstand vom 2026-08-04
+> **Erstellt:** 2026-08-04
+> **Letztes Update:** 2026-08-04
+
+---
+
+## Warum dieses System?
+
+Wenn mehrere Herdr-Panes über Nacht offen bleiben, ist ein gewöhnlicher Windows-Shutdown zu grob: Er kann noch arbeitende Agenten unterbrechen. Umgekehrt ist es frustrierend, wenn ein eigentlich fertiger Rechner bis zum Morgen weiterläuft, weil niemand zuverlässig auf den Abschluss schaut. Entscheidend ist dabei nicht, ob irgendein Terminal offen ist, sondern ob Herdr aktuell noch Arbeit meldet.
+
+Der Herdr-Nachtwächter löst das mit einem absichtlich vorsichtigen Prinzip. Nach dem Start prüft er fortlaufend alle aktuell von Herdr gemeldeten Agenten. Erst wenn keiner mehr arbeitet und dieser Zustand über die Ruhezeit stabil bleibt, wird ein Shutdown vorbereitet. Bei Unklarheit - etwa bei `blocked`, `unknown`, fehlendem Status oder keiner verlässlichen Herdr-Antwort - wird nicht heruntergefahren. Das ist der „fail-closed“-Vertrag: Im Zweifel bleibt Windows an.
+
+Dadurch wird aus einem manuellen Nacht-Ritual eine überprüfbare Automatik. Die Tray-App macht den Zustand sichtbar und bietet Start, Stopp, Beobachtung und eine gefahrlose Demo. Der Hintergrundwächter bleibt davon getrennt, damit ein versehentlich geschlossenes Tray-Symbol keinen bereits kontrolliert laufenden Wächter beendet.
+
+| Vorher | Nachher |
+|---|---|
+| Offene Terminals waren kein brauchbares Signal für fertige Arbeit. | Alle aktuell von Herdr gemeldeten Agenten bestimmen den Nachtlauf. |
+| Ein Shutdown wäre bei einer Unsicherheit riskant gewesen. | Jede Unsicherheit verweigert den Shutdown. |
+| Prüfung und Bedienung erforderten sichtbare Konsolenfenster. | Die Tray-App steuert einen unsichtbaren, vom Task Scheduler überwachten Wächter. |
+
+## Was wir gebaut haben
+
+Beim Klick auf „Nachtmodus starten“ ruft die Windows-Tray-App ein PowerShell-Skript auf. Dieses bittet den WSL-Wächter, die aktive Herdr-Arbeit zu erfassen, und startet anschließend den Windows-Task „Herdr Night Watch“. Der Task startet über einen kleinen VBS-Starter den Python-Wächter ohne Konsolenfenster. Dieser prüft Herdr in festen Abständen, führt die Ruhezeit und setzt erst dann den Windows-Shutdown mit einer widerrufbaren Warnfrist an.
+
+Währenddessen fragt die Tray-App den WSL-Zustand etwa alle fünf Sekunden ab und färbt ihr Mond-Symbol passend ein. In der echten Warnphase erscheint ein Windows-Dialog: „Abbrechen“ ruft den Stopp-Pfad auf und hebt ausschließlich den vom Wächter selbst geplanten Shutdown auf. Die Demo folgt derselben sichtbaren Zustandsfolge, kann aber technisch niemals `shutdown.exe /s` ausführen.
+
+| Kernpunkt | Wert |
+|---|---|
+| Standard-Ruhezeit | 5 Sekunden |
+| Standard-Prüfintervall | 1 Sekunde |
+| Echte Warnfrist | 300 Sekunden |
+| Demo-Ruhezeit und -Warnfrist | 8 Sekunden und 15 Sekunden |
+| Windows-Task | `Herdr Night Watch` |
+| Sicherheitsprinzip | Bei Zweifel kein Shutdown |
+
+## Wie es zusammenhängt
+
+Dieses Projekt verbindet sich mit [Herdr](../../../.agents/skills/herdr/SKILL.md), weil der Wächter dessen Agentenstatus und Pane-Prozessdaten als Grundlage für seine Entscheidung verwendet. Ohne einen laufenden, kompatiblen Herdr-Server wird deshalb kein Nachtlauf scharfgestellt. Die Verbindung ist bewusst eng: Shell-Prozesse oder nicht als Herdr-Agent erfasste Arbeit werden nicht geraten oder interpretiert.
+
+Es verbindet sich außerdem mit dem Windows Task Scheduler und WSL. Windows besitzt die Herunterfahr-Funktion, WSL kennt Herdr und führt den Python-Wächter aus. Die VBS-Schicht zwischen Task Scheduler und `wsl.exe` ist kein Komfortdetail: Sie verhindert das früher beobachtete kurze Terminal-Popup. Die Tray-App ist separat, weil sie den Ablauf erklären und abbrechen soll, nicht aber die Sicherheitsentscheidung tragen darf.
+
+## Schlüsselentscheidungen
+
+### Aktuelle Herdr-Arbeit statt „alle offenen Panes“
+
+**Kontext:** Der Nachtlauf soll neue relevante Herdr-Arbeit berücksichtigen, aber sich nicht von beliebigen offenen Terminals leiten lassen.
+
+**Entscheidung:** Der Wächter fragt bei jeder Prüfung alle aktuell von Herdr gemeldeten Agenten ab. Nur wenn keiner `working` ist, kann die Ruhezeit laufen.
+
+**Konsequenzen:**
+
+- (+) Neue relevante Herdr-Arbeit wird automatisch berücksichtigt.
+- (-) Dauerhaft als `working` gemeldete Arbeit hält den Nachtlauf offen.
+- (~) Arbeit während der Warnfrist bricht nur den eigenen Countdown ab; danach wird automatisch weiter beobachtet.
+
+### Fail-closed bei Abweichungen
+
+**Kontext:** Ein fehlender oder unklarer Herdr-Status kann bedeuten, dass aktuelle Arbeit nicht eindeutig erkennbar ist.
+
+**Entscheidung:** Der Wächter verweigert den Shutdown bei `blocked`, `unknown`, fehlendem Status oder nicht erreichbarem Herdr.
+
+**Konsequenzen:**
+
+- (+) Die Automatik fährt nicht auf Basis einer Vermutung herunter.
+- (-) Manchmal bleibt der Rechner länger an als unbedingt nötig.
+- (~) Log und Status sind die erste Anlaufstelle, wenn ein Lauf mit `refused` endet.
+
+### Unsichtbarer Task statt sichtbarem WSL-Fenster
+
+**Kontext:** Ein direkt vom Task Scheduler gestartetes `wsl.exe` erzeugte sichtbare Windows-Terminal-Fenster.
+
+**Entscheidung:** Der Task ruft `wscript.exe` mit `Run-HerdrNightWatchHidden.vbs` auf; die Tray-App startet ihre Hilfsprozesse zusätzlich mit `CREATE_NO_WINDOW`.
+
+**Konsequenzen:**
+
+- (+) Der Hintergrundlauf bleibt im Hintergrund.
+- (-) Fehler sind nicht an einer Konsole sichtbar.
+- (~) Für Diagnose wird das Protokoll verwendet, nicht ein offenes Terminal.
+
+## Dokument-Map
+
+| # | Dokument | Zeilen | Inhalt |
+|---|---|---:|---|
+| 01 | [Systembild](01-systembild.md) | 80 | Komponenten, Pfade und Ablauf von Windows bis Herdr |
+| 02 | [Bedienung und Zustände](02-bedienung-und-zustaende.md) | 83 | Tray-Menü, Farben, Popup und Zustandsautomat |
+| 03 | [Betrieb und Fehlerdiagnose](03-betrieb-und-fehlerdiagnose.md) | 80 | Installation, Status, Protokoll und sichere Fehlerbehebung |
+| 04 | [Entwicklung und Test](04-entwicklung-und-test.md) | 79 | Änderungsregeln, Build, Auslieferung und Testmatrix |
+
+## Leseempfehlung
+
+**Zum Wieder-Einstieg:** Dieses Dokument, dann [Systembild](./01-systembild.md).
+
+**Für eine Bedienungsänderung:** [Bedienung und Zustände](./02-bedienung-und-zustaende.md).
+
+**Bei einem Fehler oder sichtbaren Popup:** [Betrieb und Fehlerdiagnose](./03-betrieb-und-fehlerdiagnose.md).
+
+**Vor einer Code- oder Installationsänderung:** [Entwicklung und Test](./04-entwicklung-und-test.md).
+
+## Änderungshistorie
+
+| Datum | Was |
+|---|---|
+| 2026-08-04 | Initiale Wartungsdokumentation aus dem geprüften Quellstand erstellt. |

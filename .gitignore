@@ -1,0 +1,21 @@
+# Rust build output
+/target/
+
+# Local runtime state and diagnostics
+*.jsonl
+*.log
+/.local/
+/.state/
+state/
+logs/
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+__pycache__/
+
+# Local packaging copies
+*.pdb
+*.msi

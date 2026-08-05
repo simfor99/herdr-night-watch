@@ -1,0 +1,23 @@
+[package]
+name = "herdr-night-watch"
+version = "0.1.0"
+edition = "2024"
+description = "Windows tray app and fail-closed watcher for Herdr agent work"
+license = "MIT"
+repository = "https://github.com/simfor99/herdr-night-watch"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+png = "0.17"
+tray-icon = "0.18"
+winit = "0.30"
+eframe = "0.35"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
