@@ -2,11 +2,11 @@
 param(
     [string]$TaskName = 'Herdr Night Watch',
     [string]$Distro = 'Ubuntu',
-    [string]$CodexHome = '/home/user/.codex'
+    [string]$WatcherPath = '/home/user/.codex/bin/herdr-night-watch.py'
 )
 
 $ErrorActionPreference = 'Stop'
-$watcher = "$CodexHome/bin/herdr-night-watch.py"
+$watcher = $WatcherPath
 $wsl = "$env:SystemRoot\System32\wsl.exe"
 
 if (-not (Test-Path $wsl)) {
@@ -17,6 +17,10 @@ if (-not (Test-Path $wsl)) {
 if ($LASTEXITCODE -ne 0) {
     throw "The watcher could not be started in WSL distro '$Distro'."
 }
+
+New-Item -Path 'HKCU:\Software\HerdrNachtwaechter' -Force | Out-Null
+New-ItemProperty -Path 'HKCU:\Software\HerdrNachtwaechter' -Name Distro -Value $Distro -PropertyType String -Force | Out-Null
+New-ItemProperty -Path 'HKCU:\Software\HerdrNachtwaechter' -Name WatcherPath -Value $WatcherPath -PropertyType String -Force | Out-Null
 
 $hiddenLauncher = Join-Path $PSScriptRoot 'Run-HerdrNightWatchHidden.vbs'
 if (-not (Test-Path $hiddenLauncher)) {

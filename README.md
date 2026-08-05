@@ -14,6 +14,17 @@ That handoff between “Herdr is finished” and “Windows may go to sleep” w
 
 The interface supports Deutsch and English. Change the language from the tray right-click menu under “Sprache / Language”.
 
+## Agent support and setup
+
+Herdr Night Watch is not tied to one coding agent. It works with Codex, Claude Code, or any other agent that Herdr can report. The only required integration is Herdr itself.
+
+Open **Open setup** from the tray right-click menu to set:
+
+- the name of your WSL distribution, for example `Ubuntu`;
+- the WSL path to `herdr-night-watch.py`.
+
+For a checkout of this repository, the path normally looks like `/home/your-name/projects/herdr-night-watch/watcher/herdr-night-watch.py`. The setup is stored locally in the Windows user registry and is never committed to Git.
+
 ## Live status
 
 ![Herdr Night Watch live status](docs/images/live-status-de.png)
@@ -32,8 +43,8 @@ The Python watcher lives at `watcher/herdr-night-watch.py`; its safety contract 
 ## Installation
 
 1. Set up WSL with a working Herdr CLI and an Ubuntu distribution.
-2. Adjust `-Distro` and `-CodexHome` in the Windows scripts for your WSL installation. `CodexHome` is the WSL path containing `watcher/herdr-night-watch.py`.
-3. Run `windows/Install-HerdrNightWatch.ps1` in PowerShell.
+2. Choose a WSL path for `watcher/herdr-night-watch.py`.
+3. Run `windows/Install-HerdrNightWatch.ps1 -Distro Ubuntu -WatcherPath '/home/your-name/projects/herdr-night-watch/watcher/herdr-night-watch.py'` in PowerShell. This creates the hidden scheduled watcher task and saves the same configuration locally.
 4. Start `dist/Herdr-Nachtwaechter.exe`.
 
 The EXE is a convenience artifact for Windows. For other architectures or after source changes, rebuild it from `src/`.

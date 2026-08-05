@@ -2,13 +2,13 @@
 param(
     [string]$TaskName = 'Herdr Night Watch',
     [string]$Distro = 'Ubuntu',
-    [string]$CodexHome = '/home/user/.codex',
+    [string]$WatcherPath = '/home/user/.codex/bin/herdr-night-watch.py',
     [string]$CancelSource = 'manual_stop_script'
 )
 
 $ErrorActionPreference = 'Stop'
 $wsl = "$env:SystemRoot\System32\wsl.exe"
-$watcher = "$CodexHome/bin/herdr-night-watch.py"
+$watcher = $WatcherPath
 
 & $wsl -d $Distro --exec /usr/bin/python3 $watcher --cancel --cancel-source $CancelSource
 if ($LASTEXITCODE -ne 0) {

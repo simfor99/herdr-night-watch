@@ -8,17 +8,23 @@ mod autostart;
 #[cfg(windows)]
 mod backend;
 #[cfg(windows)]
+mod configuration;
+#[cfg(windows)]
 mod language;
 #[cfg(windows)]
 mod live_status;
 #[cfg(windows)]
 mod notify;
 #[cfg(windows)]
+mod settings;
+#[cfg(windows)]
 mod tray;
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    if std::env::args().any(|argument| argument == "--live-status") {
+    if std::env::args().any(|argument| argument == "--settings") {
+        settings::run()
+    } else if std::env::args().any(|argument| argument == "--live-status") {
         live_status::run()
     } else {
         tray::run()

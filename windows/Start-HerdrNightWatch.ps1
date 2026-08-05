@@ -7,12 +7,12 @@ param(
     [int]$PollSeconds = 1,
     [string]$TaskName = 'Herdr Night Watch',
     [string]$Distro = 'Ubuntu',
-    [string]$CodexHome = '/home/user/.codex'
+    [string]$WatcherPath = '/home/user/.codex/bin/herdr-night-watch.py'
 )
 
 $ErrorActionPreference = 'Stop'
 $wsl = "$env:SystemRoot\System32\wsl.exe"
-$watcher = "$CodexHome/bin/herdr-night-watch.py"
+$watcher = $WatcherPath
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
 
 if ($task.State -eq 'Running') {

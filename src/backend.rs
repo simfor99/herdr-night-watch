@@ -1,11 +1,9 @@
+use crate::configuration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use std::env;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 
-const DEFAULT_DISTRO: &str = "Ubuntu";
-const DEFAULT_CODEX_HOME: &str = "/home/user/.codex";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,21 +134,8 @@ struct ShutdownWarning {
     reason: String,
 }
 
-fn distro() -> String {
-    env::var("HERDR_WSL_DISTRO").unwrap_or_else(|_| DEFAULT_DISTRO.to_string())
-}
-
-fn codex_home() -> String {
-    env::var("HERDR_CODEX_HOME").unwrap_or_else(|_| DEFAULT_CODEX_HOME.to_string())
-}
-
 fn watcher_path() -> String {
-    format!("{}/bin/herdr-night-watch.py", codex_home())
-}
-
-fn windows_script_path(script: &str) -> String {
-    let path = codex_home().trim_start_matches('/').replace('/', "\\");
-    format!(r"\\wsl.localhost\{}\{}\windows\{}", distro(), path, script)
+    configuration::load().watcher_path
 }
 
 fn wsl() -> Command {
@@ -158,7 +143,7 @@ fn wsl() -> Command {
     command
         .creation_flags(CREATE_NO_WINDOW)
         .arg("-d")
-        .arg(distro())
+        .arg(configuration::load().distro)
         .arg("--exec");
     command
 }
@@ -261,52 +246,60 @@ pub fn status() -> Result<WatchStatus> {
     })
 }
 
-fn run_powershell(script: &str, dry_run: bool) -> Result<()> {
-    let mut command = Command::new("powershell.exe");
-    command
-        .creation_flags(CREATE_NO_WINDOW)
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(windows_script_path(script));
-    if dry_run {
-        command.arg("-DryRun");
+pub fn start(observe_only: bool) -> Result<()> {
+    let mut command = wsl();
+    command.arg("/usr/bin/python3").arg(watcher_path()).args([
+        "--arm",
+        "--quiet-seconds",
+        "5",
+        "--poll-seconds",
+        "1",
+    ]);
+    if observe_only {
+        command.arg("--dry-run");
     }
-    command_output(command, "Herdr-Nachtwächter")?;
+    command_output(command, "Herdr night watch")?;
+    let status = Command::new("schtasks.exe")
+        .args(["/Run", "/TN", "Herdr Night Watch"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()?;
+    if !status.success() {
+        let _ = stop("scheduled_task_start_failed");
+        bail!("The watcher task is not installed. Run windows/Install-HerdrNightWatch.ps1 first.");
+    }
     Ok(())
 }
 
-pub fn start(observe_only: bool) -> Result<()> {
-    run_powershell("Start-HerdrNightWatch.ps1", observe_only)
-}
-
 pub fn demo() -> Result<()> {
-    let mut command = Command::new("powershell.exe");
+    let mut command = wsl();
     command
+        .arg("/usr/bin/python3")
+        .arg(watcher_path())
+        .arg("--demo");
+    command_output(command, "Herdr night watch demo")?;
+    let status = Command::new("schtasks.exe")
+        .args(["/Run", "/TN", "Herdr Night Watch"])
         .creation_flags(CREATE_NO_WINDOW)
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(windows_script_path("Start-HerdrNightWatch.ps1"))
-        .arg("-Demo");
-    command_output(command, "Herdr-Nachtwächter-Demo")?;
+        .status()?;
+    anyhow::ensure!(
+        status.success(),
+        "The watcher task is not installed. Run windows/Install-HerdrNightWatch.ps1 first."
+    );
     Ok(())
 }
 
 pub fn stop(source: &str) -> Result<()> {
-    let mut command = Command::new("powershell.exe");
-    command
+    let mut command = wsl();
+    command.arg("/usr/bin/python3").arg(watcher_path()).args([
+        "--cancel",
+        "--cancel-source",
+        source,
+    ]);
+    command_output(command, "Herdr night watch")?;
+    let _ = Command::new("schtasks.exe")
+        .args(["/End", "/TN", "Herdr Night Watch"])
         .creation_flags(CREATE_NO_WINDOW)
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(windows_script_path("Stop-HerdrNightWatch.ps1"))
-        .arg("-CancelSource")
-        .arg(source);
-    command_output(command, "Herdr-Nachtwächter")?;
+        .status();
     Ok(())
 }
 
@@ -379,7 +372,7 @@ pub fn warning_seconds(status: &WatchStatus) -> u64 {
 pub fn open_log() -> Result<()> {
     let path = format!(
         r"\\wsl.localhost\{}\home\user\.local\state\herdr-night-watch\watch.log",
-        distro()
+        configuration::load().distro
     );
     Command::new("notepad.exe")
         .arg(path)

@@ -3,8 +3,17 @@
 ' so the scheduler can supervise and restart that single background process.
 Option Explicit
 
-Dim shell, exitCode
+Dim shell, exitCode, distro, watcherPath, command
 Set shell = CreateObject("WScript.Shell")
 
-exitCode = shell.Run("""C:\WINDOWS\System32\wsl.exe"" -d Ubuntu --exec /usr/bin/python3 /home/user/.codex/bin/herdr-night-watch.py --watch", 0, True)
+On Error Resume Next
+distro = shell.RegRead("HKCU\Software\HerdrNachtwaechter\Distro")
+If Err.Number <> 0 Then distro = "Ubuntu"
+Err.Clear
+watcherPath = shell.RegRead("HKCU\Software\HerdrNachtwaechter\WatcherPath")
+If Err.Number <> 0 Then watcherPath = "/home/user/.codex/bin/herdr-night-watch.py"
+On Error GoTo 0
+
+command = """C:\WINDOWS\System32\wsl.exe"" -d """" & distro & """" --exec /usr/bin/python3 """" & watcherPath & """" --watch"
+exitCode = shell.Run(command, 0, True)
 WScript.Quit exitCode

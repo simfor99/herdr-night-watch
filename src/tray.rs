@@ -1,4 +1,4 @@
-use crate::{autostart, backend, language::Language, live_status, notify};
+use crate::{autostart, backend, language::Language, live_status, notify, settings};
 use anyhow::Result;
 use std::sync::mpsc;
 use std::thread;
@@ -20,6 +20,7 @@ const ID_AUTOSTART: &str = "autostart";
 const ID_QUIT: &str = "quit";
 const ID_LANGUAGE_DE: &str = "language_de";
 const ID_LANGUAGE_EN: &str = "language_en";
+const ID_SETTINGS: &str = "settings";
 
 #[derive(Clone, Copy)]
 struct Wake;
@@ -213,6 +214,7 @@ impl App {
             ID_LOG => backend::open_log(),
             ID_LIVE_STATUS => live_status::open(),
             ID_DEMO => backend::demo(),
+            ID_SETTINGS => settings::open(),
             ID_AUTOSTART => autostart::set_enabled(!autostart::enabled()),
             ID_LANGUAGE_DE => Language::German.set(),
             ID_LANGUAGE_EN => Language::English.set(),
@@ -239,6 +241,7 @@ impl App {
                 ID_LOG => "Protokoll geöffnet".into(),
                 ID_LIVE_STATUS => "Live-Status geöffnet".into(),
                 ID_DEMO => "Demo gestartet - kein Shutdown".into(),
+                ID_SETTINGS => "Einrichtung geöffnet".into(),
                 ID_AUTOSTART => "Autostart geändert".into(),
                 ID_LANGUAGE_DE => "Sprache auf Deutsch gesetzt".into(),
                 ID_LANGUAGE_EN => "Language set to English".into(),
@@ -337,6 +340,12 @@ fn menu_for(
     let _ = menu.append(&MenuItem::with_id(
         ID_LIVE_STATUS,
         language.text("Live-Status öffnen", "Open live status"),
+        true,
+        None,
+    ));
+    let _ = menu.append(&MenuItem::with_id(
+        ID_SETTINGS,
+        language.text("Einrichtung öffnen", "Open setup"),
         true,
         None,
     ));
