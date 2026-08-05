@@ -6,6 +6,12 @@ Die App steuert den robusten WSL-Hintergrundwächter, ersetzt ihn aber nicht.
 
 Dieses Repository enthält die Rust-Tray-App, den Python-Wächter, Windows-Skripte, Tests, Dokumentation und eine getestete Windows-EXE.
 
+## Warum dieses Tool existiert
+
+Wir lassen Herdr häufig über Nacht laufen, weil Compound-Engineering-Pläne sehr groß werden können. Sobald ein solcher Plan ausgeführt wird, arbeiten mehrere Agenten oft stundenlang selbstständig weiter. Der Rechner muss dafür aber nicht die ganze Nacht laufen: Wenn alle Arbeiten beendet sind, soll Windows zuverlässig in den Energiesparmodus wechseln oder herunterfahren.
+
+Genau diese Übergabe zwischen „Herdr ist fertig“ und „Windows darf schlafen gehen“ war vorher nicht zuverlässig gelöst. Der Herdr-Nachtwächter schließt diese Lücke: Er überwacht die Agenten fail-closed, zeigt den Zustand sichtbar an und führt die gewählte Energieaktion erst nach einer konfigurierbaren Warnfrist aus.
+
 Die Oberfläche unterstützt Deutsch und English. Die Sprache lässt sich im Tray-Rechtsklickmenü unter „Sprache / Language“ umstellen.
 
 ## Live-Status
