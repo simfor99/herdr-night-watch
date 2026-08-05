@@ -18,12 +18,44 @@ The interface supports Deutsch and English. Change the language from the tray ri
 
 Herdr Night Watch is not tied to one coding agent. It works with Codex, Claude Code, or any other agent that Herdr can report. The only required integration is Herdr itself.
 
+## How the pieces fit together
+
+Codex and Claude Code do the work. Herdr is the shared terminal runtime that knows whether their agents are still working, waiting, or finished. Herdr Night Watch does not read prompts, source code, or terminal output. It only asks Herdr for the current agent states and uses that answer to decide whether Windows may sleep.
+
+```text
+Codex / Claude Code / other coding agents
+                    |
+                    v
+        Herdr terminal runtime in WSL
+                    |
+                    v
+  herdr-night-watch.py checks agent states
+                    |
+                    +-- work remains -> keep watching
+                    +-- status uncertain -> do nothing (fail-closed)
+                    +-- all work complete -> visible warning period
+                                             |
+                                             v
+                                  Windows sleep or shutdown
+
+Windows tray app = configuration, live status, start/stop, and cancellation
+```
+
+The tray app never launches, stops, or controls Codex or Claude Code. It only watches the state Herdr reports. This is why one Night Watch installation can support mixed Herdr sessions, for example Codex and Claude Code working in parallel.
+
 Open **Open setup** from the tray right-click menu to set:
 
 - the name of your WSL distribution, for example `Ubuntu`;
 - the WSL path to `herdr-night-watch.py`.
 
 For a checkout of this repository, the path normally looks like `/home/your-name/projects/herdr-night-watch/watcher/herdr-night-watch.py`. The setup is stored locally in the Windows user registry and is never committed to Git.
+
+## Requirements
+
+- Windows with WSL installed;
+- a WSL distribution with Python 3 and the Herdr CLI available;
+- Codex, Claude Code, or another agent running inside Herdr when there is work to monitor;
+- the hidden Windows scheduled task installed once with `Install-HerdrNightWatch.ps1`.
 
 ## Live status
 
