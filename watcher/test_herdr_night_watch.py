@@ -24,6 +24,7 @@ def agent(pane_id: str, status: str | None) -> dict[str, object]:
 
 
 LIVE_STATE = {"demo": False, "monitoring_scope": "live_agents", "targets": []}
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class LiveScopeEvaluationTests(unittest.TestCase):
@@ -47,10 +48,19 @@ class LiveScopeEvaluationTests(unittest.TestCase):
     def test_unknown_or_missing_status_refuses_shutdown(self) -> None:
         result, _ = self.evaluate([agent("p1", "unknown")])
         self.assertEqual(result, "refuse")
-
         result, _ = self.evaluate([agent("p1", None)])
         self.assertEqual(result, "refuse")
 
+
+class WindowsLauncherTests(unittest.TestCase):
+    def test_scheduled_task_uses_the_powershell_launcher(self) -> None:
+        launcher = (PROJECT_ROOT / "windows" / "Run-HerdrNightWatchHidden.ps1").read_text()
+        installer = (PROJECT_ROOT / "windows" / "Install-HerdrNightWatch.ps1").read_text()
+
+        self.assertIn("& $wsl -d $distro --exec /usr/bin/python3 $watcherPath --watch", launcher)
+        self.assertIn("Run-HerdrNightWatchHidden.ps1", installer)
+        self.assertIn("WindowsPowerShell", installer)
+        self.assertNotIn("wscript.exe", installer)
 
 class CompletionActionTests(unittest.TestCase):
     def test_unknown_settings_fail_closed_to_shutdown(self) -> None:

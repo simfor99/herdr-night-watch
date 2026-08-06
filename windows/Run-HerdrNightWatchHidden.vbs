@@ -1,19 +1,11 @@
-' Starts the WSL watchdog without creating a visible console window.
-' This script is the Windows Task Scheduler action; it waits for the watcher
-' so the scheduler can supervise and restart that single background process.
+' Compatibility launcher for installations created before the PowerShell task action.
+' New installations run Run-HerdrNightWatchHidden.ps1 directly.
 Option Explicit
 
-Dim shell, exitCode, distro, watcherPath, command
+Dim shell, exitCode, launcher, powershell
 Set shell = CreateObject("WScript.Shell")
 
-On Error Resume Next
-distro = shell.RegRead("HKCU\Software\HerdrNachtwaechter\Distro")
-If Err.Number <> 0 Then distro = "Ubuntu"
-Err.Clear
-watcherPath = shell.RegRead("HKCU\Software\HerdrNachtwaechter\WatcherPath")
-If Err.Number <> 0 Then watcherPath = "/home/user/.codex/bin/herdr-night-watch.py"
-On Error GoTo 0
-
-command = """C:\WINDOWS\System32\wsl.exe"" -d """" & distro & """" --exec /usr/bin/python3 """" & watcherPath & """" --watch"
-exitCode = shell.Run(command, 0, True)
+launcher = Replace(WScript.ScriptFullName, ".vbs", ".ps1")
+powershell = shell.ExpandEnvironmentStrings("%SystemRoot%") & "\System32\WindowsPowerShell\v1.0\powershell.exe"
+exitCode = shell.Run("""" & powershell & """ -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File """" & launcher & """"", 0, True)
 WScript.Quit exitCode

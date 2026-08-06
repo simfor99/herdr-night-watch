@@ -26,7 +26,7 @@ Die Rust-Anwendung in diesem Projekt ist dagegen ein Controller. Sie bietet die 
 | Wächter | [`herdr-night-watch.py`](../watcher/herdr-night-watch.py) | Prüfung aller aktuellen Herdr-Agenten, Ruhezeit, Shutdown und Abbruch |
 | Windows-Skripte | [`windows/`](../windows/) | Installation, manuelle Diagnose und alternative PowerShell-Bedienung |
 | Task-Installation | [`Install-HerdrNightWatch.ps1`](../windows/Install-HerdrNightWatch.ps1) | Task `Herdr Night Watch` mit verborgenem Starter registrieren |
-| Verdeckter Starter | [`Run-HerdrNightWatchHidden.vbs`](../windows/Run-HerdrNightWatchHidden.vbs) | Startet WSL ohne sichtbare Konsole |
+| Verdeckter Starter | [`Run-HerdrNightWatchHidden.ps1`](../windows/Run-HerdrNightWatchHidden.ps1) | Startet WSL ohne sichtbare Konsole |
 
 ## Ablauf eines echten Nachtlaufs
 
@@ -44,7 +44,7 @@ WSL: herdr-night-watch.py schreibt active-run.json
 Task Scheduler: „Herdr Night Watch“
         |
         v
-wscript.exe -> Run-HerdrNightWatchHidden.vbs -> wsl.exe --watch
+powershell.exe -> Run-HerdrNightWatchHidden.ps1 -> wsl.exe --watch
         |
         v
 Wächter prüft aktuellen Herdr-Status, Ruhezeit und Warnfrist

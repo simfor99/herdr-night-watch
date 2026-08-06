@@ -22,11 +22,13 @@ New-Item -Path 'HKCU:\Software\HerdrNachtwaechter' -Force | Out-Null
 New-ItemProperty -Path 'HKCU:\Software\HerdrNachtwaechter' -Name Distro -Value $Distro -PropertyType String -Force | Out-Null
 New-ItemProperty -Path 'HKCU:\Software\HerdrNachtwaechter' -Name WatcherPath -Value $WatcherPath -PropertyType String -Force | Out-Null
 
-$hiddenLauncher = Join-Path $PSScriptRoot 'Run-HerdrNightWatchHidden.vbs'
+$hiddenLauncher = Join-Path $PSScriptRoot 'Run-HerdrNightWatchHidden.ps1'
 if (-not (Test-Path $hiddenLauncher)) {
     throw "The hidden watcher launcher is missing: $hiddenLauncher"
 }
-$action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" -Argument "`"$hiddenLauncher`""
+$action = New-ScheduledTaskAction `
+    -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$hiddenLauncher`""
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `

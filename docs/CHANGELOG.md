@@ -5,6 +5,16 @@
 
 ---
 
+## [2026-08-06] - Verdeckter Windows-Starter repariert
+
+### 🔧 Zuverlässigkeit
+
+- **Nachtlauf startet wieder wirklich** - Der Task Scheduler verwendet jetzt einen versteckten PowerShell-Starter statt einer fehleranfälligen VBS-Kette.
+- **Keine falschen Erfolgsmeldungen** - Ein scharfgestellter Lauf wird erst dann überwacht, wenn der Hintergrundstarter WSL tatsächlich erreicht.
+- **Regressionstest** - Der Test sichert, dass der Installationsskript weiterhin den PowerShell-Starter registriert.
+
+---
+
 ## [2026-08-05] - Sicherheitsfixes aus Code-Review
 
 ### 🔧 Sicherheit
