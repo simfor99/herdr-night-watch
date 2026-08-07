@@ -18,6 +18,8 @@ mod notify;
 #[cfg(windows)]
 mod settings;
 #[cfg(windows)]
+mod system_metrics;
+#[cfg(windows)]
 mod tray;
 
 #[cfg(windows)]

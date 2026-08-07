@@ -3,6 +3,16 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-07] - Systemwerte im Live-Status
+
+### 🎛️ Live-Überblick
+
+- **Schmale Systemzeile** - CPU, GPU, VRAM, RAM und der verfügbare Grafikkarten-Wattwert erscheinen als kleine Anzeige unter dem Herdr-Dashboard.
+- **Schnell lesbare Warnfarben** - Mittlere Auslastung wird pastellgelb, hohe Auslastung pastellrot. Das gilt auch für VRAM und GPU-Watt relativ zum Power-Limit.
+- **Noch weniger Text** - Das VRAM-Symbol trägt seine GPU-Kennzeichnung selbst; die Zeile zeigt nur noch Größe und Auslastung.
+- **Nur Anzeige** - Die Telemetrie läuft unabhängig vom Wächter und kann weder Ruhezeit, Warnfrist noch Energieaktion beeinflussen.
+- **Fail-safe bei fehlender Hardware** - Nicht verfügbare Werte werden als `—` angezeigt; insbesondere wird kein Wattwert erfunden, wenn Windows keinen Sensor meldet.
+
 ---
 
 ## [2026-08-06] - Verdeckter Windows-Starter repariert

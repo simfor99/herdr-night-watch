@@ -1,6 +1,7 @@
 use crate::{
     backend::{self, AgentSummary, CompletionAction, WatchStatus},
     language::Language,
+    system_metrics::{self, SystemMetrics},
 };
 use anyhow::{Context, Result};
 use eframe::egui;
@@ -16,6 +17,8 @@ const ACCENT_STRONG: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(74, 222, 128);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(251, 191, 36);
 const RED: egui::Color32 = egui::Color32::from_rgb(248, 113, 113);
+const PASTEL_YELLOW: egui::Color32 = egui::Color32::from_rgb(245, 210, 125);
+const PASTEL_RED: egui::Color32 = egui::Color32::from_rgb(242, 145, 150);
 const GRAY: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);
 const BG_TOP: egui::Color32 = egui::Color32::from_rgb(26, 34, 54);
@@ -36,8 +39,8 @@ pub fn open() -> Result<()> {
 pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 140.0])
-            .with_min_inner_size([390.0, 130.0])
+            .with_inner_size([400.0, 170.0])
+            .with_min_inner_size([390.0, 160.0])
             .with_title(match Language::current() {
                 Language::German => "Herdr-Nachtwächter - Live-Status",
                 Language::English => "Herdr Night Watch - Live Status",
@@ -73,12 +76,22 @@ struct LiveStatusApp {
     toast: Option<Toast>,
     warning_seconds_input: String,
     editing_warning_seconds: bool,
+    metrics_rx: Receiver<SystemMetrics>,
+    metrics: SystemMetrics,
 }
 
 impl LiveStatusApp {
     fn new() -> Self {
         let (status_tx, status_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
+        let (metrics_tx, metrics_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut sampler = system_metrics::Sampler::new();
+            loop {
+                let _ = metrics_tx.send(sampler.sample());
+                thread::sleep(Duration::from_secs(2));
+            }
+        });
         Self {
             language: Language::current(),
             status: WatchStatus::Off {
@@ -98,6 +111,8 @@ impl LiveStatusApp {
             toast: None,
             warning_seconds_input: "300".into(),
             editing_warning_seconds: false,
+            metrics_rx,
+            metrics: SystemMetrics::default(),
         }
     }
 
@@ -111,6 +126,12 @@ impl LiveStatusApp {
         thread::spawn(move || {
             let _ = sender.send(backend::status().map_err(|error| error.to_string()));
         });
+    }
+
+    fn collect_metrics(&mut self) {
+        while let Ok(metrics) = self.metrics_rx.try_recv() {
+            self.metrics = metrics;
+        }
     }
 
     fn collect_results(&mut self) {
@@ -230,6 +251,7 @@ impl eframe::App for LiveStatusApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         self.collect_results();
         self.collect_actions();
+        self.collect_metrics();
         self.refresh();
         paint_gradient(ui.painter(), ui.max_rect(), BG_TOP, BG_BOTTOM);
         egui::Frame::new()
@@ -337,6 +359,7 @@ impl eframe::App for LiveStatusApp {
                         });
                         ui.add_space(14.0);
                         ui.vertical(|ui| {
+                            ui.add_space(30.0);
                             let response = moon_icon(ui, moon.color, 66.0, gradient_rect)
                                 .on_hover_text(moon.tooltip);
                             if response.hovered() && !self.action_in_progress {
@@ -356,6 +379,8 @@ impl eframe::App for LiveStatusApp {
                         });
                     },
                 );
+                ui.add_space(6.0);
+                system_metrics_row(ui, self.metrics);
             });
         self.show_toast(ui.ctx());
         ui.ctx().request_repaint_after(Duration::from_millis(250));
@@ -635,6 +660,226 @@ fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32) {
         );
         ui.label(egui::RichText::new(label).small().color(GRAY));
     });
+}
+
+fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
+    let available = ui.available_width();
+    let spacing = 7.0;
+    let mut widths = [64.0, 64.0, 64.0, 88.0, 60.0];
+    let required = widths.iter().sum::<f32>() + spacing * 4.0;
+    if required > available {
+        let scale = ((available - spacing * 4.0) / widths.iter().sum::<f32>()).max(0.8);
+        widths.iter_mut().for_each(|width| *width *= scale);
+    }
+    let old_spacing = ui.spacing().item_spacing.x;
+    ui.spacing_mut().item_spacing.x = spacing;
+    ui.horizontal(|ui| {
+        system_metric_badge(
+            ui,
+            widths[0],
+            MetricIcon::Cpu,
+            "CPU",
+            metrics.cpu_percent.map(|value| format!("{value}%")),
+            metric_color(TEXT, metrics.cpu_percent),
+        );
+        system_metric_badge(
+            ui,
+            widths[1],
+            MetricIcon::Ram,
+            "RAM",
+            metrics.ram_percent.map(|value| format!("{value}%")),
+            metric_color(TEXT, metrics.ram_percent),
+        );
+        system_metric_badge(
+            ui,
+            widths[2],
+            MetricIcon::Gpu,
+            "GPU",
+            metrics.gpu_percent.map(|value| format!("{value}%")),
+            metric_color(ACCENT, metrics.gpu_percent),
+        );
+        system_metric_badge(
+            ui,
+            widths[3],
+            MetricIcon::Vram,
+            "",
+            metrics
+                .vram_used_bytes
+                .map(|bytes| format_vram(bytes, metrics.vram_percent)),
+            metric_color(ACCENT, metrics.vram_percent),
+        );
+        ui.add_space(5.0);
+        system_metric_badge(
+            ui,
+            widths[4],
+            MetricIcon::Power,
+            "",
+            metrics.gpu_watts.map(|value| format!("{value}W")),
+            metric_color(YELLOW, metrics.gpu_power_percent),
+        );
+    });
+    ui.spacing_mut().item_spacing.x = old_spacing;
+}
+
+fn metric_color(base: egui::Color32, usage: Option<u8>) -> egui::Color32 {
+    match usage {
+        Some(value) if value >= 80 => PASTEL_RED,
+        Some(value) if value >= 50 => PASTEL_YELLOW,
+        _ => base,
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1}G", bytes / GIB)
+    } else {
+        format!("{}M", (bytes / MIB).round() as u64)
+    }
+}
+
+fn format_vram(bytes: u64, percent: Option<u8>) -> String {
+    let size = format_bytes(bytes);
+    percent.map_or(size.clone(), |value| format!("{size} {value}%"))
+}
+
+#[derive(Clone, Copy)]
+enum MetricIcon {
+    Cpu,
+    Gpu,
+    Vram,
+    Ram,
+    Power,
+}
+
+fn system_metric_badge(
+    ui: &mut egui::Ui,
+    width: f32,
+    icon: MetricIcon,
+    label: &str,
+    value: Option<String>,
+    color: egui::Color32,
+) {
+    let tooltip = match value.as_deref() {
+        Some(value) if matches!(icon, MetricIcon::Vram) => format!("Belegter VRAM: {value}"),
+        Some(value) if label.is_empty() => format!("Grafikkartenverbrauch: {value}"),
+        Some(value) => format!("{label}-Auslastung: {value}"),
+        None if matches!(icon, MetricIcon::Vram) => {
+            "VRAM-Wert ist momentan nicht verfügbar.".into()
+        }
+        None if label.is_empty() => {
+            "Grafikkartenverbrauch ist für diese Hardware nicht verfügbar.".into()
+        }
+        None => format!("{label}-Wert ist momentan nicht verfügbar."),
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
+    draw_metric_icon(
+        ui.painter(),
+        icon,
+        egui::pos2(rect.left() + 7.0, rect.center().y),
+        color,
+    );
+    let value = value.unwrap_or_else(|| "—".into());
+    let text = if label.is_empty() {
+        value.clone()
+    } else {
+        format!("{label} {value}")
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + 17.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(11.0),
+        if value == "—" { GRAY } else { color },
+    );
+    response.on_hover_text(tooltip);
+}
+
+fn draw_metric_icon(
+    painter: &egui::Painter,
+    icon: MetricIcon,
+    center: egui::Pos2,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.1, color);
+    match icon {
+        MetricIcon::Cpu | MetricIcon::Vram | MetricIcon::Ram => {
+            let size = if matches!(icon, MetricIcon::Cpu) {
+                7.0
+            } else {
+                8.0
+            };
+            let body = egui::Rect::from_center_size(center, egui::vec2(size, size));
+            painter.rect_stroke(body, 1.2, stroke, egui::StrokeKind::Inside);
+            for offset in [-3.0, 0.0, 3.0] {
+                painter.line_segment(
+                    [
+                        egui::pos2(center.x + offset, center.y - 6.0),
+                        egui::pos2(center.x + offset, center.y - 4.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(center.x + offset, center.y + 4.0),
+                        egui::pos2(center.x + offset, center.y + 6.0),
+                    ],
+                    stroke,
+                );
+            }
+            if matches!(icon, MetricIcon::Vram) {
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "GPU",
+                    egui::FontId::proportional(4.5),
+                    color,
+                );
+            }
+        }
+        MetricIcon::Gpu => {
+            let body = egui::Rect::from_center_size(center, egui::vec2(10.0, 7.0));
+            painter.rect_stroke(body, 1.0, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 2.0, center.y - 2.0),
+                    egui::pos2(center.x + 2.0, center.y + 2.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x + 2.0, center.y - 2.0),
+                    egui::pos2(center.x - 2.0, center.y + 2.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x + 5.0, center.y - 2.0),
+                    egui::pos2(center.x + 7.0, center.y - 2.0),
+                ],
+                stroke,
+            );
+        }
+        MetricIcon::Power => {
+            let points = vec![
+                egui::pos2(center.x + 2.0, center.y - 7.0),
+                egui::pos2(center.x - 2.0, center.y - 1.0),
+                egui::pos2(center.x + 1.0, center.y - 1.0),
+                egui::pos2(center.x - 2.0, center.y + 7.0),
+                egui::pos2(center.x + 4.0, center.y - 2.0),
+                egui::pos2(center.x + 1.0, center.y - 2.0),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
 }
 
 fn divider(ui: &mut egui::Ui) {

@@ -36,6 +36,7 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - `diagnostics.jsonl` muss für jede relevante Zustandsänderung maschinenlesbare Ereignisse liefern und auf die letzten 500 Einträge begrenzt bleiben.
 - Eine neue Wächterinstanz darf erst nach Freigabe des Lock des Vorgängers prüfen.
 - Tooltip und Live-Fenster zeigen die aktuelle Herdr-Sicht; die Shutdown-Prüfung liest diesen Status unabhängig erneut.
+- Die Systemtelemetrie im Live-Fenster ist reine Anzeige. Fehler oder fehlende Werte dürfen den Wächter und seine Energieentscheidung nicht beeinflussen.
 
 ## Build und Auslieferung
 
@@ -69,7 +70,7 @@ Ein echter Windows-Shutdown wird nicht als automatischer Test ausgeführt. Die T
 | Änderung | Pflichtprüfung | Erfolgszeichen |
 |---|---|---|
 | Tray-Text, Menü oder Symbol | App starten, Menü und Tooltip ansehen | Kein zusätzliches Fenster, passende Menü-Sperren |
-| Live-Status | Mehrere Herdr-Agenten laufen lassen, Live-Status öffnen | Live-Zahl, großer Mond mit Hover-Hinweis sowie funktionierender Start- oder Stoppknopf sind sichtbar; Abschluss-Schalter und Sekundenfeld liegen rechts neben „Herdr jetzt“, speichern nur außerhalb eines aktiven Laufes; bei Warnfrist zeigt das Fenster einen roten Countdown; Fenster ist beweglich und schließbar |
+| Live-Status | Mehrere Herdr-Agenten laufen lassen, Live-Status öffnen | Live-Zahl, großer Mond mit Hover-Hinweis sowie funktionierender Start- oder Stoppknopf sind sichtbar; Abschluss-Schalter und Sekundenfeld liegen rechts neben „Herdr jetzt“, speichern nur außerhalb eines aktiven Laufes; bei Warnfrist zeigt das Fenster einen roten Countdown; die schmale Fußzeile zeigt CPU, GPU, belegten VRAM, RAM und einen verfügbaren Grafikkarten-Wattwert oder `—`; Fenster ist beweglich und schließbar |
 | WSL-/PowerShell-Start | Beobachtungsmodus mit echter Herdr-Arbeit | Task läuft, Status hat `monitoring_scope=live_agents`, kein Shutdown |
 | Warnfenster | `Demo: Abschluss simulieren` | Ruhezeit, rotes Symbol und Dialog sichtbar; Windows bleibt an |
 | Stopp-Pfad | Demo oder Beobachtung starten, dann Stopp | Task beendet, Log enthält `CANCELLED` oder Abschluss |

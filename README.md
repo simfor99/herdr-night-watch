@@ -68,6 +68,7 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 - **Stop and cancel shutdown**: ends the run and cancels only a pending shutdown scheduled by the watcher.
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.
 - **Open live status**: opens a freely movable status window that can be closed at any time. Left-clicking the tray icon opens it; right-clicking shows the menu.
+- The live-status footer gives a compact, informational view of CPU, RAM, GPU, occupied VRAM, and an available GPU power reading. Pastel yellow and red indicate medium and high utilization. Unsupported values show `—` and never affect the watcher.
 - **Start with Windows**: starts only the tray app when you log in. It does not automatically arm a night run.
 
 The Python watcher lives at `watcher/herdr-night-watch.py`; its safety contract remains authoritative.
