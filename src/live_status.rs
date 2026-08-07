@@ -63,6 +63,13 @@ pub fn run() -> Result<()> {
     .map_err(|error| anyhow::anyhow!("Live-Status-Fenster konnte nicht ausgeführt werden: {error}"))
 }
 
+fn live_title(language: Language) -> &'static str {
+    language.text(
+        "Herdr-Nachtwächter - Live-Status",
+        "Herdr Night Watch - Live Status",
+    )
+}
+
 struct LiveStatusApp {
     language: Language,
     status: WatchStatus,
@@ -183,18 +190,41 @@ impl LiveStatusApp {
             match result {
                 Ok(action) => {
                     let (message, color) = match action {
-                        NightAction::Start => ("Nachtmodus aktiv".into(), GREEN),
-                        NightAction::Stop => ("Nachtmodus deaktiviert".into(), GRAY),
-                        NightAction::SetCompletionAction(CompletionAction::Sleep) => {
-                            ("Energiesparmodus gewählt".into(), GREEN)
-                        }
-                        NightAction::SetCompletionAction(CompletionAction::Shutdown) => {
-                            ("Herunterfahren gewählt".into(), RED)
-                        }
+                        NightAction::Start => (
+                            self.language
+                                .text("Nachtmodus aktiv", "Night mode active")
+                                .into(),
+                            GREEN,
+                        ),
+                        NightAction::Stop => (
+                            self.language
+                                .text("Nachtmodus deaktiviert", "Night mode disabled")
+                                .into(),
+                            GRAY,
+                        ),
+                        NightAction::SetCompletionAction(CompletionAction::Sleep) => (
+                            self.language
+                                .text("Energiesparmodus gewählt", "Sleep selected")
+                                .into(),
+                            GREEN,
+                        ),
+                        NightAction::SetCompletionAction(CompletionAction::Shutdown) => (
+                            self.language
+                                .text("Herunterfahren gewählt", "Shutdown selected")
+                                .into(),
+                            RED,
+                        ),
                         NightAction::SetWarningSeconds(seconds) => {
                             self.warning_seconds_input = seconds.to_string();
                             self.editing_warning_seconds = false;
-                            (format!("Warnfrist auf {seconds} Sekunden gesetzt"), ACCENT)
+                            (
+                                format!(
+                                    "{} {seconds} {}",
+                                    self.language.text("Warnfrist auf", "Warning period set to"),
+                                    self.language.text("Sekunden gesetzt", "seconds"),
+                                ),
+                                ACCENT,
+                            )
                         }
                     };
                     self.toast = Some(Toast {
@@ -251,6 +281,13 @@ struct Toast {
 
 impl eframe::App for LiveStatusApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        let current_language = Language::current();
+        if current_language != self.language {
+            self.language = current_language;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(
+                live_title(current_language).into(),
+            ));
+        }
         self.collect_results();
         self.collect_actions();
         self.collect_metrics();
@@ -259,7 +296,12 @@ impl eframe::App for LiveStatusApp {
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(14, 14))
             .show(ui, |ui| {
-                let moon = moon_view(&self.status, self.pending_action, self.error.as_deref());
+                let moon = moon_view(
+                    &self.status,
+                    self.pending_action,
+                    self.error.as_deref(),
+                    self.language,
+                );
                 let action = action_for(&self.status);
                 let night_mode_active = night_mode_active(&self.status);
                 let display_completion_action = completion_action_for_display(&self.status, self.pending_action);
@@ -277,11 +319,20 @@ impl eframe::App for LiveStatusApp {
                                 ui.label(egui::RichText::new(self.language.text("Herdr jetzt", "Herdr now")).strong().color(ACCENT));
                                 ui.add_space(8.0);
                                 let switch_tooltip = if night_mode_active {
-                                    "Der Abschlussmodus ist für den laufenden Nachtmodus gespeichert.\nStopp den Nachtmodus, um ihn zu ändern."
+                                    self.language.text(
+                                        "Der Abschlussmodus ist für den laufenden Nachtmodus gespeichert.\nStopp den Nachtmodus, um ihn zu ändern.",
+                                        "The completion mode is saved for the active night run.\nStop the night run to change it.",
+                                    )
                                 } else if display_completion_action == CompletionAction::Sleep {
-                                    "Energiesparmodus nach Abschluss\nKlicken für Herunterfahren."
+                                    self.language.text(
+                                        "Energiesparmodus nach Abschluss\nKlicken für Herunterfahren.",
+                                        "Sleep after completion\nClick for shutdown.",
+                                    )
                                 } else {
-                                    "Herunterfahren nach Abschluss\nKlicken für Energiesparmodus."
+                                    self.language.text(
+                                        "Herunterfahren nach Abschluss\nKlicken für Energiesparmodus.",
+                                        "Shutdown after completion\nClick for sleep.",
+                                    )
                                 };
                                 let response = completion_switch(
                                     ui,
@@ -302,9 +353,15 @@ impl eframe::App for LiveStatusApp {
                                 );
                                 let seconds_response = seconds_response.on_hover_text(
                                     if night_mode_active {
-                                        "Die Warnfrist ist für den laufenden Nachtmodus gespeichert."
+                                        self.language.text(
+                                            "Die Warnfrist ist für den laufenden Nachtmodus gespeichert.",
+                                            "The warning period is saved for the active night run.",
+                                        )
                                     } else {
-                                        "Warnfrist in Sekunden für den nächsten Nachtmodus.\nErlaubt sind 10 bis 3.600 Sekunden."
+                                        self.language.text(
+                                            "Warnfrist in Sekunden für den nächsten Nachtmodus.\nErlaubt sind 10 bis 3.600 Sekunden.",
+                                            "Warning period in seconds for the next night run.\nAllowed: 10 to 3,600 seconds.",
+                                        )
                                     },
                                 );
                                 if seconds_response.has_focus() {
@@ -318,7 +375,11 @@ impl eframe::App for LiveStatusApp {
                                         }
                                         _ => {
                                             self.error = Some(
-                                                "Die Warnfrist muss zwischen 10 und 3.600 Sekunden liegen."
+                                                self.language
+                                                    .text(
+                                                        "Die Warnfrist muss zwischen 10 und 3.600 Sekunden liegen.",
+                                                        "The warning period must be between 10 and 3,600 seconds.",
+                                                    )
                                                     .into(),
                                             );
                                             self.warning_seconds_input =
@@ -351,9 +412,18 @@ impl eframe::App for LiveStatusApp {
                                         metric(ui, self.language.text("Fertig", "Finished"), agents.done, GRAY);
                                     });
                                 } else {
-                                    ui.colored_label(YELLOW, "Herdr ist gerade nicht erreichbar");
+                                    ui.colored_label(
+                                        YELLOW,
+                                        self.language.text(
+                                            "Herdr ist gerade nicht erreichbar",
+                                            "Herdr is currently unreachable",
+                                        ),
+                                    );
                                     ui.label(
-                                        egui::RichText::new("Es wird keine Zahl geschätzt.")
+                                        egui::RichText::new(self.language.text(
+                                            "Es wird keine Zahl geschätzt.",
+                                            "No number will be guessed.",
+                                        ))
                                             .color(GRAY),
                                     );
                                 }
@@ -382,7 +452,7 @@ impl eframe::App for LiveStatusApp {
                     },
                 );
                 ui.add_space(6.0);
-                system_metrics_row(ui, self.metrics);
+                system_metrics_row(ui, self.metrics, self.language);
             });
         self.show_toast(ui.ctx());
         ui.ctx().request_repaint_after(Duration::from_millis(250));
@@ -435,31 +505,52 @@ fn moon_view(
     status: &WatchStatus,
     pending_action: Option<NightAction>,
     error: Option<&str>,
+    language: Language,
 ) -> MoonView {
     if matches!(pending_action, Some(NightAction::Start)) {
         return MoonView {
             color: GREEN,
-            tooltip: "Nachtmodus wird aktiviert …\nBitte kurz warten.".into(),
+            tooltip: language
+                .text(
+                    "Nachtmodus wird aktiviert …\nBitte kurz warten.",
+                    "Night mode is being enabled …\nPlease wait.",
+                )
+                .into(),
         };
     }
     if matches!(pending_action, Some(NightAction::Stop)) {
         return MoonView {
             color: GRAY,
-            tooltip: "Nachtmodus wird deaktiviert …\nBitte kurz warten.".into(),
+            tooltip: language
+                .text(
+                    "Nachtmodus wird deaktiviert …\nBitte kurz warten.",
+                    "Night mode is being disabled …\nPlease wait.",
+                )
+                .into(),
         };
     }
     let (color, state, action) = match status {
         WatchStatus::Off { .. } => (
             PASTEL_YELLOW,
-            "Kein Nachtlauf aktiv",
-            "Klicken, um den Nachtmodus zu starten.",
+            language.text("Kein Nachtlauf aktiv", "No night run active"),
+            language.text(
+                "Klicken, um den Nachtmodus zu starten.",
+                "Click to start night mode.",
+            ),
         ),
         WatchStatus::Watching {
             observe_only,
             quiet,
             demo,
             ..
-        } if *demo => (ACCENT, "Demo läuft", "Klicken, um die Demo zu stoppen."),
+        } if *demo => (
+            ACCENT,
+            language.text("Demo läuft", "Demo running"),
+            language.text(
+                "Klicken, um die Demo zu stoppen.",
+                "Click to stop the demo.",
+            ),
+        ),
         WatchStatus::Watching {
             observe_only,
             quiet,
@@ -467,13 +558,22 @@ fn moon_view(
         } => (
             if *observe_only { ACCENT } else { GREEN },
             if *observe_only {
-                "Beobachtung aktiv - kein Shutdown"
+                language.text(
+                    "Beobachtung aktiv - kein Shutdown",
+                    "Observation active - no shutdown",
+                )
             } else if *quiet {
-                "Nachtmodus aktiv - Ruhezeit läuft"
+                language.text(
+                    "Nachtmodus aktiv - Ruhezeit läuft",
+                    "Night mode active - quiet period running",
+                )
             } else {
-                "Nachtmodus aktiv"
+                language.text("Nachtmodus aktiv", "Night mode active")
             },
-            "Klicken, um den Nachtlauf zu stoppen.",
+            language.text(
+                "Klicken, um den Nachtlauf zu stoppen.",
+                "Click to stop the night run.",
+            ),
         ),
         WatchStatus::ShutdownWarning {
             demo,
@@ -483,18 +583,30 @@ fn moon_view(
         } => (
             if *observe_only { ACCENT } else { PASTEL_ORANGE },
             if *observe_only {
-                "Beobachtung abgeschlossen - keine Windows-Aktion"
+                language.text(
+                    "Beobachtung abgeschlossen - keine Windows-Aktion",
+                    "Observation complete - no Windows action",
+                )
             } else if *network_triggered {
-                "Internet seit fünf Minuten nicht erreichbar - Warnung aktiv"
+                language.text(
+                    "Internet seit fünf Minuten nicht erreichbar - Warnung aktiv",
+                    "Internet unavailable for five minutes - warning active",
+                )
             } else if *demo {
-                "Demo-Warnung aktiv"
+                language.text("Demo-Warnung aktiv", "Demo warning active")
             } else {
-                "Shutdown-Warnung aktiv"
+                language.text("Shutdown-Warnung aktiv", "Shutdown warning active")
             },
             if *demo {
-                "Klicken, um die Demo zu stoppen."
+                language.text(
+                    "Klicken, um die Demo zu stoppen.",
+                    "Click to stop the demo.",
+                )
             } else {
-                "Klicken, um Countdown und Nachtlauf abzubrechen."
+                language.text(
+                    "Klicken, um Countdown und Nachtlauf abzubrechen.",
+                    "Click to cancel the countdown and night run.",
+                )
             },
         ),
         WatchStatus::Finished { outcome, .. } => (
@@ -504,11 +616,14 @@ fn moon_view(
                 PASTEL_YELLOW
             },
             if outcome.contains("confirmed") {
-                "Energieaktion wird ausgeführt"
+                language.text("Energieaktion wird ausgeführt", "Power action is executing")
             } else {
-                "Kein Nachtlauf aktiv"
+                language.text("Kein Nachtlauf aktiv", "No night run active")
             },
-            "Klicken, um den Nachtmodus zu starten.",
+            language.text(
+                "Klicken, um den Nachtmodus zu starten.",
+                "Click to start night mode.",
+            ),
         ),
     };
     let tooltip = if let Some(error) = error {
@@ -670,7 +785,7 @@ fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32) {
     });
 }
 
-fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
+fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Language) {
     let available = ui.available_width();
     let spacing = 7.0;
     let item_width = ((available - spacing * 4.0) / 5.0).max(52.0);
@@ -684,6 +799,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             "CPU",
             metrics.cpu_percent.map(|value| format!("{value:>2}%")),
             metric_color(metrics.cpu_percent),
+            language,
         );
         system_metric_badge(
             ui,
@@ -692,6 +808,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             "RAM",
             metrics.ram_percent.map(|value| format!("{value:>2}%")),
             metric_color(metrics.ram_percent),
+            language,
         );
         system_metric_badge(
             ui,
@@ -700,6 +817,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             "GPU",
             metrics.gpu_percent.map(|value| format!("{value:>2}%")),
             metric_color(metrics.gpu_percent),
+            language,
         );
         system_metric_badge(
             ui,
@@ -708,6 +826,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             "VRAM",
             metrics.vram_percent.map(|value| format!("{value:>2}%")),
             metric_color(metrics.vram_percent),
+            language,
         );
         system_metric_badge(
             ui,
@@ -716,6 +835,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             "",
             metrics.gpu_watts.map(|value| format!("{value:>3}W")),
             metric_color(metrics.gpu_power_percent),
+            language,
         );
     });
     ui.spacing_mut().item_spacing.x = old_spacing;
@@ -746,18 +866,43 @@ fn system_metric_badge(
     label: &str,
     value: Option<String>,
     color: egui::Color32,
+    language: Language,
 ) {
     let tooltip = match value.as_deref() {
-        Some(value) if matches!(icon, MetricIcon::Vram) => format!("Belegter VRAM: {value}"),
-        Some(value) if label.is_empty() => format!("Grafikkartenverbrauch: {value}"),
-        Some(value) => format!("{label}-Auslastung: {value}"),
-        None if matches!(icon, MetricIcon::Vram) => {
-            "VRAM-Wert ist momentan nicht verfügbar.".into()
+        Some(value) if matches!(icon, MetricIcon::Vram) => {
+            format!(
+                "{}{}",
+                language.text("VRAM-Auslastung: ", "VRAM utilization: "),
+                value
+            )
         }
-        None if label.is_empty() => {
-            "Grafikkartenverbrauch ist für diese Hardware nicht verfügbar.".into()
+        Some(value) if label.is_empty() => {
+            format!(
+                "{}{}",
+                language.text("Grafikkartenverbrauch: ", "GPU power draw: "),
+                value
+            )
         }
-        None => format!("{label}-Wert ist momentan nicht verfügbar."),
+        Some(value) => format!(
+            "{label} {}: {value}",
+            language.text("Auslastung", "utilization")
+        ),
+        None if matches!(icon, MetricIcon::Vram) => language
+            .text(
+                "VRAM-Wert ist momentan nicht verfügbar.",
+                "VRAM value is currently unavailable.",
+            )
+            .into(),
+        None if label.is_empty() => language
+            .text(
+                "Grafikkartenverbrauch ist für diese Hardware nicht verfügbar.",
+                "GPU power draw is unavailable on this hardware.",
+            )
+            .into(),
+        None => format!(
+            "{label} {}",
+            language.text("ist momentan nicht verfügbar.", "is currently unavailable.")
+        ),
     };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
     draw_metric_icon(
