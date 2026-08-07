@@ -119,6 +119,7 @@ struct LiveStatusApp {
     metrics: SystemMetrics,
     opacity: Option<u8>,
     window_level: window_settings::WindowLevel,
+    window_drag_started: bool,
 }
 
 impl LiveStatusApp {
@@ -156,6 +157,7 @@ impl LiveStatusApp {
             metrics: SystemMetrics::default(),
             opacity: None,
             window_level: window_settings::WindowLevel::current(),
+            window_drag_started: false,
         }
     }
 
@@ -544,9 +546,51 @@ impl eframe::App for LiveStatusApp {
                 );
                 ui.add_space(6.0);
                 system_metrics_row(ui, self.metrics, self.language);
-            });
+        });
         self.show_toast(ui.ctx());
+        handle_window_drag(self, ui);
         ui.ctx().request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
+    let rect = ui.max_rect();
+    let top_controls =
+        egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 86.0));
+    let moon = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - 130.0, rect.top() + 25.0),
+        egui::pos2(rect.right() - 5.0, rect.top() + 132.0),
+    );
+    let (origin, position, total_delta, primary_down) = ui.input(|input| {
+        (
+            input.pointer.press_origin(),
+            input.pointer.latest_pos(),
+            input.pointer.total_drag_delta(),
+            input.pointer.primary_down(),
+        )
+    });
+    if !primary_down {
+        app.window_drag_started = false;
+    }
+    let excluded_origin =
+        origin.is_some_and(|position| top_controls.contains(position) || moon.contains(position));
+    if primary_down
+        && !app.window_drag_started
+        && !excluded_origin
+        && total_delta.is_some_and(|delta| delta.length_sq() > 16.0)
+    {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        app.window_drag_started = true;
+    }
+    if let Some(position) = position {
+        let excluded = top_controls.contains(position) || moon.contains(position);
+        if !excluded {
+            ui.ctx().set_cursor_icon(if app.window_drag_started {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+        }
     }
 }
 
@@ -568,38 +612,6 @@ fn window_controls(
         .ctx()
         .pointer_hover_pos()
         .is_some_and(|position| hood_rect.contains(position));
-    let moon_exclusion = egui::Rect::from_min_max(
-        egui::pos2(rect.right() - 130.0, rect.top() + 25.0),
-        egui::pos2(rect.right() - 5.0, rect.top() + 132.0),
-    );
-    let drag_rects = [
-        egui::Rect::from_min_max(
-            rect.left_top(),
-            egui::pos2(rect.right(), moon_exclusion.top()),
-        ),
-        egui::Rect::from_min_max(
-            egui::pos2(rect.left(), moon_exclusion.top()),
-            egui::pos2(moon_exclusion.left(), moon_exclusion.bottom()),
-        ),
-        egui::Rect::from_min_max(
-            egui::pos2(moon_exclusion.right(), moon_exclusion.top()),
-            egui::pos2(rect.right(), moon_exclusion.bottom()),
-        ),
-        egui::Rect::from_min_max(
-            egui::pos2(rect.left(), moon_exclusion.bottom()),
-            rect.right_bottom(),
-        ),
-    ];
-    for (index, drag_rect) in drag_rects.into_iter().enumerate() {
-        let drag_response = ui.interact(
-            drag_rect,
-            ui.make_persistent_id(("live_window_drag", index)),
-            egui::Sense::drag(),
-        );
-        if drag_response.drag_started() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-    }
     if !visible {
         return (false, false, false, false);
     }
