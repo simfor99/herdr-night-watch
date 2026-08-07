@@ -116,7 +116,13 @@ impl eframe::App for LogApp {
             self.opacity = Some(current_opacity);
         }
 
-        paint_gradient(ui.painter(), ui.max_rect());
+        let window_rect = ui.max_rect();
+        paint_gradient(ui.painter(), window_rect);
+        let header_rect = egui::Rect::from_min_max(
+            egui::pos2(window_rect.left() + 1.0, window_rect.top() + 1.0),
+            egui::pos2(window_rect.right() - 1.0, window_rect.top() + 48.0),
+        );
+        glass_sheen(ui.painter(), header_rect);
         let (minimize, close) = window_controls(ui);
         if minimize {
             ui.ctx()
@@ -142,7 +148,7 @@ impl eframe::App for LogApp {
                     .color(GRAY),
                 );
                 ui.add_space(12.0);
-                let panel = egui::Frame::group(ui.style())
+                egui::Frame::group(ui.style())
                     .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10))
                     .stroke(egui::Stroke::new(
                         1.0,
@@ -171,7 +177,6 @@ impl eframe::App for LogApp {
                                 });
                         }
                     });
-                glass_sheen(ui.painter(), panel.response.rect);
             });
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
@@ -247,14 +252,7 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         egui::pos2(rect.right() - 68.0, rect.top() + 3.0),
         egui::pos2(rect.right() - 6.0, rect.top() + 29.0),
     );
-    let visible = ui
-        .ctx()
-        .pointer_hover_pos()
-        .is_some_and(|position| hood.contains(position));
-    let drag = egui::Rect::from_min_max(
-        rect.left_top(),
-        egui::pos2(hood.left() - 4.0, rect.top() + 14.0),
-    );
+    let drag = rect;
     if ui
         .interact(
             drag,
@@ -264,9 +262,6 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         .drag_started()
     {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-    }
-    if !visible {
-        return (false, false);
     }
     let minimize_rect = egui::Rect::from_min_max(
         egui::pos2(hood.left() + 2.0, hood.top()),
@@ -373,12 +368,14 @@ fn paint_gradient(painter: &egui::Painter, rect: egui::Rect) {
 }
 
 fn glass_sheen(painter: &egui::Painter, rect: egui::Rect) {
+    let inset = 12.0_f32.min(rect.width() / 4.0);
     let band_bottom = (rect.top() + rect.height() * 0.18).min(rect.bottom() - 1.0);
+    let band = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 1.0, rect.top() + 1.0),
+        egui::pos2(rect.right() - 1.0, band_bottom),
+    );
     painter.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 1.0, rect.top() + 1.0),
-            egui::pos2(rect.right() - 1.0, band_bottom),
-        ),
+        band,
         egui::CornerRadius {
             nw: 9,
             ne: 9,
@@ -386,6 +383,26 @@ fn glass_sheen(painter: &egui::Painter, rect: egui::Rect) {
             se: 0,
         },
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + inset, rect.top() + 1.5),
+            egui::pos2(rect.right() - inset, rect.top() + 1.5),
+        ],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+        ),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + inset + 8.0, rect.top() + 3.0),
+            egui::pos2(rect.right() - inset - 8.0, rect.top() + 3.0),
+        ],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+        ),
     );
 }
 
