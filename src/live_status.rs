@@ -555,11 +555,17 @@ impl eframe::App for LiveStatusApp {
 
 fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
     let rect = ui.max_rect();
-    let top_controls =
-        egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 86.0));
+    let completion_controls = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 92.0, rect.top() + 8.0),
+        egui::pos2(rect.right() - 136.0, rect.top() + 72.0),
+    );
     let moon = egui::Rect::from_min_max(
         egui::pos2(rect.right() - 130.0, rect.top() + 25.0),
         egui::pos2(rect.right() - 5.0, rect.top() + 132.0),
+    );
+    let control_hood = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - 150.0, rect.top()),
+        egui::pos2(rect.right(), rect.top() + 34.0),
     );
     let (origin, position, total_delta, primary_down) = ui.input(|input| {
         (
@@ -572,8 +578,11 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
     if !primary_down {
         app.window_drag_started = false;
     }
-    let excluded_origin =
-        origin.is_some_and(|position| top_controls.contains(position) || moon.contains(position));
+    let excluded_origin = origin.is_some_and(|position| {
+        completion_controls.contains(position)
+            || moon.contains(position)
+            || control_hood.contains(position)
+    });
     if primary_down
         && !app.window_drag_started
         && !excluded_origin
@@ -583,13 +592,11 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
         app.window_drag_started = true;
     }
     if let Some(position) = position {
-        let excluded = top_controls.contains(position) || moon.contains(position);
+        let excluded = completion_controls.contains(position)
+            || moon.contains(position)
+            || control_hood.contains(position);
         if !excluded {
-            ui.ctx().set_cursor_icon(if app.window_drag_started {
-                egui::CursorIcon::Grabbing
-            } else {
-                egui::CursorIcon::Grab
-            });
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
         }
     }
 }
