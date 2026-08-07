@@ -629,6 +629,10 @@ fn moon_icon(
     let center = rect.center();
     let radius = diameter / 2.0;
     let painter = ui.painter();
+    let halo_outer = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18);
+    let halo_inner = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 32);
+    painter.circle_filled(center, radius * 1.28, halo_outer);
+    painter.circle_filled(center, radius * 1.14, halo_inner);
     painter.circle_filled(center, radius, color);
     let cutout_center = egui::pos2(center.x + radius * 0.45, center.y - radius * 0.28);
     painter.circle_filled(

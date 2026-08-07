@@ -557,7 +557,7 @@ fn compact_status_line(status: &backend::WatchStatus, _language: Language) -> St
 
 fn icon_for(status: &backend::WatchStatus) -> Result<Icon> {
     let (red, green, blue) = match status {
-        backend::WatchStatus::Off { .. } | backend::WatchStatus::Finished { .. } => (105, 112, 124),
+        backend::WatchStatus::Off { .. } | backend::WatchStatus::Finished { .. } => (96, 165, 250),
         backend::WatchStatus::Watching {
             observe_only: true, ..
         } => (59, 130, 246),
