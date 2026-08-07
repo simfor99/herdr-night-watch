@@ -602,8 +602,8 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
     } else {
         egui::Color32::TRANSPARENT
     };
-    painter.rect_filled(minimize_rect, 0.0, minimize_fill);
-    painter.rect_filled(close_rect, 0.0, close_fill);
+    painter.rect_filled(minimize_rect, egui::CornerRadius::same(8), minimize_fill);
+    painter.rect_filled(close_rect, egui::CornerRadius::same(8), close_fill);
     let icon_color = if close_response.hovered() {
         egui::Color32::WHITE
     } else {
