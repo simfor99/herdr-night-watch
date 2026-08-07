@@ -46,8 +46,9 @@ pub fn open() -> Result<()> {
 pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 170.0])
-            .with_min_inner_size([390.0, 160.0])
+            .with_inner_size([400.0, 198.0])
+            .with_min_inner_size([390.0, 188.0])
+            .with_decorations(false)
             .with_window_level(window_level(window_settings::WindowLevel::current()))
             .with_title(match Language::current() {
                 Language::German => "Herdr-Nachtwächter - Live-Status",
@@ -338,6 +339,15 @@ impl eframe::App for LiveStatusApp {
         self.collect_metrics();
         self.refresh();
         paint_gradient(ui.painter(), ui.max_rect(), BG_TOP, BG_BOTTOM);
+        let (minimize_clicked, close_clicked) = window_controls(ui);
+        if minimize_clicked {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        if close_clicked {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(14, 14))
             .show(ui, |ui| {
@@ -502,6 +512,101 @@ impl eframe::App for LiveStatusApp {
         self.show_toast(ui.ctx());
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
+}
+
+fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
+    let width = ui.available_width();
+    let height = 32.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let painter = ui.painter();
+    let button_width = 30.0;
+    let gap = 1.0;
+    let hood_width = button_width * 2.0 + gap + 10.0;
+    let hood_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - hood_width, rect.top() + 2.0),
+        egui::pos2(rect.right() - 4.0, rect.bottom() - 2.0),
+    );
+    painter.rect_filled(
+        hood_rect,
+        egui::CornerRadius::same(10),
+        egui::Color32::from_rgba_unmultiplied(28, 29, 38, 220),
+    );
+    painter.rect_stroke(
+        hood_rect,
+        egui::CornerRadius::same(10),
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(66, 74, 98)),
+        egui::StrokeKind::Inside,
+    );
+    let close_rect = egui::Rect::from_min_max(
+        egui::pos2(hood_rect.right() - button_width - 2.0, hood_rect.top()),
+        egui::pos2(hood_rect.right() - 2.0, hood_rect.bottom()),
+    );
+    let minimize_rect = egui::Rect::from_min_max(
+        egui::pos2(close_rect.left() - gap - button_width, hood_rect.top()),
+        egui::pos2(close_rect.left() - gap, hood_rect.bottom()),
+    );
+    let drag_rect = egui::Rect::from_min_max(
+        rect.left_top(),
+        egui::pos2(hood_rect.left() - gap, rect.bottom()),
+    );
+    let drag_response = ui.interact(
+        drag_rect,
+        ui.make_persistent_id("live_window_drag"),
+        egui::Sense::drag(),
+    );
+    if drag_response.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+
+    let minimize_response = ui.interact(
+        minimize_rect,
+        ui.make_persistent_id("live_window_minimize"),
+        egui::Sense::click(),
+    );
+    let close_response = ui.interact(
+        close_rect,
+        ui.make_persistent_id("live_window_close"),
+        egui::Sense::click(),
+    );
+    let minimize_fill = if minimize_response.hovered() {
+        egui::Color32::from_rgb(52, 54, 66)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let close_fill = if close_response.hovered() {
+        egui::Color32::from_rgb(190, 65, 78)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect_filled(minimize_rect, 0.0, minimize_fill);
+    painter.rect_filled(close_rect, 0.0, close_fill);
+    let icon_color = if close_response.hovered() {
+        egui::Color32::WHITE
+    } else {
+        GRAY
+    };
+    painter.line_segment(
+        [
+            egui::pos2(minimize_rect.left() + 11.0, minimize_rect.center().y + 4.0),
+            egui::pos2(minimize_rect.right() - 11.0, minimize_rect.center().y + 4.0),
+        ],
+        egui::Stroke::new(1.2, icon_color),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(close_rect.left() + 11.0, close_rect.top() + 10.0),
+            egui::pos2(close_rect.right() - 11.0, close_rect.bottom() - 10.0),
+        ],
+        egui::Stroke::new(1.2, icon_color),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(close_rect.right() - 11.0, close_rect.top() + 10.0),
+            egui::pos2(close_rect.left() + 11.0, close_rect.bottom() - 10.0),
+        ],
+        egui::Stroke::new(1.2, icon_color),
+    );
+    (minimize_response.clicked(), close_response.clicked())
 }
 
 fn countdown_seconds(status: &WatchStatus) -> Option<u64> {
