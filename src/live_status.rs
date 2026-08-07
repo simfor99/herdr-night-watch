@@ -698,7 +698,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             ui,
             item_width,
             MetricIcon::Vram,
-            "",
+            "VRAM",
             metrics.vram_percent.map(|value| format!("{value:>2}%")),
             metric_color(metrics.vram_percent),
         );
