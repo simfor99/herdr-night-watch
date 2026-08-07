@@ -3,6 +3,19 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-07] - Live-Fenster und öffentliche Oberfläche
+
+### 🪟 Bedienung
+
+- **Fenster beim Start öffnen** - Eine gespeicherte Tray-Option öffnet das Live-Fenster automatisch; standardmäßig bleibt die App weiterhin Tray-only.
+- **Verschieben ohne Fummelei** - Zahlenkarten, Kopfzeile und Systemzeile lassen sich mit dem normalen Mauszeiger verschieben. Nur echte Bedienelemente bleiben klickbar.
+- **Abschlussprotokoll im gleichen Stil** - Das Protokoll zeigt die letzten 30 Energieaktionen in einem frei verschiebbaren Fenster mit dauerhaft sichtbaren Minimieren- und Schließen-Schaltflächen.
+
+### 🌍 Veröffentlichung
+
+- **Bilinguale Oberfläche** - Das Abschlussprotokoll übersetzt jetzt auch Lauf-ID und Lesefehler zwischen Deutsch und Englisch.
+- **Aktuelle Screenshots** - Die README verwendet die aktuelle deutsche und englische Live-Status-Ansicht.
+
 ## [2026-08-07] - Systemwerte im Live-Status
 
 ### 🎛️ Live-Überblick
