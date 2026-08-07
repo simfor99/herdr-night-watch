@@ -4,6 +4,7 @@ use winreg::enums::HKEY_CURRENT_USER;
 const KEY: &str = r"Software\HerdrNachtwaechter";
 const OPACITY_VALUE: &str = "WindowOpacity";
 const LEVEL_VALUE: &str = "WindowLevel";
+const LIVE_STATUS_START_VALUE: &str = "OpenLiveStatusOnStartup";
 
 pub const OPACITY_VALUES: [u8; 10] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
 
@@ -69,5 +70,19 @@ pub fn set_opacity(value: u8) -> anyhow::Result<()> {
     };
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
     key.set_value(OPACITY_VALUE, &u32::from(value))?;
+    Ok(())
+}
+
+pub fn live_status_on_start() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .and_then(|key| key.get_value::<u32, _>(LIVE_STATUS_START_VALUE))
+        .map(|value| value != 0)
+        .unwrap_or(false)
+}
+
+pub fn set_live_status_on_start(enabled: bool) -> anyhow::Result<()> {
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
+    key.set_value(LIVE_STATUS_START_VALUE, &u32::from(enabled))?;
     Ok(())
 }

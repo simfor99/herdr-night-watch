@@ -72,6 +72,7 @@ The live window is intentionally compact: Herdr counts and the night-mode contro
 - **Stop and cancel shutdown**: ends the run and cancels only a pending shutdown scheduled by the watcher.
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.
 - **Open live status**: opens a freely movable status window that can be closed at any time. Left-clicking the tray icon opens it; right-clicking shows the menu.
+- **Open live window at startup**: optionally reopen the live status window automatically whenever the tray app starts. The default remains tray-only until you enable this option.
 - **Completion log**: the live window's upper-right log button opens a read-only view of the last 30 requested sleep and shutdown actions.
 - **Window settings**: choose opacity from 100% (opaque) to 10% in 10-point steps. The upper-right live-window control cycles normal, always-on-top, and always-in-background placement. These settings are stored locally and can be changed while the live window is open.
 - The live-status footer gives a compact, informational view of CPU, RAM, GPU, occupied VRAM, and an available GPU power reading. Pastel yellow and red indicate medium and high utilization. Unsupported values show `—` and never affect the watcher.

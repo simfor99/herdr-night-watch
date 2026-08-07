@@ -17,6 +17,7 @@ const ID_OBSERVE: &str = "observe";
 const ID_STOP: &str = "stop";
 const ID_LOG: &str = "log";
 const ID_LIVE_STATUS: &str = "live_status";
+const ID_LIVE_STATUS_ON_START: &str = "live_status_on_start";
 const ID_DEMO: &str = "demo";
 const ID_AUTOSTART: &str = "autostart";
 const ID_QUIT: &str = "quit";
@@ -72,6 +73,9 @@ pub fn run() -> Result<()> {
         )))
         .with_menu_on_left_click(false)
         .build()?;
+    if window_settings::live_status_on_start() {
+        let _ = live_status::open();
+    }
     let mut app = App {
         language,
         tray: Some(tray),
@@ -185,12 +189,13 @@ impl App {
 
     fn render(&mut self) {
         let view = format!(
-            "{:?}|{:?}|{}|{}|{:?}",
+            "{:?}|{:?}|{}|{}|{:?}|{}",
             self.status,
             self.message,
             autostart::enabled(),
             window_settings::opacity(),
             window_settings::WindowLevel::current(),
+            window_settings::live_status_on_start(),
         );
         if view == self.last_view {
             return;
@@ -221,6 +226,9 @@ impl App {
             ID_STOP => backend::stop("tray_menu"),
             ID_LOG => backend::open_log(),
             ID_LIVE_STATUS => live_status::open(),
+            ID_LIVE_STATUS_ON_START => {
+                window_settings::set_live_status_on_start(!window_settings::live_status_on_start())
+            }
             ID_DEMO => backend::demo(),
             ID_SETTINGS => settings::open(),
             ID_AUTOSTART => autostart::set_enabled(!autostart::enabled()),
@@ -256,6 +264,13 @@ impl App {
                 ID_STOP => "Nachtmodus gestoppt".into(),
                 ID_LOG => "Protokoll geöffnet".into(),
                 ID_LIVE_STATUS => "Live-Status geöffnet".into(),
+                ID_LIVE_STATUS_ON_START => self
+                    .language
+                    .text(
+                        "Live-Fenster-Start geändert",
+                        "Live-window startup setting changed",
+                    )
+                    .into(),
                 ID_DEMO => "Demo gestartet - kein Shutdown".into(),
                 ID_SETTINGS => "Einrichtung geöffnet".into(),
                 ID_AUTOSTART => "Autostart geändert".into(),
@@ -383,6 +398,16 @@ fn menu_for(
         ID_LIVE_STATUS,
         language.text("Live-Status öffnen", "Open live status"),
         true,
+        None,
+    ));
+    let _ = menu.append(&CheckMenuItem::with_id(
+        ID_LIVE_STATUS_ON_START,
+        language.text(
+            "Live-Fenster beim Start öffnen",
+            "Open live window at startup",
+        ),
+        true,
+        window_settings::live_status_on_start(),
         None,
     ));
     let _ = menu.append(&MenuItem::with_id(
