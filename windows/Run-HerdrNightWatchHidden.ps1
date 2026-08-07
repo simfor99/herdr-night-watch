@@ -9,5 +9,11 @@ $distro = if ($settings.Distro) { [string]$settings.Distro } else { 'Ubuntu' }
 $watcherPath = if ($settings.WatcherPath) { [string]$settings.WatcherPath } else { '/home/user/.codex/bin/herdr-night-watch.py' }
 $wsl = "$env:SystemRoot\System32\wsl.exe"
 
-& $wsl -d $distro --exec /usr/bin/python3 $watcherPath --watch
-exit $LASTEXITCODE
+$process = Start-Process `
+    -FilePath $wsl `
+    -ArgumentList @('-d', $distro, '--exec', '/usr/bin/python3', $watcherPath, '--watch') `
+    -NoNewWindow `
+    -Wait `
+    -PassThru
+
+exit $process.ExitCode

@@ -57,7 +57,9 @@ class WindowsLauncherTests(unittest.TestCase):
         launcher = (PROJECT_ROOT / "windows" / "Run-HerdrNightWatchHidden.ps1").read_text()
         installer = (PROJECT_ROOT / "windows" / "Install-HerdrNightWatch.ps1").read_text()
 
-        self.assertIn("& $wsl -d $distro --exec /usr/bin/python3 $watcherPath --watch", launcher)
+        self.assertIn("Start-Process", launcher)
+        self.assertIn("-NoNewWindow", launcher)
+        self.assertIn("'/usr/bin/python3'", launcher)
         self.assertIn("Run-HerdrNightWatchHidden.ps1", installer)
         self.assertIn("WindowsPowerShell", installer)
         self.assertNotIn("wscript.exe", installer)
