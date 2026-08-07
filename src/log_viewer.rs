@@ -276,6 +276,7 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         egui::CornerRadius::same(10),
         egui::Color32::from_rgba_unmultiplied(28, 29, 38, 220),
     );
+    glass_sheen(ui.painter(), hood);
     let minimize = ui.interact(
         minimize_rect,
         ui.make_persistent_id("log_window_minimize"),
