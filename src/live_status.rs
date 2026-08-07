@@ -665,7 +665,7 @@ fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32) {
 fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
     let available = ui.available_width();
     let spacing = 7.0;
-    let mut widths = [64.0, 64.0, 64.0, 88.0, 60.0];
+    let mut widths = [64.0, 64.0, 64.0, 72.0, 60.0];
     let required = widths.iter().sum::<f32>() + spacing * 4.0;
     if required > available {
         let scale = ((available - spacing * 4.0) / widths.iter().sum::<f32>()).max(0.8);
@@ -708,14 +708,13 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
                 .map(|bytes| format_vram(bytes, metrics.vram_percent)),
             metric_color(ACCENT, metrics.vram_percent),
         );
-        ui.add_space(5.0);
         system_metric_badge(
             ui,
             widths[4],
             MetricIcon::Power,
             "",
             metrics.gpu_watts.map(|value| format!("{value}W")),
-            metric_color(YELLOW, metrics.gpu_power_percent),
+            metric_color(PASTEL_YELLOW, metrics.gpu_power_percent),
         );
     });
     ui.spacing_mut().item_spacing.x = old_spacing;
@@ -723,8 +722,8 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
 
 fn metric_color(base: egui::Color32, usage: Option<u8>) -> egui::Color32 {
     match usage {
-        Some(value) if value >= 80 => PASTEL_RED,
-        Some(value) if value >= 50 => PASTEL_YELLOW,
+        Some(value) if value >= 75 => PASTEL_RED,
+        Some(value) if value >= 40 => PASTEL_YELLOW,
         _ => base,
     }
 }
