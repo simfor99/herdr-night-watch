@@ -84,17 +84,25 @@ struct LogApp {
 
 impl LogApp {
     fn new() -> Self {
+        let language = Language::current();
         match load_entries() {
             Ok(entries) => Self {
-                language: Language::current(),
+                language,
                 entries,
                 error: None,
                 opacity: None,
             },
-            Err(error) => Self {
-                language: Language::current(),
+            Err(_) => Self {
+                language,
                 entries: Vec::new(),
-                error: Some(error.to_string()),
+                error: Some(
+                    language
+                        .text(
+                            "Abschlussprotokoll konnte nicht gelesen werden.",
+                            "The completion log could not be read.",
+                        )
+                        .to_owned(),
+                ),
                 opacity: None,
             },
         }
@@ -221,9 +229,13 @@ fn log_entry_row(ui: &mut egui::Ui, entry: &LogEntry, language: Language) {
         ui.colored_label(GRAY, localized_trigger(&entry.trigger, language));
     });
     ui.label(
-        egui::RichText::new(format!("Lauf-ID: {}", entry.run_id))
-            .small()
-            .color(GRAY),
+        egui::RichText::new(format!(
+            "{}: {}",
+            language.text("Lauf-ID", "Run ID"),
+            entry.run_id
+        ))
+        .small()
+        .color(GRAY),
     );
 }
 
