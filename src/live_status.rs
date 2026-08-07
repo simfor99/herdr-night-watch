@@ -524,12 +524,10 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         egui::pos2(rect.right() - hood_width, rect.top() + 2.0),
         egui::pos2(rect.right() - 4.0, rect.top() + 28.0),
     );
-    let hover_response = ui.interact(
-        hood_rect,
-        ui.make_persistent_id("live_window_controls_hover"),
-        egui::Sense::hover(),
-    );
-    let visible = hover_response.hovered();
+    let visible = ui
+        .ctx()
+        .pointer_hover_pos()
+        .is_some_and(|position| hood_rect.contains(position));
     let moon_exclusion = egui::Rect::from_min_max(
         egui::pos2(rect.right() - 130.0, rect.top() + 25.0),
         egui::pos2(rect.right() - 5.0, rect.top() + 132.0),
