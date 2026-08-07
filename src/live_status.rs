@@ -556,9 +556,13 @@ impl eframe::App for LiveStatusApp {
 
 fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
     let rect = ui.max_rect();
-    let completion_controls = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 88.0, rect.top() + 8.0),
-        egui::pos2(rect.left() + 258.0, rect.top() + 58.0),
+    let completion_switch = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 86.0, rect.top() + 12.0),
+        egui::pos2(rect.left() + 168.0, rect.top() + 50.0),
+    );
+    let warning_seconds = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 176.0, rect.top() + 12.0),
+        egui::pos2(rect.left() + 244.0, rect.top() + 50.0),
     );
     let moon = egui::Rect::from_min_max(
         egui::pos2(rect.right() - 104.0, rect.top() + 40.0),
@@ -568,6 +572,12 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
         egui::pos2(rect.right() - 138.0, rect.top() + 1.0),
         egui::pos2(rect.right() - 3.0, rect.top() + 30.0),
     );
+    let is_excluded = |position: egui::Pos2| {
+        completion_switch.contains(position)
+            || warning_seconds.contains(position)
+            || moon.contains(position)
+            || control_hood.contains(position)
+    };
     let (origin, position, total_delta, primary_down) = ui.input(|input| {
         (
             input.pointer.press_origin(),
@@ -579,11 +589,7 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
     if !primary_down {
         app.window_drag_started = false;
     }
-    let excluded_origin = origin.is_some_and(|position| {
-        completion_controls.contains(position)
-            || moon.contains(position)
-            || control_hood.contains(position)
-    });
+    let excluded_origin = origin.is_some_and(is_excluded);
     if primary_down
         && !app.window_drag_started
         && !excluded_origin
@@ -592,13 +598,10 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         app.window_drag_started = true;
     }
-    if let Some(position) = position {
-        let excluded = completion_controls.contains(position)
-            || moon.contains(position)
-            || control_hood.contains(position);
-        if !excluded {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-        }
+    if let Some(position) = position
+        && !is_excluded(position)
+    {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
     }
 }
 
