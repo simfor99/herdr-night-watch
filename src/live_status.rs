@@ -556,16 +556,16 @@ impl eframe::App for LiveStatusApp {
 fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
     let rect = ui.max_rect();
     let completion_controls = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 92.0, rect.top() + 8.0),
-        egui::pos2(rect.right() - 136.0, rect.top() + 72.0),
+        egui::pos2(rect.left() + 88.0, rect.top() + 8.0),
+        egui::pos2(rect.left() + 258.0, rect.top() + 58.0),
     );
     let moon = egui::Rect::from_min_max(
-        egui::pos2(rect.right() - 130.0, rect.top() + 25.0),
-        egui::pos2(rect.right() - 5.0, rect.top() + 132.0),
+        egui::pos2(rect.right() - 104.0, rect.top() + 40.0),
+        egui::pos2(rect.right() - 38.0, rect.top() + 106.0),
     );
     let control_hood = egui::Rect::from_min_max(
-        egui::pos2(rect.right() - 150.0, rect.top()),
-        egui::pos2(rect.right(), rect.top() + 34.0),
+        egui::pos2(rect.right() - 138.0, rect.top() + 1.0),
+        egui::pos2(rect.right() - 3.0, rect.top() + 30.0),
     );
     let (origin, position, total_delta, primary_down) = ui.input(|input| {
         (
