@@ -1,44 +1,33 @@
 use anyhow::{Context, Result};
-use std::os::windows::process::CommandExt;
-use std::process::Command;
+use winreg::RegKey;
+use winreg::enums::HKEY_CURRENT_USER;
 
-const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "HerdrNightWatchTray";
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub fn enabled() -> bool {
-    let mut command = Command::new("reg.exe");
-    command
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["query", RUN_KEY, "/v", VALUE_NAME]);
-    command.output().is_ok_and(|output| output.status.success())
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(RUN_KEY)
+        .and_then(|key| key.get_value::<String, _>(VALUE_NAME))
+        .is_ok()
 }
 
 pub fn set_enabled(on: bool) -> Result<()> {
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
     if on {
         let exe = std::env::current_exe().context("Programmdatei konnte nicht bestimmt werden")?;
         let command = format!("\"{}\"", exe.display());
-        let mut registry = Command::new("reg.exe");
-        registry.creation_flags(CREATE_NO_WINDOW).args([
-            "add", RUN_KEY, "/v", VALUE_NAME, "/t", "REG_SZ", "/d", &command, "/f",
-        ]);
-        let status = registry
-            .status()
+        let (key, _) = current_user
+            .create_subkey(RUN_KEY)
             .context("Autostart konnte nicht eingerichtet werden")?;
-        if !status.success() {
-            anyhow::bail!("Autostart konnte nicht eingerichtet werden")
-        }
+        key.set_value(VALUE_NAME, &command)
+            .context("Autostart konnte nicht eingerichtet werden")?;
     } else {
-        let mut registry = Command::new("reg.exe");
-        registry
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["delete", RUN_KEY, "/v", VALUE_NAME, "/f"]);
-        let status = registry
-            .status()
+        let key = current_user
+            .open_subkey_with_flags(RUN_KEY, winreg::enums::KEY_WRITE)
             .context("Autostart konnte nicht entfernt werden")?;
-        if !status.success() {
-            anyhow::bail!("Autostart konnte nicht entfernt werden")
-        }
+        key.delete_value(VALUE_NAME)
+            .context("Autostart konnte nicht entfernt werden")?;
     }
     Ok(())
 }

@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
-use std::os::windows::process::CommandExt;
-use std::process::Command;
+use winreg::RegKey;
+use winreg::enums::HKEY_CURRENT_USER;
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const KEY: &str = r"HKCU\Software\HerdrNachtwaechter";
+const KEY: &str = r"Software\HerdrNachtwaechter";
 const DEFAULT_DISTRO: &str = "Ubuntu";
 const DEFAULT_WATCHER_PATH: &str = "/home/user/.codex/bin/herdr-night-watch.py";
 
@@ -14,24 +13,10 @@ pub struct Configuration {
 }
 
 fn value(name: &str) -> Option<String> {
-    let output = Command::new("reg.exe")
-        .args(["query", KEY, "/v", name])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            if fields.len() >= 3 && fields[0].eq_ignore_ascii_case(name) {
-                Some(fields[2..].join(" "))
-            } else {
-                None
-            }
-        })
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .and_then(|key| key.get_value(name))
+        .ok()
 }
 
 pub fn load() -> Configuration {
@@ -53,16 +38,15 @@ pub fn load() -> Configuration {
 }
 
 pub fn save(configuration: &Configuration) -> Result<()> {
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+        .create_subkey(KEY)
+        .context("configuration could not be saved")?;
     for (name, value) in [
         ("Distro", &configuration.distro),
         ("WatcherPath", &configuration.watcher_path),
     ] {
-        let status = Command::new("reg.exe")
-            .args(["add", KEY, "/v", name, "/t", "REG_SZ", "/d", value, "/f"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
+        key.set_value(name, value)
             .context("configuration could not be saved")?;
-        anyhow::ensure!(status.success(), "configuration could not be saved");
     }
     Ok(())
 }

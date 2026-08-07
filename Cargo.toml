@@ -16,6 +16,9 @@ winit = "0.30"
 eframe = "0.35"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

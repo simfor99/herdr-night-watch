@@ -74,6 +74,11 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertNotIn("schtasks.exe", start_body)
         self.assertNotIn("schtasks.exe", demo_body)
 
+    def test_tray_never_spawns_reg_exe(self) -> None:
+        sources = "\n".join(path.read_text() for path in (PROJECT_ROOT / "src").glob("*.rs"))
+
+        self.assertNotIn('Command::new("reg.exe")', sources)
+
 class CompletionActionTests(unittest.TestCase):
     def test_unknown_settings_fail_closed_to_shutdown(self) -> None:
         self.assertEqual(WATCHER.completion_action("sleep"), "sleep")

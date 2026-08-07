@@ -1,8 +1,7 @@
-use std::os::windows::process::CommandExt;
-use std::process::Command;
+use winreg::RegKey;
+use winreg::enums::HKEY_CURRENT_USER;
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const KEY: &str = r"HKCU\Software\HerdrNachtwaechter";
+const KEY: &str = r"Software\HerdrNachtwaechter";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Language {
@@ -12,15 +11,10 @@ pub enum Language {
 
 impl Language {
     pub fn current() -> Self {
-        let output = Command::new("reg.exe")
-            .args(["query", KEY, "/v", "Language"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        if output.ok().is_some_and(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|line| line.trim().to_ascii_lowercase().ends_with(" en"))
-        }) {
+        let value = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(KEY)
+            .and_then(|key| key.get_value::<String, _>("Language"));
+        if value.is_ok_and(|value| value.eq_ignore_ascii_case("en")) {
             Self::English
         } else {
             Self::German
@@ -31,13 +25,8 @@ impl Language {
             Self::German => "de",
             Self::English => "en",
         };
-        let status = Command::new("reg.exe")
-            .args([
-                "add", KEY, "/v", "Language", "/t", "REG_SZ", "/d", value, "/f",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()?;
-        anyhow::ensure!(status.success(), "language setting could not be saved");
+        let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
+        key.set_value("Language", &value)?;
         Ok(())
     }
     pub fn text(self, german: &'static str, english: &'static str) -> &'static str {
