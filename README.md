@@ -1,6 +1,6 @@
 # Herdr Night Watch
 
-A small Windows tray app for the existing fail-closed Herdr night watcher.
+A small Windows tray app, live Herdr dashboard, and lightweight Windows system monitor for the existing fail-closed Herdr night watcher.
 
 The app controls the robust WSL background watcher; it does not replace it.
 
@@ -12,7 +12,7 @@ We often let Herdr run overnight because Compound Engineering plans can become v
 
 That handoff between “Herdr is finished” and “Windows may go to sleep” was not reliably solved before. Herdr Night Watch closes that gap: it monitors the agents fail-closed, makes the current state visible, and performs the selected power action only after a configurable warning period.
 
-The interface supports Deutsch and English. Change the language from the tray right-click menu under “Sprache / Language”.
+The interface supports Deutsch and English. Change the language from the tray right-click menu under “Sprache / Language”. The live window also provides a compact system monitor for CPU, RAM, GPU, occupied VRAM, and NVIDIA GPU power use.
 
 ## Agent support and setup
 
@@ -59,9 +59,11 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 
 ## Live status
 
-![Herdr Night Watch live status](docs/images/live-status-de.png)
+![Herdr Night Watch live status in German](docs/images/live-status-de-latest.png)
 
-The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer provides a quick hardware glance without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed.
+![Herdr Night Watch live status in English](docs/images/live-status-en-latest.png)
+
+The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer turns it into a quick system monitor without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed. The tray menu lets you choose window opacity from 100% down to 10%, plus normal, always-on-top, or always-in-background window placement.
 
 ## Usage
 
@@ -70,6 +72,7 @@ The live window is intentionally compact: Herdr counts and the night-mode contro
 - **Stop and cancel shutdown**: ends the run and cancels only a pending shutdown scheduled by the watcher.
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.
 - **Open live status**: opens a freely movable status window that can be closed at any time. Left-clicking the tray icon opens it; right-clicking shows the menu.
+- **Window settings**: choose opacity from 100% (opaque) to 10% in 10-point steps and choose normal, always-on-top, or always-in-background placement. These settings are stored locally and can be changed while the live window is open.
 - The live-status footer gives a compact, informational view of CPU, RAM, GPU, occupied VRAM, and an available GPU power reading. Pastel yellow and red indicate medium and high utilization. Unsupported values show `—` and never affect the watcher.
 - **Start with Windows**: starts only the tray app when you log in. It does not automatically arm a night run.
 

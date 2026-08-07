@@ -1,4 +1,6 @@
-use crate::{autostart, backend, language::Language, live_status, notify, settings};
+use crate::{
+    autostart, backend, language::Language, live_status, notify, settings, window_settings,
+};
 use anyhow::Result;
 use std::sync::mpsc;
 use std::thread;
@@ -21,6 +23,10 @@ const ID_QUIT: &str = "quit";
 const ID_LANGUAGE_DE: &str = "language_de";
 const ID_LANGUAGE_EN: &str = "language_en";
 const ID_SETTINGS: &str = "settings";
+const ID_WINDOW_OPACITY_PREFIX: &str = "window_opacity_";
+const ID_WINDOW_LEVEL_NORMAL: &str = "window_level_normal";
+const ID_WINDOW_LEVEL_TOP: &str = "window_level_top";
+const ID_WINDOW_LEVEL_BOTTOM: &str = "window_level_bottom";
 
 #[derive(Clone, Copy)]
 struct Wake;
@@ -179,10 +185,12 @@ impl App {
 
     fn render(&mut self) {
         let view = format!(
-            "{:?}|{:?}|{}",
+            "{:?}|{:?}|{}|{}|{:?}",
             self.status,
             self.message,
-            autostart::enabled()
+            autostart::enabled(),
+            window_settings::opacity(),
+            window_settings::WindowLevel::current(),
         );
         if view == self.last_view {
             return;
@@ -218,6 +226,14 @@ impl App {
             ID_AUTOSTART => autostart::set_enabled(!autostart::enabled()),
             ID_LANGUAGE_DE => Language::German.set(),
             ID_LANGUAGE_EN => Language::English.set(),
+            ID_WINDOW_LEVEL_NORMAL => window_settings::WindowLevel::Normal.set(),
+            ID_WINDOW_LEVEL_TOP => window_settings::WindowLevel::AlwaysOnTop.set(),
+            ID_WINDOW_LEVEL_BOTTOM => window_settings::WindowLevel::AlwaysOnBottom.set(),
+            action if action.starts_with(ID_WINDOW_OPACITY_PREFIX) => action
+                .trim_start_matches(ID_WINDOW_OPACITY_PREFIX)
+                .parse::<u8>()
+                .map_err(|error| anyhow::anyhow!("invalid opacity value: {error}"))
+                .and_then(window_settings::set_opacity),
             ID_QUIT => {
                 if matches!(
                     self.status,
@@ -245,6 +261,32 @@ impl App {
                 ID_AUTOSTART => "Autostart geändert".into(),
                 ID_LANGUAGE_DE => "Sprache auf Deutsch gesetzt".into(),
                 ID_LANGUAGE_EN => "Language set to English".into(),
+                ID_WINDOW_LEVEL_NORMAL => self
+                    .language
+                    .text(
+                        "Fenster auf normale Ebene gesetzt",
+                        "Window set to normal level",
+                    )
+                    .into(),
+                ID_WINDOW_LEVEL_TOP => self
+                    .language
+                    .text("Fenster bleibt im Vordergrund", "Window stays on top")
+                    .into(),
+                ID_WINDOW_LEVEL_BOTTOM => self
+                    .language
+                    .text(
+                        "Fenster bleibt im Hintergrund",
+                        "Window stays in background",
+                    )
+                    .into(),
+                action if action.starts_with(ID_WINDOW_OPACITY_PREFIX) => {
+                    let value = action.trim_start_matches(ID_WINDOW_OPACITY_PREFIX);
+                    if self.language == Language::German {
+                        format!("Fenstertransparenz auf {value} % gesetzt")
+                    } else {
+                        format!("Window opacity set to {value}%")
+                    }
+                }
                 _ => String::new(),
             }),
             Err(error) => Some(format!("Fehler: {error}")),
@@ -349,6 +391,55 @@ fn menu_for(
         true,
         None,
     ));
+    let window_submenu = Submenu::new(
+        language.text("Fenstereinstellungen", "Window settings"),
+        true,
+    );
+    let opacity_submenu = Submenu::new(language.text("Fenstertransparenz", "Window opacity"), true);
+    let current_opacity = window_settings::opacity();
+    for value in window_settings::OPACITY_VALUES {
+        let id = format!("{ID_WINDOW_OPACITY_PREFIX}{value}");
+        let label = if value == 100 {
+            language
+                .text("100 % (deckend)", "100% (opaque)")
+                .to_string()
+        } else {
+            format!("{value} %")
+        };
+        let _ = opacity_submenu.append(&CheckMenuItem::with_id(
+            id,
+            label,
+            true,
+            value == current_opacity,
+            None,
+        ));
+    }
+    let _ = window_submenu.append(&opacity_submenu);
+    let level_submenu = Submenu::new(language.text("Fensterebene", "Window level"), true);
+    let current_level = window_settings::WindowLevel::current();
+    let _ = level_submenu.append(&CheckMenuItem::with_id(
+        ID_WINDOW_LEVEL_NORMAL,
+        language.text("Normal", "Normal"),
+        true,
+        current_level == window_settings::WindowLevel::Normal,
+        None,
+    ));
+    let _ = level_submenu.append(&CheckMenuItem::with_id(
+        ID_WINDOW_LEVEL_TOP,
+        language.text("Immer im Vordergrund", "Always on top"),
+        true,
+        current_level == window_settings::WindowLevel::AlwaysOnTop,
+        None,
+    ));
+    let _ = level_submenu.append(&CheckMenuItem::with_id(
+        ID_WINDOW_LEVEL_BOTTOM,
+        language.text("Immer im Hintergrund", "Always in background"),
+        true,
+        current_level == window_settings::WindowLevel::AlwaysOnBottom,
+        None,
+    ));
+    let _ = window_submenu.append(&level_submenu);
+    let _ = menu.append(&window_submenu);
     let _ = menu.append(&MenuItem::with_id(
         ID_LOG,
         language.text("Protokoll öffnen", "Open log"),

@@ -2,6 +2,7 @@ use crate::{
     backend::{self, AgentSummary, CompletionAction, WatchStatus},
     language::Language,
     system_metrics::{self, SystemMetrics},
+    window_settings,
 };
 use anyhow::{Context, Result};
 use eframe::egui;
@@ -10,6 +11,10 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, GWL_EXSTYLE, GetWindowLongW, LWA_ALPHA, SetLayeredWindowAttributes,
+    SetWindowLongW, WS_EX_LAYERED,
+};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
@@ -43,6 +48,7 @@ pub fn run() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([400.0, 170.0])
             .with_min_inner_size([390.0, 160.0])
+            .with_window_level(window_level(window_settings::WindowLevel::current()))
             .with_title(match Language::current() {
                 Language::German => "Herdr-Nachtwächter - Live-Status",
                 Language::English => "Herdr Night Watch - Live Status",
@@ -70,6 +76,28 @@ fn live_title(language: Language) -> &'static str {
     )
 }
 
+fn window_level(level: window_settings::WindowLevel) -> egui::WindowLevel {
+    match level {
+        window_settings::WindowLevel::Normal => egui::WindowLevel::Normal,
+        window_settings::WindowLevel::AlwaysOnTop => egui::WindowLevel::AlwaysOnTop,
+        window_settings::WindowLevel::AlwaysOnBottom => egui::WindowLevel::AlwaysOnBottom,
+    }
+}
+
+fn apply_window_opacity(opacity: u8, title: &str) {
+    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED as i32);
+        let alpha = ((u16::from(opacity) * 255 + 50) / 100) as u8;
+        let _ = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+    }
+}
+
 struct LiveStatusApp {
     language: Language,
     status: WatchStatus,
@@ -87,6 +115,8 @@ struct LiveStatusApp {
     editing_warning_seconds: bool,
     metrics_rx: Receiver<SystemMetrics>,
     metrics: SystemMetrics,
+    opacity: Option<u8>,
+    window_level: window_settings::WindowLevel,
 }
 
 impl LiveStatusApp {
@@ -122,6 +152,8 @@ impl LiveStatusApp {
             editing_warning_seconds: false,
             metrics_rx,
             metrics: SystemMetrics::default(),
+            opacity: None,
+            window_level: window_settings::WindowLevel::current(),
         }
     }
 
@@ -287,6 +319,19 @@ impl eframe::App for LiveStatusApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(
                 live_title(current_language).into(),
             ));
+        }
+        let current_opacity = window_settings::opacity();
+        if self.opacity != Some(current_opacity) {
+            apply_window_opacity(current_opacity, live_title(self.language));
+            self.opacity = Some(current_opacity);
+        }
+        let current_window_level = window_settings::WindowLevel::current();
+        if current_window_level != self.window_level {
+            self.window_level = current_window_level;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
+                    current_window_level,
+                )));
         }
         self.collect_results();
         self.collect_actions();
