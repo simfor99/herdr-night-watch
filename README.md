@@ -55,7 +55,7 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 - Windows with WSL installed;
 - a WSL distribution with Python 3 and the Herdr CLI available;
 - Codex, Claude Code, or another agent running inside Herdr when there is work to monitor;
-- the hidden Windows scheduled task installed once with `Install-HerdrNightWatch.ps1`.
+- the Herdr Night Watch tray app running while a night run is active.
 
 ## Live status
 
@@ -76,8 +76,8 @@ The Python watcher lives at `watcher/herdr-night-watch.py`; its safety contract 
 
 1. Set up WSL with a working Herdr CLI and an Ubuntu distribution.
 2. Choose a WSL path for `watcher/herdr-night-watch.py`.
-3. Run `windows/Install-HerdrNightWatch.ps1 -Distro Ubuntu -WatcherPath '/home/your-name/projects/herdr-night-watch/watcher/herdr-night-watch.py'` in PowerShell. This creates the hidden scheduled watcher task and saves the same configuration locally.
-4. Start `dist/Herdr-Nachtwaechter.exe`.
+3. Start `dist/Herdr-Nachtwaechter.exe` and open **Open setup** from its tray menu.
+4. Enter the WSL distribution and watcher path, then start a night mode from the tray app.
 
 The EXE is a convenience artifact for Windows. For other architectures or after source changes, rebuild it from `src/`.
 

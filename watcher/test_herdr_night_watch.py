@@ -64,6 +64,16 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertIn("WindowsPowerShell", installer)
         self.assertNotIn("wscript.exe", installer)
 
+    def test_tray_starts_the_watcher_without_a_scheduled_task(self) -> None:
+        backend = (PROJECT_ROOT / "src" / "backend.rs").read_text()
+
+        start_body = backend[backend.index("pub fn start"):backend.index("pub fn demo")]
+        demo_body = backend[backend.index("pub fn demo"):backend.index("pub fn stop")]
+        self.assertIn("spawn_watcher()", start_body)
+        self.assertIn("spawn_watcher()", demo_body)
+        self.assertNotIn("schtasks.exe", start_body)
+        self.assertNotIn("schtasks.exe", demo_body)
+
 class CompletionActionTests(unittest.TestCase):
     def test_unknown_settings_fail_closed_to_shutdown(self) -> None:
         self.assertEqual(WATCHER.completion_action("sleep"), "sleep")

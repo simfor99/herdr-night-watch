@@ -2,7 +2,7 @@ use crate::configuration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::os::windows::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -166,6 +166,21 @@ fn command_output(mut command: Command, label: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn spawn_watcher() -> Result<()> {
+    let mut command = wsl();
+    command
+        .arg("/usr/bin/python3")
+        .arg(watcher_path())
+        .arg("--watch")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+        .spawn()
+        .context("Herdr-Hintergrundwächter konnte nicht gestartet werden")?;
+    Ok(())
+}
+
 pub fn status() -> Result<WatchStatus> {
     let mut command = wsl();
     command
@@ -259,13 +274,9 @@ pub fn start(observe_only: bool) -> Result<()> {
         command.arg("--dry-run");
     }
     command_output(command, "Herdr night watch")?;
-    let status = Command::new("schtasks.exe")
-        .args(["/Run", "/TN", "Herdr Night Watch"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()?;
-    if !status.success() {
+    if let Err(error) = spawn_watcher() {
         let _ = stop("scheduled_task_start_failed");
-        bail!("The watcher task is not installed. Run windows/Install-HerdrNightWatch.ps1 first.");
+        return Err(error);
     }
     Ok(())
 }
@@ -277,14 +288,7 @@ pub fn demo() -> Result<()> {
         .arg(watcher_path())
         .arg("--demo");
     command_output(command, "Herdr night watch demo")?;
-    let status = Command::new("schtasks.exe")
-        .args(["/Run", "/TN", "Herdr Night Watch"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()?;
-    anyhow::ensure!(
-        status.success(),
-        "The watcher task is not installed. Run windows/Install-HerdrNightWatch.ps1 first."
-    );
+    spawn_watcher()?;
     Ok(())
 }
 
@@ -296,10 +300,6 @@ pub fn stop(source: &str) -> Result<()> {
         source,
     ]);
     command_output(command, "Herdr night watch")?;
-    let _ = Command::new("schtasks.exe")
-        .args(["/End", "/TN", "Herdr Night Watch"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
     Ok(())
 }
 
