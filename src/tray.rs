@@ -557,13 +557,17 @@ fn compact_status_line(status: &backend::WatchStatus, _language: Language) -> St
 
 fn icon_for(status: &backend::WatchStatus) -> Result<Icon> {
     let (red, green, blue) = match status {
-        backend::WatchStatus::Off { .. } | backend::WatchStatus::Finished { .. } => (96, 165, 250),
+        backend::WatchStatus::Off { .. } => (96, 165, 250),
         backend::WatchStatus::Watching {
             observe_only: true, ..
         } => (59, 130, 246),
         backend::WatchStatus::Watching { quiet: true, .. } => (245, 158, 11),
         backend::WatchStatus::Watching { .. } => (34, 197, 94),
-        backend::WatchStatus::ShutdownWarning { .. } => (239, 68, 68),
+        backend::WatchStatus::ShutdownWarning { .. } => (248, 177, 110),
+        backend::WatchStatus::Finished { outcome, .. } if outcome.contains("confirmed") => {
+            (242, 145, 150)
+        }
+        backend::WatchStatus::Finished { .. } => (96, 165, 250),
     };
     let bytes = include_bytes!("../assets/material-bedtime-32.png");
     let decoder = png::Decoder::new(bytes.as_slice());

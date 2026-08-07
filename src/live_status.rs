@@ -20,6 +20,7 @@ const RED: egui::Color32 = egui::Color32::from_rgb(248, 113, 113);
 const PASTEL_GREEN: egui::Color32 = egui::Color32::from_rgb(125, 220, 170);
 const PASTEL_YELLOW: egui::Color32 = egui::Color32::from_rgb(245, 210, 125);
 const PASTEL_RED: egui::Color32 = egui::Color32::from_rgb(242, 145, 150);
+const PASTEL_ORANGE: egui::Color32 = egui::Color32::from_rgb(248, 177, 110);
 const GRAY: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);
 const BG_TOP: egui::Color32 = egui::Color32::from_rgb(26, 34, 54);
@@ -361,7 +362,7 @@ impl eframe::App for LiveStatusApp {
                         ui.add_space(14.0);
                         ui.vertical(|ui| {
                             ui.add_space(30.0);
-                            let response = moon_icon(ui, moon.color, 66.0, gradient_rect)
+                            let response = moon_icon(ui, moon.color, 59.5, gradient_rect)
                                 .on_hover_text(moon.tooltip);
                             if response.hovered() && !self.action_in_progress {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -449,7 +450,7 @@ fn moon_view(
     }
     let (color, state, action) = match status {
         WatchStatus::Off { .. } => (
-            GRAY,
+            PASTEL_YELLOW,
             "Kein Nachtlauf aktiv",
             "Klicken, um den Nachtmodus zu starten.",
         ),
@@ -464,13 +465,7 @@ fn moon_view(
             quiet,
             ..
         } => (
-            if *observe_only {
-                ACCENT
-            } else if *quiet {
-                YELLOW
-            } else {
-                GREEN
-            },
+            if *observe_only { ACCENT } else { GREEN },
             if *observe_only {
                 "Beobachtung aktiv - kein Shutdown"
             } else if *quiet {
@@ -486,7 +481,7 @@ fn moon_view(
             network_triggered,
             ..
         } => (
-            if *observe_only { ACCENT } else { RED },
+            if *observe_only { ACCENT } else { PASTEL_ORANGE },
             if *observe_only {
                 "Beobachtung abgeschlossen - keine Windows-Aktion"
             } else if *network_triggered {
@@ -502,9 +497,17 @@ fn moon_view(
                 "Klicken, um Countdown und Nachtlauf abzubrechen."
             },
         ),
-        WatchStatus::Finished { .. } => (
-            GRAY,
-            "Kein Nachtlauf aktiv",
+        WatchStatus::Finished { outcome, .. } => (
+            if outcome.contains("confirmed") {
+                PASTEL_RED
+            } else {
+                PASTEL_YELLOW
+            },
+            if outcome.contains("confirmed") {
+                "Energieaktion wird ausgeführt"
+            } else {
+                "Kein Nachtlauf aktiv"
+            },
             "Klicken, um den Nachtmodus zu starten.",
         ),
     };
