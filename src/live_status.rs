@@ -17,6 +17,7 @@ const ACCENT_STRONG: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(74, 222, 128);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(251, 191, 36);
 const RED: egui::Color32 = egui::Color32::from_rgb(248, 113, 113);
+const PASTEL_GREEN: egui::Color32 = egui::Color32::from_rgb(125, 220, 170);
 const PASTEL_YELLOW: egui::Color32 = egui::Color32::from_rgb(245, 210, 125);
 const PASTEL_RED: egui::Color32 = egui::Color32::from_rgb(242, 145, 150);
 const GRAY: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
@@ -680,7 +681,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             MetricIcon::Cpu,
             "CPU",
             metrics.cpu_percent.map(|value| format!("{value}%")),
-            metric_color(TEXT, metrics.cpu_percent),
+            metric_color(metrics.cpu_percent),
         );
         system_metric_badge(
             ui,
@@ -688,7 +689,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             MetricIcon::Ram,
             "RAM",
             metrics.ram_percent.map(|value| format!("{value}%")),
-            metric_color(TEXT, metrics.ram_percent),
+            metric_color(metrics.ram_percent),
         );
         system_metric_badge(
             ui,
@@ -696,7 +697,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             MetricIcon::Gpu,
             "GPU",
             metrics.gpu_percent.map(|value| format!("{value}%")),
-            metric_color(ACCENT, metrics.gpu_percent),
+            metric_color(metrics.gpu_percent),
         );
         system_metric_badge(
             ui,
@@ -706,7 +707,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             metrics
                 .vram_used_bytes
                 .map(|bytes| format_vram(bytes, metrics.vram_percent)),
-            metric_color(ACCENT, metrics.vram_percent),
+            metric_color(metrics.vram_percent),
         );
         system_metric_badge(
             ui,
@@ -714,17 +715,18 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
             MetricIcon::Power,
             "",
             metrics.gpu_watts.map(|value| format!("{value}W")),
-            metric_color(PASTEL_YELLOW, metrics.gpu_power_percent),
+            metric_color(metrics.gpu_power_percent),
         );
     });
     ui.spacing_mut().item_spacing.x = old_spacing;
 }
 
-fn metric_color(base: egui::Color32, usage: Option<u8>) -> egui::Color32 {
+fn metric_color(usage: Option<u8>) -> egui::Color32 {
     match usage {
         Some(value) if value >= 75 => PASTEL_RED,
         Some(value) if value >= 40 => PASTEL_YELLOW,
-        _ => base,
+        Some(_) => PASTEL_GREEN,
+        None => GRAY,
     }
 }
 
