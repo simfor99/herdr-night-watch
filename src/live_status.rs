@@ -31,6 +31,7 @@ const GRAY: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);
 const BG_TOP: egui::Color32 = egui::Color32::from_rgb(26, 34, 54);
 const BG_BOTTOM: egui::Color32 = egui::Color32::from_rgb(14, 19, 33);
+const WINDOW_DRAG_THRESHOLD_SQUARED: f32 = 4.0;
 
 pub fn open() -> Result<()> {
     let executable =
@@ -586,7 +587,7 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
     if primary_down
         && !app.window_drag_started
         && !excluded_origin
-        && total_delta.is_some_and(|delta| delta.length_sq() > 16.0)
+        && total_delta.is_some_and(|delta| delta.length_sq() > WINDOW_DRAG_THRESHOLD_SQUARED)
     {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         app.window_drag_started = true;
