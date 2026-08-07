@@ -14,6 +14,8 @@ mod language;
 #[cfg(windows)]
 mod live_status;
 #[cfg(windows)]
+mod log_viewer;
+#[cfg(windows)]
 mod notify;
 #[cfg(windows)]
 mod settings;
@@ -30,6 +32,8 @@ fn main() -> anyhow::Result<()> {
         settings::run()
     } else if std::env::args().any(|argument| argument == "--live-status") {
         live_status::run()
+    } else if std::env::args().any(|argument| argument == "--completion-log") {
+        log_viewer::run()
     } else {
         tray::run()
     }

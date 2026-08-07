@@ -1,6 +1,7 @@
 use crate::{
     backend::{self, AgentSummary, CompletionAction, WatchStatus},
     language::Language,
+    log_viewer,
     system_metrics::{self, SystemMetrics},
     window_settings,
 };
@@ -339,7 +340,41 @@ impl eframe::App for LiveStatusApp {
         self.collect_metrics();
         self.refresh();
         paint_gradient(ui.painter(), ui.max_rect(), BG_TOP, BG_BOTTOM);
-        let (minimize_clicked, close_clicked) = window_controls(ui);
+        let (log_clicked, level_clicked, minimize_clicked, close_clicked) =
+            window_controls(ui, self.language, self.window_level);
+        if log_clicked {
+            match log_viewer::open() {
+                Ok(()) => {
+                    self.toast = Some(Toast {
+                        message: self
+                            .language
+                            .text("Abschlussprotokoll geöffnet", "Completion log opened")
+                            .into(),
+                        color: ACCENT,
+                        expires_at: Instant::now() + Duration::from_secs(3),
+                    });
+                }
+                Err(error) => self.error = Some(error.to_string()),
+            }
+        }
+        if level_clicked {
+            let next_level = self.window_level.next();
+            match next_level.set() {
+                Ok(()) => {
+                    self.window_level = next_level;
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
+                            next_level,
+                        )));
+                    self.toast = Some(Toast {
+                        message: window_level_message(next_level, self.language).into(),
+                        color: ACCENT,
+                        expires_at: Instant::now() + Duration::from_secs(3),
+                    });
+                }
+                Err(error) => self.error = Some(error.to_string()),
+            }
+        }
         if minimize_clicked {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -454,7 +489,7 @@ impl eframe::App for LiveStatusApp {
                                 self.run_action(NightAction::SetWarningSeconds(seconds));
                             }
                             ui.add_space(5.0);
-                            glassy_frame(ui).show(ui, |ui| {
+                            let panel = glassy_frame(ui).show(ui, |ui| {
                                 let agents = agents_for(&self.status);
                                 if agents.available {
                                     ui.horizontal(|ui| {
@@ -483,6 +518,7 @@ impl eframe::App for LiveStatusApp {
                                     );
                                 }
                             });
+                            glass_sheen(ui.painter(), panel.response.rect);
                         });
                         ui.add_space(14.0);
                         ui.vertical(|ui| {
@@ -514,12 +550,16 @@ impl eframe::App for LiveStatusApp {
     }
 }
 
-fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
+fn window_controls(
+    ui: &mut egui::Ui,
+    language: Language,
+    level: window_settings::WindowLevel,
+) -> (bool, bool, bool, bool) {
     let rect = ui.max_rect();
     let painter = ui.painter();
     let button_width = 30.0;
     let gap = 1.0;
-    let hood_width = button_width * 2.0 + gap + 10.0;
+    let hood_width = button_width * 4.0 + gap * 3.0 + 10.0;
     let hood_rect = egui::Rect::from_min_max(
         egui::pos2(rect.right() - hood_width, rect.top() + 2.0),
         egui::pos2(rect.right() - 4.0, rect.top() + 28.0),
@@ -561,7 +601,7 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         }
     }
     if !visible {
-        return (false, false);
+        return (false, false, false, false);
     }
     painter.rect_filled(
         hood_rect,
@@ -574,6 +614,15 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         egui::Stroke::new(1.0, egui::Color32::from_rgb(66, 74, 98)),
         egui::StrokeKind::Inside,
     );
+    glass_sheen(ui.painter(), hood_rect);
+    let log_rect = egui::Rect::from_min_max(
+        egui::pos2(hood_rect.left() + 2.0, hood_rect.top()),
+        egui::pos2(hood_rect.left() + button_width + 2.0, hood_rect.bottom()),
+    );
+    let level_rect = egui::Rect::from_min_max(
+        egui::pos2(log_rect.right() + gap, hood_rect.top()),
+        egui::pos2(log_rect.right() + gap + button_width, hood_rect.bottom()),
+    );
     let close_rect = egui::Rect::from_min_max(
         egui::pos2(hood_rect.right() - button_width - 2.0, hood_rect.top()),
         egui::pos2(hood_rect.right() - 2.0, hood_rect.bottom()),
@@ -582,6 +631,23 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         egui::pos2(close_rect.left() - gap - button_width, hood_rect.top()),
         egui::pos2(close_rect.left() - gap, hood_rect.bottom()),
     );
+    let log_response = ui
+        .interact(
+            log_rect,
+            ui.make_persistent_id("live_window_log"),
+            egui::Sense::click(),
+        )
+        .on_hover_text(language.text(
+            "Letzte 30 Abschlussaktionen öffnen",
+            "Open the last 30 completion actions",
+        ));
+    let level_response = ui
+        .interact(
+            level_rect,
+            ui.make_persistent_id("live_window_level"),
+            egui::Sense::click(),
+        )
+        .on_hover_text(window_level_tooltip(level, language));
     let minimize_response = ui.interact(
         minimize_rect,
         ui.make_persistent_id("live_window_minimize"),
@@ -602,6 +668,18 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
     } else {
         egui::Color32::TRANSPARENT
     };
+    let level_fill = if level_response.hovered() {
+        egui::Color32::from_rgb(52, 54, 66)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let log_fill = if log_response.hovered() {
+        egui::Color32::from_rgb(52, 54, 66)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect_filled(log_rect, egui::CornerRadius::same(8), log_fill);
+    painter.rect_filled(level_rect, egui::CornerRadius::same(8), level_fill);
     painter.rect_filled(minimize_rect, egui::CornerRadius::same(8), minimize_fill);
     painter.rect_filled(close_rect, egui::CornerRadius::same(8), close_fill);
     let icon_color = if close_response.hovered() {
@@ -609,6 +687,21 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
     } else {
         GRAY
     };
+    draw_log_icon(
+        painter,
+        log_rect.center(),
+        if log_response.hovered() { ACCENT } else { GRAY },
+    );
+    draw_window_level_icon(
+        painter,
+        level_rect.center(),
+        level,
+        if level_response.hovered() {
+            level_color(level)
+        } else {
+            GRAY
+        },
+    );
     painter.line_segment(
         [
             egui::pos2(minimize_rect.left() + 11.0, minimize_rect.center().y + 4.0),
@@ -630,7 +723,99 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         ],
         egui::Stroke::new(1.2, icon_color),
     );
-    (minimize_response.clicked(), close_response.clicked())
+    (
+        log_response.clicked(),
+        level_response.clicked(),
+        minimize_response.clicked(),
+        close_response.clicked(),
+    )
+}
+
+fn draw_log_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.15, color);
+    let page = egui::Rect::from_center_size(center, egui::vec2(10.0, 12.0));
+    painter.rect_stroke(page, 1.0, stroke, egui::StrokeKind::Inside);
+    for offset in [-3.0, 0.0, 3.0] {
+        painter.line_segment(
+            [
+                egui::pos2(center.x - 3.0, center.y + offset),
+                egui::pos2(center.x + 3.0, center.y + offset),
+            ],
+            stroke,
+        );
+    }
+}
+
+fn level_color(level: window_settings::WindowLevel) -> egui::Color32 {
+    match level {
+        window_settings::WindowLevel::Normal => GRAY,
+        window_settings::WindowLevel::AlwaysOnTop => GREEN,
+        window_settings::WindowLevel::AlwaysOnBottom => PASTEL_YELLOW,
+    }
+}
+
+fn window_level_tooltip(level: window_settings::WindowLevel, language: Language) -> &'static str {
+    match (level, language) {
+        (window_settings::WindowLevel::Normal, Language::German) => {
+            "Fensterebene: Normal\nKlicken: Immer im Vordergrund"
+        }
+        (window_settings::WindowLevel::AlwaysOnTop, Language::German) => {
+            "Fensterebene: Immer im Vordergrund\nKlicken: Immer im Hintergrund"
+        }
+        (window_settings::WindowLevel::AlwaysOnBottom, Language::German) => {
+            "Fensterebene: Immer im Hintergrund\nKlicken: Normal"
+        }
+        (window_settings::WindowLevel::Normal, Language::English) => {
+            "Window level: Normal\nClick: Always on top"
+        }
+        (window_settings::WindowLevel::AlwaysOnTop, Language::English) => {
+            "Window level: Always on top\nClick: Always in background"
+        }
+        (window_settings::WindowLevel::AlwaysOnBottom, Language::English) => {
+            "Window level: Always in background\nClick: Normal"
+        }
+    }
+}
+
+fn window_level_message(level: window_settings::WindowLevel, language: Language) -> &'static str {
+    match (level, language) {
+        (window_settings::WindowLevel::Normal, Language::German) => "Fenster: normale Ebene",
+        (window_settings::WindowLevel::AlwaysOnTop, Language::German) => {
+            "Fenster bleibt im Vordergrund"
+        }
+        (window_settings::WindowLevel::AlwaysOnBottom, Language::German) => {
+            "Fenster bleibt im Hintergrund"
+        }
+        (window_settings::WindowLevel::Normal, Language::English) => "Window: normal level",
+        (window_settings::WindowLevel::AlwaysOnTop, Language::English) => "Window stays on top",
+        (window_settings::WindowLevel::AlwaysOnBottom, Language::English) => {
+            "Window stays in background"
+        }
+    }
+}
+
+fn draw_window_level_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    level: window_settings::WindowLevel,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.15, color);
+    let offset = match level {
+        window_settings::WindowLevel::Normal => 0.0,
+        window_settings::WindowLevel::AlwaysOnTop => -1.5,
+        window_settings::WindowLevel::AlwaysOnBottom => 1.5,
+    };
+    let back = egui::Rect::from_center_size(
+        egui::pos2(center.x + 2.0, center.y + offset),
+        egui::vec2(9.0, 7.0),
+    );
+    let front = egui::Rect::from_center_size(
+        egui::pos2(center.x - 2.0, center.y - offset),
+        egui::vec2(9.0, 7.0),
+    );
+    painter.rect_stroke(back, 1.0, stroke, egui::StrokeKind::Inside);
+    painter.rect_stroke(front, 1.0, stroke, egui::StrokeKind::Inside);
 }
 
 fn countdown_seconds(status: &WatchStatus) -> Option<u64> {
@@ -844,6 +1029,7 @@ fn completion_switch(ui: &mut egui::Ui, action: CompletionAction, enabled: bool)
         egui::Stroke::new(1.0, border),
         egui::StrokeKind::Inside,
     );
+    glass_sheen(painter, rect);
 
     let knob_radius = 11.0;
     let left_center = egui::pos2(rect.left() + 14.0, rect.center().y);
@@ -1201,6 +1387,45 @@ fn glassy_frame(ui: &mut egui::Ui) -> egui::Frame {
         ))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::same(12))
+}
+
+fn glass_sheen(painter: &egui::Painter, rect: egui::Rect) {
+    let inset = 12.0_f32.min(rect.width() / 4.0);
+    let band_bottom = (rect.top() + rect.height() * 0.18).min(rect.bottom() - 1.0);
+    let band = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 1.0, rect.top() + 1.0),
+        egui::pos2(rect.right() - 1.0, band_bottom),
+    );
+    painter.rect_filled(
+        band,
+        egui::CornerRadius {
+            nw: 9,
+            ne: 9,
+            sw: 0,
+            se: 0,
+        },
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + inset, rect.top() + 1.5),
+            egui::pos2(rect.right() - inset, rect.top() + 1.5),
+        ],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+        ),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + inset + 8.0, rect.top() + 3.0),
+            egui::pos2(rect.right() - inset - 8.0, rect.top() + 3.0),
+        ],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+        ),
+    );
 }
 
 fn paint_gradient(

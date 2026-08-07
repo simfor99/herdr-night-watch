@@ -15,6 +15,14 @@ pub enum WindowLevel {
 }
 
 impl WindowLevel {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::AlwaysOnTop,
+            Self::AlwaysOnTop => Self::AlwaysOnBottom,
+            Self::AlwaysOnBottom => Self::Normal,
+        }
+    }
+
     pub fn current() -> Self {
         let value = RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey(KEY)

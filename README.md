@@ -63,7 +63,7 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 
 ![Herdr Night Watch live status in English](docs/images/live-status-en-latest.png)
 
-The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer turns it into a quick system monitor without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed. The tray menu lets you choose window opacity from 100% down to 10%, plus normal, always-on-top, or always-in-background window placement.
+The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer turns it into a quick system monitor without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed. The small upper-right control hood opens the last 30 completion actions and cycles the window between normal, always-on-top, and always-in-background modes. Its glass surfaces use a subtle top reflection to keep the dashboard calm but tactile. The tray menu lets you choose window opacity from 100% down to 10%.
 
 ## Usage
 
@@ -72,7 +72,8 @@ The live window is intentionally compact: Herdr counts and the night-mode contro
 - **Stop and cancel shutdown**: ends the run and cancels only a pending shutdown scheduled by the watcher.
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.
 - **Open live status**: opens a freely movable status window that can be closed at any time. Left-clicking the tray icon opens it; right-clicking shows the menu.
-- **Window settings**: choose opacity from 100% (opaque) to 10% in 10-point steps and choose normal, always-on-top, or always-in-background placement. These settings are stored locally and can be changed while the live window is open.
+- **Completion log**: the live window's upper-right log button opens a read-only view of the last 30 requested sleep and shutdown actions.
+- **Window settings**: choose opacity from 100% (opaque) to 10% in 10-point steps. The upper-right live-window control cycles normal, always-on-top, and always-in-background placement. These settings are stored locally and can be changed while the live window is open.
 - The live-status footer gives a compact, informational view of CPU, RAM, GPU, occupied VRAM, and an available GPU power reading. Pastel yellow and red indicate medium and high utilization. Unsupported values show `—` and never affect the watcher.
 - **Start with Windows**: starts only the tray app when you log in. It does not automatically arm a night run.
 
