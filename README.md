@@ -61,6 +61,8 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 
 ![Herdr Night Watch live status](docs/images/live-status-de.png)
 
+The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer provides a quick hardware glance without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed.
+
 ## Usage
 
 - **Start night mode**: continuously monitors all agents currently reported by Herdr and only shuts down Windows after the configured quiet period.

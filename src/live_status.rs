@@ -666,55 +666,48 @@ fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32) {
 fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics) {
     let available = ui.available_width();
     let spacing = 7.0;
-    let mut widths = [64.0, 64.0, 64.0, 72.0, 60.0];
-    let required = widths.iter().sum::<f32>() + spacing * 4.0;
-    if required > available {
-        let scale = ((available - spacing * 4.0) / widths.iter().sum::<f32>()).max(0.8);
-        widths.iter_mut().for_each(|width| *width *= scale);
-    }
+    let item_width = ((available - spacing * 4.0) / 5.0).max(52.0);
     let old_spacing = ui.spacing().item_spacing.x;
     ui.spacing_mut().item_spacing.x = spacing;
     ui.horizontal(|ui| {
         system_metric_badge(
             ui,
-            widths[0],
+            item_width,
             MetricIcon::Cpu,
             "CPU",
-            metrics.cpu_percent.map(|value| format!("{value}%")),
+            metrics.cpu_percent.map(|value| format!("{value:>2}%")),
             metric_color(metrics.cpu_percent),
         );
         system_metric_badge(
             ui,
-            widths[1],
+            item_width,
             MetricIcon::Ram,
             "RAM",
-            metrics.ram_percent.map(|value| format!("{value}%")),
+            metrics.ram_percent.map(|value| format!("{value:>2}%")),
             metric_color(metrics.ram_percent),
         );
         system_metric_badge(
             ui,
-            widths[2],
+            item_width,
             MetricIcon::Gpu,
             "GPU",
-            metrics.gpu_percent.map(|value| format!("{value}%")),
+            metrics.gpu_percent.map(|value| format!("{value:>2}%")),
             metric_color(metrics.gpu_percent),
         );
         system_metric_badge(
             ui,
-            widths[3],
+            item_width,
             MetricIcon::Vram,
             "",
-            metrics
-                .vram_used_bytes
-                .map(|bytes| format_vram(bytes, metrics.vram_percent)),
+            metrics.vram_percent.map(|value| format!("{value:>2}%")),
             metric_color(metrics.vram_percent),
         );
         system_metric_badge(
             ui,
-            widths[4],
+            item_width,
             MetricIcon::Power,
             "",
-            metrics.gpu_watts.map(|value| format!("{value}W")),
+            metrics.gpu_watts.map(|value| format!("{value:>3}W")),
             metric_color(metrics.gpu_power_percent),
         );
     });
@@ -728,22 +721,6 @@ fn metric_color(usage: Option<u8>) -> egui::Color32 {
         Some(_) => PASTEL_GREEN,
         None => GRAY,
     }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    let bytes = bytes as f64;
-    if bytes >= GIB {
-        format!("{:.1}G", bytes / GIB)
-    } else {
-        format!("{}M", (bytes / MIB).round() as u64)
-    }
-}
-
-fn format_vram(bytes: u64, percent: Option<u8>) -> String {
-    let size = format_bytes(bytes);
-    percent.map_or(size.clone(), |value| format!("{size} {value}%"))
 }
 
 #[derive(Clone, Copy)]

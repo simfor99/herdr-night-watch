@@ -23,7 +23,6 @@ use windows_sys::Win32::System::Threading::GetSystemTimes;
 pub struct SystemMetrics {
     pub cpu_percent: Option<u8>,
     pub gpu_percent: Option<u8>,
-    pub vram_used_bytes: Option<u64>,
     pub vram_percent: Option<u8>,
     pub ram_percent: Option<u8>,
     pub gpu_watts: Option<u16>,
@@ -53,7 +52,7 @@ impl Sampler {
     pub fn sample(&mut self) -> SystemMetrics {
         let cpu_percent = sample_cpu(&mut self.cpu_previous);
         let ram_percent = sample_ram();
-        let (gpu_percent, pdh_vram_used_bytes) = self
+        let gpu_percent = self
             .query
             .as_mut()
             .map(PdhQuery::sample)
@@ -63,14 +62,9 @@ impl Sampler {
         let gpu_power_percent = nvidia
             .as_ref()
             .and_then(|telemetry| telemetry.power_percent);
-        let vram_used_bytes = nvidia
-            .as_ref()
-            .and_then(|telemetry| telemetry.vram_used_bytes)
-            .or(pdh_vram_used_bytes);
         SystemMetrics {
             cpu_percent,
             gpu_percent,
-            vram_used_bytes,
             vram_percent: nvidia.as_ref().and_then(|telemetry| telemetry.vram_percent),
             ram_percent,
             gpu_watts,
@@ -82,7 +76,6 @@ impl Sampler {
 struct PdhQuery {
     handle: isize,
     gpu: Option<isize>,
-    vram_used: Option<isize>,
 }
 
 impl PdhQuery {
@@ -96,9 +89,8 @@ impl PdhQuery {
         let query = Self {
             handle,
             gpu: add_counter(handle, r"\GPU Engine(*)\Utilization Percentage"),
-            vram_used: add_counter(handle, r"\GPU Adapter Memory(*)\Dedicated Usage"),
         };
-        if query.gpu.is_none() && query.vram_used.is_none() {
+        if query.gpu.is_none() {
             unsafe { PdhCloseQuery(handle) };
             None
         } else {
@@ -106,17 +98,13 @@ impl PdhQuery {
         }
     }
 
-    fn sample(&mut self) -> (Option<u8>, Option<u64>) {
+    fn sample(&mut self) -> Option<u8> {
         if unsafe { PdhCollectQueryData(self.handle) } != 0 {
-            return (None, None);
+            return None;
         }
 
         let gpu = self.gpu.and_then(read_max);
-        let vram = self
-            .vram_used
-            .and_then(read_sum)
-            .map(|value| value.round().clamp(0.0, u64::MAX as f64) as u64);
-        (gpu.map(percentage), vram)
+        gpu.map(percentage)
     }
 }
 
@@ -140,11 +128,6 @@ fn read_max(counter: isize) -> Option<f64> {
         .into_iter()
         .map(|value| value.max(0.0))
         .max_by(|left, right| left.total_cmp(right))
-}
-
-fn read_sum(counter: isize) -> Option<f64> {
-    let values = formatted_values(counter);
-    (!values.is_empty()).then(|| values.into_iter().map(|value| value.max(0.0)).sum())
 }
 
 fn formatted_values(counter: isize) -> Vec<f64> {
@@ -247,7 +230,6 @@ fn percentage(value: f64) -> u8 {
 struct NvidiaTelemetry {
     power_watts: Option<u16>,
     power_percent: Option<u8>,
-    vram_used_bytes: Option<u64>,
     vram_percent: Option<u8>,
 }
 
@@ -300,7 +282,6 @@ fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
     Some(NvidiaTelemetry {
         power_watts: Some(power_watts.round().clamp(0.0, f64::from(u16::MAX)) as u16),
         power_percent,
-        vram_used_bytes: Some((vram_used_mib * 1024.0 * 1024.0).round() as u64),
         vram_percent,
     })
 }
