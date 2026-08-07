@@ -46,8 +46,8 @@ pub fn open() -> Result<()> {
 pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 198.0])
-            .with_min_inner_size([390.0, 188.0])
+            .with_inner_size([400.0, 170.0])
+            .with_min_inner_size([390.0, 160.0])
             .with_decorations(false)
             .with_window_level(window_level(window_settings::WindowLevel::current()))
             .with_title(match Language::current() {
@@ -515,17 +515,56 @@ impl eframe::App for LiveStatusApp {
 }
 
 fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
-    let width = ui.available_width();
-    let height = 32.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let rect = ui.max_rect();
     let painter = ui.painter();
     let button_width = 30.0;
     let gap = 1.0;
     let hood_width = button_width * 2.0 + gap + 10.0;
     let hood_rect = egui::Rect::from_min_max(
         egui::pos2(rect.right() - hood_width, rect.top() + 2.0),
-        egui::pos2(rect.right() - 4.0, rect.bottom() - 2.0),
+        egui::pos2(rect.right() - 4.0, rect.top() + 28.0),
     );
+    let hover_response = ui.interact(
+        hood_rect,
+        ui.make_persistent_id("live_window_controls_hover"),
+        egui::Sense::hover(),
+    );
+    let visible = hover_response.hovered();
+    let moon_exclusion = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - 130.0, rect.top() + 25.0),
+        egui::pos2(rect.right() - 5.0, rect.top() + 132.0),
+    );
+    let drag_rects = [
+        egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(rect.right(), moon_exclusion.top()),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left(), moon_exclusion.top()),
+            egui::pos2(moon_exclusion.left(), moon_exclusion.bottom()),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(moon_exclusion.right(), moon_exclusion.top()),
+            egui::pos2(rect.right(), moon_exclusion.bottom()),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left(), moon_exclusion.bottom()),
+            rect.right_bottom(),
+        ),
+    ];
+    for (index, drag_rect) in drag_rects.into_iter().enumerate() {
+        let drag_response = ui.interact(
+            drag_rect,
+            ui.make_persistent_id(("live_window_drag", index)),
+            egui::Sense::drag(),
+        );
+        if drag_response.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+    }
+    if !visible {
+        return (false, false);
+    }
     painter.rect_filled(
         hood_rect,
         egui::CornerRadius::same(10),
@@ -545,19 +584,6 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         egui::pos2(close_rect.left() - gap - button_width, hood_rect.top()),
         egui::pos2(close_rect.left() - gap, hood_rect.bottom()),
     );
-    let drag_rect = egui::Rect::from_min_max(
-        rect.left_top(),
-        egui::pos2(hood_rect.left() - gap, rect.bottom()),
-    );
-    let drag_response = ui.interact(
-        drag_rect,
-        ui.make_persistent_id("live_window_drag"),
-        egui::Sense::drag(),
-    );
-    if drag_response.drag_started() {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-    }
-
     let minimize_response = ui.interact(
         minimize_rect,
         ui.make_persistent_id("live_window_minimize"),
