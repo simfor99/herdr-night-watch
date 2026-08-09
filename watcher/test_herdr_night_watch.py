@@ -141,12 +141,66 @@ class ArmingTests(unittest.TestCase):
             self.assertEqual(WATCHER.load_json(state_path)["armed_working_count"], 0)
 
 
+class RestartResetTests(unittest.TestCase):
+    def test_active_run_is_reset_after_a_new_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            WATCHER.write_json(
+                state_path,
+                {
+                    "run_id": "old-run",
+                    "boot_id": "old-boot",
+                    "outcome": None,
+                },
+            )
+            WATCHER.write_json(warning_path, {"run_id": "old-run"})
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, warning_path, root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "runtime_boot_id", return_value="new-boot"),
+                patch.object(WATCHER, "record_cancellation"),
+                patch.object(WATCHER, "log"),
+            ):
+                self.assertTrue(WATCHER.reset_stale_run_after_restart())
+            state = WATCHER.load_json(state_path)
+            self.assertEqual(state["outcome"], "reset_after_restart")
+            self.assertEqual(state["reset_reason"], "boot_id_changed")
+            self.assertFalse(warning_path.exists())
+
+    def test_active_run_survives_normal_watcher_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            WATCHER.write_json(
+                state_path,
+                {"run_id": "same-run", "boot_id": "same-boot", "outcome": None},
+            )
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "runtime_boot_id", return_value="same-boot"),
+            ):
+                self.assertFalse(WATCHER.reset_stale_run_after_restart())
+            self.assertIsNone(WATCHER.load_json(state_path)["outcome"])
+
+
 class ConfirmationTests(unittest.TestCase):
     def test_confirmation_refuses_without_a_matching_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             state_path = root / "active-run.json"
-            WATCHER.write_json(state_path, {"run_id": "test-run", "outcome": None})
+            WATCHER.write_json(
+                state_path,
+                {"run_id": "test-run", "boot_id": WATCHER.runtime_boot_id(), "outcome": None},
+            )
             with patch.object(
                 WATCHER,
                 "paths",
@@ -164,6 +218,7 @@ class ConfirmationTests(unittest.TestCase):
                 state_path,
                 {
                     "run_id": "observe-run",
+                    "boot_id": WATCHER.runtime_boot_id(),
                     "outcome": None,
                     "dry_run": True,
                     "completion_action": "sleep",
@@ -196,7 +251,10 @@ class ConfirmationTests(unittest.TestCase):
             root = Path(temporary_directory)
             state_path = root / "active-run.json"
             warning_path = root / "shutdown-warning.json"
-            WATCHER.write_json(state_path, {"run_id": "cancel-run", "outcome": None})
+            WATCHER.write_json(
+                state_path,
+                {"run_id": "cancel-run", "boot_id": WATCHER.runtime_boot_id(), "outcome": None},
+            )
             (root / "cancellation-history.csv").write_bytes(b"\xff\xfeinvalid")
             with (
                 patch.object(

@@ -51,6 +51,7 @@ WINDOWS_INSTALL_LOG_DIR = Path(
 LIVE_MONITORING_SCOPE = "live_agents"
 DEFAULT_COMPLETION_ACTION = "shutdown"
 COMPLETION_ACTIONS = {"sleep", "shutdown"}
+STATE_SCHEMA_VERSION = 4
 
 
 def utc_now() -> datetime:
@@ -73,6 +74,49 @@ def state_dir() -> Path:
 def paths() -> tuple[Path, Path, Path, Path]:
     root = state_dir()
     return root, root / "active-run.json", root / "shutdown-warning.json", root / "watch.lock"
+
+
+def runtime_boot_id() -> str | None:
+    """Return the current WSL/Linux boot marker when the kernel exposes it."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
+
+
+def reset_stale_run_after_restart() -> bool:
+    """Finish an armed run left behind by a Windows/WSL restart.
+
+    The shutdown process can terminate the watcher before it writes its final
+    outcome. A new kernel boot must never inherit that incomplete run and its
+    pending warning file.
+    """
+    _, state_path, warning_path, _ = paths()
+    state = load_json(state_path)
+    if not state or state.get("outcome"):
+        return False
+    current_boot_id = runtime_boot_id()
+    if not current_boot_id or state.get("boot_id") == current_boot_id:
+        return False
+
+    run_id = str(state.get("run_id", "unknown"))
+    previous_boot_id = state.get("boot_id")
+    state["outcome"] = "reset_after_restart"
+    state["finished_at"] = iso_now()
+    state["detail"] = "night watch reset after WSL/Windows restart"
+    state["reset_reason"] = "boot_id_changed" if previous_boot_id else "missing_boot_id_marker"
+    write_json(state_path, state)
+    warning_path.unlink(missing_ok=True)
+    try:
+        record_cancellation("system_restart", run_id)
+    except (OSError, UnicodeError, csv.Error) as error:
+        log(f"CANCELLATION HISTORY ERROR {error}")
+    log(
+        f"RESET run={run_id} reason={state['reset_reason']} "
+        "active night watch was cleared after restart"
+    )
+    return True
 
 
 def completion_lock_path() -> Path:
@@ -120,6 +164,7 @@ def preferred_warning_seconds() -> int:
 def set_completion_action(action: str) -> int:
     if action not in COMPLETION_ACTIONS:
         raise RuntimeError("Unsupported completion action.")
+    reset_stale_run_after_restart()
     _, state_path, _, _ = paths()
     state = load_json(state_path)
     if state and not state.get("outcome"):
@@ -136,6 +181,7 @@ def set_warning_seconds(seconds: int) -> int:
         raise RuntimeError(
             f"Warning seconds must be between {MIN_WARNING_SECONDS} and {MAX_WARNING_SECONDS}."
         )
+    reset_stale_run_after_restart()
     _, state_path, _, _ = paths()
     state = load_json(state_path)
     if state and not state.get("outcome"):
@@ -410,6 +456,7 @@ def snapshot_target(agent: dict[str, Any]) -> dict[str, Any]:
 
 
 def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: int) -> int:
+    reset_stale_run_after_restart()
     root, state_path, warning_path, _ = paths()
     root.mkdir(parents=True, exist_ok=True)
     existing = load_json(state_path)
@@ -426,9 +473,10 @@ def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: i
     working = [agent for agent in list_agents() if agent.get("agent_status") == "working"]
 
     state = {
-        "schema_version": 3,
+        "schema_version": STATE_SCHEMA_VERSION,
         "demo": False,
         "run_id": str(uuid.uuid4()),
+        "boot_id": runtime_boot_id(),
         "armed_at": iso_now(),
         "dry_run": dry_run,
         "poll_seconds": poll_seconds,
@@ -452,6 +500,7 @@ def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: i
 
 def demo() -> int:
     """Run the complete visible state sequence without reading Herdr or shutting down Windows."""
+    reset_stale_run_after_restart()
     root, state_path, warning_path, _ = paths()
     root.mkdir(parents=True, exist_ok=True)
     existing = load_json(state_path)
@@ -463,6 +512,7 @@ def demo() -> int:
         "schema_version": 1,
         "demo": True,
         "run_id": str(uuid.uuid4()),
+        "boot_id": runtime_boot_id(),
         "armed_at": iso_now(),
         "dry_run": True,
         "poll_seconds": 1,
@@ -652,6 +702,7 @@ def abort_shutdown_if_ours() -> bool:
 
 
 def confirm_completion() -> int:
+    reset_stale_run_after_restart()
     _, _, warning_path, _ = paths()
     with completion_lock():
         state = load_json(paths()[1])
@@ -694,6 +745,7 @@ def finish(state: dict[str, Any], outcome: str, detail: str) -> None:
 
 
 def watch() -> int:
+    reset_stale_run_after_restart()
     _, state_path, _, lock_path = paths()
     state = load_json(state_path)
     if not state:
@@ -862,6 +914,7 @@ def watch() -> int:
 
 
 def cancel(source: str) -> int:
+    reset_stale_run_after_restart()
     _, state_path, _, _ = paths()
     with completion_lock():
         state = load_json(state_path)
@@ -883,6 +936,7 @@ def cancel(source: str) -> int:
 
 
 def status() -> int:
+    reset_stale_run_after_restart()
     _, state_path, warning_path, _ = paths()
     state = load_json(state_path)
     warning = load_json(warning_path)

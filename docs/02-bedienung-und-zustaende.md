@@ -79,6 +79,8 @@ Fällt die Internetverbindung aus, zählt das nicht sofort als „fertig“. Ers
 
 Wenn das Tray-Symbol nicht direkt sichtbar ist, liegt es möglicherweise im ausgeklappten Bereich der Windows-Taskleiste hinter dem Pfeil `^`. Das ist ein Windows-Verhalten und kein Zeichen, dass der Wächter gestoppt wurde.
 
+Ein Windows- oder WSL-Neustart beendet einen aktiven Nachtlauf sicher. Der Wächter vergleicht beim nächsten Statusaufruf die gespeicherte Boot-ID mit der aktuellen. Bei einer Änderung löscht er eine eventuell alte Warnung, protokolliert den Reset als `system_restart` und meldet wieder „kein Nachtlauf aktiv“. Ein neuer Nachtlauf muss bewusst gestartet werden.
+
 ## Live-Zahl und Nachtlauf-Zahl
 
 Der kompakte Tooltip lautet zum Beispiel `Aus · Herdr 4/10 aktiv`. Das ist die aktuelle Zahl aller von Herdr gemeldeten Agenten und beantwortet die Kontrollfrage „arbeitet Herdr gerade wirklich parallel?“, ohne an der Windows-Zeichengrenze abgeschnitten zu werden. Im laufenden Nachtmodus ist genau diese aktuelle Herdr-Sicht auch die Grundlage der Überwachung.

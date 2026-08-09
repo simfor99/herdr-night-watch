@@ -91,6 +91,8 @@ The EXE is a convenience artifact for Windows. For other architectures or after 
 
 The tooltip and live status window show the current Herdr count for information only. If Herdr cannot be read, the app never invents a number and the shutdown decision remains fail-closed.
 
+An armed night run never survives a Windows or WSL restart. On the next start, the watcher detects the changed boot marker, clears any stale warning, records the reset, and returns to the safe inactive state. A new night run must always be started deliberately.
+
 In a real night run, five seconds of confirmed inactivity starts the 300-second warning period. The Windows dialog offers `Cancel`; choosing it stops the watcher and cancels that specific pending shutdown.
 
 ## Maintenance documentation

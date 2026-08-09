@@ -3,6 +3,14 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-09] - Neustart setzt Nachtlauf zurück
+
+### 🛡️ Sicherheit
+
+- **Kein Nachtlauf über Neustarts hinweg** - Jeder Lauf speichert die WSL-Boot-ID. Nach einem Windows- oder WSL-Neustart werden ein liegen gebliebener Lauf und seine Warnungsdatei sicher zurückgesetzt.
+- **Nachvollziehbarer Reset** - Der Reset landet im Diagnoseprotokoll und im begrenzten Abbruchverlauf mit dem Auslöser `system_restart`.
+- **Gezielter Neustarttest** - Ein neuer Test deckt sowohl den Reset nach einer geänderten Boot-ID als auch den normalen Neustart des Wächterprozesses innerhalb derselben Sitzung ab.
+
 ## [2026-08-07] - Live-Fenster und öffentliche Oberfläche
 
 ### 🪟 Bedienung
