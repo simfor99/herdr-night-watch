@@ -65,6 +65,8 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 
 The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer turns it into a quick system monitor without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed. The small upper-right control hood opens the last 30 completion actions and cycles the window between normal, always-on-top, and always-in-background modes. Its glass surfaces use a subtle top reflection to keep the dashboard calm but tactile. The tray menu lets you choose window opacity from 100% down to 10%.
 
+The moon also shows the current temperature for the selected weather location. Leipzig is used initially; the small weather control at the lower-right appears on hover and opens a searchable city selector. Weather is informational only, is refreshed in the background, and falls back to the last value or `—` when the network is unavailable.
+
 ## Usage
 
 - **Start night mode**: continuously monitors all agents currently reported by Herdr and only shuts down Windows after the configured quiet period.
@@ -74,9 +76,24 @@ The live window is intentionally compact: Herdr counts and the night-mode contro
 - **Open live status**: opens a freely movable status window that can be closed at any time. Left-clicking the tray icon opens it; right-clicking shows the menu.
 - **Open live window at startup**: optionally reopen the live status window automatically whenever the tray app starts. The default remains tray-only until you enable this option.
 - **Completion log**: the live window's upper-right log button opens a read-only view of the last 30 requested sleep and shutdown actions.
+- **Weather location**: hover the small weather control at the lower-right of the live window to search and select a city or postal code. The selected location is stored locally in the Windows user registry.
 - **Window settings**: choose opacity from 100% (opaque) to 10% in 10-point steps. The upper-right live-window control cycles normal, always-on-top, and always-in-background placement. These settings are stored locally and can be changed while the live window is open.
 - The live-status footer gives a compact, informational view of CPU, RAM, GPU, occupied VRAM, and an available GPU power reading. Pastel yellow and red indicate medium and high utilization. Unsupported values show `—` and never affect the watcher.
 - **Start with Windows**: starts only the tray app when you log in. It does not automatically arm a night run.
+
+Weather data uses [Open-Meteo's geocoding](https://open-meteo.com/en/docs/geocoding-api) and [forecast](https://open-meteo.com/en/docs) services. The location and temperature are never used by the safety-critical watcher.
+
+### Licensing and weather service
+
+The Herdr Night Watch source code is MIT-licensed. The weather feature is a
+runtime service integration and has separate provider terms: Open-Meteo's free
+endpoints are for open-source and non-commercial use, are rate-limited, and
+require attribution. Forecast data is offered under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/);
+the geocoding API documents its data under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
+For commercial deployments, use an appropriate Open-Meteo commercial/customer
+plan or replace the weather provider. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+for the exact notices and links. The core Herdr watcher remains usable under
+the MIT license without the weather feature.
 
 The Python watcher lives at `watcher/herdr-night-watch.py`; its safety contract remains authoritative.
 

@@ -1,5 +1,6 @@
 use crate::{
-    autostart, backend, language::Language, live_status, notify, settings, window_settings,
+    autostart, backend, language::Language, live_status, notify, settings, weather_location,
+    window_settings,
 };
 use anyhow::Result;
 use std::sync::mpsc;
@@ -17,6 +18,7 @@ const ID_OBSERVE: &str = "observe";
 const ID_STOP: &str = "stop";
 const ID_LOG: &str = "log";
 const ID_LIVE_STATUS: &str = "live_status";
+const ID_WEATHER_LOCATION: &str = "weather_location";
 const ID_LIVE_STATUS_ON_START: &str = "live_status_on_start";
 const ID_DEMO: &str = "demo";
 const ID_AUTOSTART: &str = "autostart";
@@ -226,6 +228,7 @@ impl App {
             ID_STOP => backend::stop("tray_menu"),
             ID_LOG => backend::open_log(),
             ID_LIVE_STATUS => live_status::open(),
+            ID_WEATHER_LOCATION => weather_location::open(),
             ID_LIVE_STATUS_ON_START => {
                 window_settings::set_live_status_on_start(!window_settings::live_status_on_start())
             }
@@ -264,6 +267,10 @@ impl App {
                 ID_STOP => "Nachtmodus gestoppt".into(),
                 ID_LOG => "Protokoll geöffnet".into(),
                 ID_LIVE_STATUS => "Live-Status geöffnet".into(),
+                ID_WEATHER_LOCATION => self
+                    .language
+                    .text("Wetterort geöffnet", "Weather location opened")
+                    .into(),
                 ID_LIVE_STATUS_ON_START => self
                     .language
                     .text(
@@ -397,6 +404,12 @@ fn menu_for(
     let _ = menu.append(&MenuItem::with_id(
         ID_LIVE_STATUS,
         language.text("Live-Status öffnen", "Open live status"),
+        true,
+        None,
+    ));
+    let _ = menu.append(&MenuItem::with_id(
+        ID_WEATHER_LOCATION,
+        language.text("Wetterort ändern", "Change weather location"),
         true,
         None,
     ));

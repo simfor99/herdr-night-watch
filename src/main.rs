@@ -24,6 +24,10 @@ mod system_metrics;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
+mod weather;
+#[cfg(windows)]
+mod weather_location;
+#[cfg(windows)]
 mod window_settings;
 
 #[cfg(windows)]
@@ -34,6 +38,8 @@ fn main() -> anyhow::Result<()> {
         live_status::run()
     } else if std::env::args().any(|argument| argument == "--completion-log") {
         log_viewer::run()
+    } else if std::env::args().any(|argument| argument == "--weather-location") {
+        weather_location::run()
     } else {
         tray::run()
     }

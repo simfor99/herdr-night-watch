@@ -22,6 +22,7 @@ Die Rust-Anwendung in diesem Projekt ist dagegen ein Controller. Sie bietet die 
 | Lokale Einrichtung | [`src/configuration.rs`](../src/configuration.rs) und [`src/settings.rs`](../src/settings.rs) | WSL-Distro und Wächterpfad lokal speichern und im Setup-Fenster bearbeiten |
 | Warnfenster | [`src/notify.rs`](../src/notify.rs) | Windows-Dialog mit „Abbrechen“ in der echten Warnphase |
 | Live-Status | [`src/live_status.rs`](../src/live_status.rs) | Frei platzierbares, schließbares Fenster für Live-Arbeit und Nachtlaufzustand |
+| Wetteranzeige | [`src/weather.rs`](../src/weather.rs) und [`src/weather_location.rs`](../src/weather_location.rs) | Hintergrund-Temperaturabruf und Suchfenster für den lokalen Wetterort |
 | Autostart | [`src/autostart.rs`](../src/autostart.rs) | `HKCU\\...\\Run` für die Tray-App, nie für einen Nachtlauf |
 | Wächter | [`herdr-night-watch.py`](../watcher/herdr-night-watch.py) | Prüfung aller aktuellen Herdr-Agenten, Ruhezeit, Shutdown und Abbruch |
 | Windows-Skripte | [`windows/`](../windows/) | Manuelle Diagnose- und Kompatibilitätshilfen |
@@ -59,6 +60,8 @@ Wächter prüft aktuellen Herdr-Status, Ruhezeit und Warnfrist
 Der Nachtwächter hängt nicht an Codex oder Claude Code. Beide sind lediglich mögliche Programme in Herdr-Panes. Entscheidend ist allein die Herdr-CLI: Sie meldet dem Wächter, ob aktuell Arbeit läuft. Der Wächter liest weder Prompt-Inhalte noch Terminalausgaben und steuert keine Agenten. Damit kann eine Herdr-Sitzung auch Codex, Claude Code und weitere Agenten parallel enthalten.
 
 Die öffentliche Anwendung speichert zwei lokale Angaben unter dem Windows-Benutzerkonto: den Namen der WSL-Distro und den vollständigen WSL-Pfad zur Datei `herdr-night-watch.py`. Sie stehen im Rechtsklick-Menü unter „Einrichtung öffnen“ zur Verfügung. Das ist bewusst kein fest eingebauter Codex-Pfad mehr und gehört nicht in Git oder Logs.
+
+Der Wetterort wird zusätzlich als lokale Windows-Registry-Einstellung gespeichert. Standardmäßig ist Leipzig hinterlegt. Die Live-App fragt die Temperatur im Hintergrund über Open-Meteo ab und zeigt bei fehlender Verbindung keinen erfundenen Wert. Diese Anzeige ist vollständig vom Wächter getrennt und kann keine Energieaktion auslösen.
 
 ## Persistenter Zustand und Protokoll
 

@@ -3,6 +3,15 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-11] - Wetter im Mond
+
+### 🌡️ Live-Status
+
+- **Temperatur in der Sichel** - Die aktuelle Temperatur des gewählten Wetterorts erscheint direkt in der freien Mondfläche.
+- **Suchbarer Wetterort** - Ein kleines Hover-Symbol unten rechts öffnet ein Fenster im Stil des Abschlussprotokolls. Stadt oder Postleitzahl suchen, Treffer auswählen, fertig.
+- **Unabhängig und fail-safe** - Wetter wird im Hintergrund aktualisiert und beeinflusst weder Herdr-Prüfung noch Ruhezeit oder Energieaktion.
+- **Drittanbieter sauber dokumentiert** - README und `THIRD_PARTY_NOTICES.md` erklären Open-Meteo-Attribution, die freien Nichtkommerziell-Bedingungen und den notwendigen kommerziellen Plan.
+
 ## [2026-08-09] - Neustart setzt Nachtlauf zurück
 
 ### 🛡️ Sicherheit

@@ -3,7 +3,8 @@ use crate::{
     language::Language,
     log_viewer,
     system_metrics::{self, SystemMetrics},
-    window_settings,
+    weather::{self, WeatherLocation, WeatherReading},
+    weather_location, window_settings,
 };
 use anyhow::{Context, Result};
 use eframe::egui;
@@ -118,6 +119,13 @@ struct LiveStatusApp {
     editing_warning_seconds: bool,
     metrics_rx: Receiver<SystemMetrics>,
     metrics: SystemMetrics,
+    weather_rx: Receiver<Result<WeatherReading, String>>,
+    weather_tx: Sender<Result<WeatherReading, String>>,
+    weather_location: WeatherLocation,
+    weather_reading: Option<WeatherReading>,
+    weather_checking: bool,
+    last_weather_fetch: Instant,
+    last_weather_location_check: Instant,
     opacity: Option<u8>,
     window_level: window_settings::WindowLevel,
     window_drag_started: bool,
@@ -128,6 +136,7 @@ impl LiveStatusApp {
         let (status_tx, status_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         let (metrics_tx, metrics_rx) = mpsc::channel();
+        let (weather_tx, weather_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut sampler = system_metrics::Sampler::new();
             loop {
@@ -156,6 +165,13 @@ impl LiveStatusApp {
             editing_warning_seconds: false,
             metrics_rx,
             metrics: SystemMetrics::default(),
+            weather_rx,
+            weather_tx,
+            weather_location: weather::current_location(),
+            weather_reading: None,
+            weather_checking: false,
+            last_weather_fetch: Instant::now() - Duration::from_secs(601),
+            last_weather_location_check: Instant::now() - Duration::from_secs(6),
             opacity: None,
             window_level: window_settings::WindowLevel::current(),
             window_drag_started: false,
@@ -177,6 +193,39 @@ impl LiveStatusApp {
     fn collect_metrics(&mut self) {
         while let Ok(metrics) = self.metrics_rx.try_recv() {
             self.metrics = metrics;
+        }
+    }
+
+    fn refresh_weather(&mut self) {
+        if self.last_weather_location_check.elapsed() >= Duration::from_secs(5) {
+            self.last_weather_location_check = Instant::now();
+            let location = weather::current_location();
+            if location != self.weather_location {
+                self.weather_location = location;
+                self.weather_reading = None;
+                self.last_weather_fetch = Instant::now() - Duration::from_secs(601);
+            }
+        }
+        if self.weather_checking || self.last_weather_fetch.elapsed() < Duration::from_secs(600) {
+            return;
+        }
+        self.weather_checking = true;
+        self.last_weather_fetch = Instant::now();
+        let sender = self.weather_tx.clone();
+        let location = self.weather_location.clone();
+        thread::spawn(move || {
+            let _ =
+                sender.send(weather::fetch_current(location).map_err(|error| error.to_string()));
+        });
+    }
+
+    fn collect_weather(&mut self) {
+        while let Ok(result) = self.weather_rx.try_recv() {
+            self.weather_checking = false;
+            if let Ok(reading) = result {
+                self.weather_location = reading.location.clone();
+                self.weather_reading = Some(reading);
+            }
         }
     }
 
@@ -341,7 +390,9 @@ impl eframe::App for LiveStatusApp {
         self.collect_results();
         self.collect_actions();
         self.collect_metrics();
+        self.collect_weather();
         self.refresh();
+        self.refresh_weather();
         paint_gradient(ui.painter(), ui.max_rect(), BG_TOP, BG_BOTTOM);
         let (log_clicked, level_clicked, minimize_clicked, close_clicked) =
             window_controls(ui, self.language, self.window_level);
@@ -394,6 +445,7 @@ impl eframe::App for LiveStatusApp {
                     self.pending_action,
                     self.error.as_deref(),
                     self.language,
+                    self.weather_reading.as_ref(),
                 );
                 let action = action_for(&self.status);
                 let night_mode_active = night_mode_active(&self.status);
@@ -526,7 +578,13 @@ impl eframe::App for LiveStatusApp {
                         ui.add_space(14.0);
                         ui.vertical(|ui| {
                             ui.add_space(30.0);
-                            let response = moon_icon(ui, moon.color, 59.5, gradient_rect)
+                            let response = moon_icon(
+                                    ui,
+                                    moon.color,
+                                    59.5,
+                                    gradient_rect,
+                                    moon.temperature_c,
+                                )
                                 .on_hover_text(moon.tooltip);
                             if response.hovered() && !self.action_in_progress {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -547,6 +605,11 @@ impl eframe::App for LiveStatusApp {
                 );
                 ui.add_space(6.0);
                 system_metrics_row(ui, self.metrics, self.language);
+                if weather_control_overlay(ui, &self.weather_reading, self.language) {
+                    if let Err(error) = weather_location::open() {
+                        self.error = Some(error.to_string());
+                    }
+                }
         });
         self.show_toast(ui.ctx());
         handle_window_drag(self, ui);
@@ -572,11 +635,13 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
         egui::pos2(rect.right() - 138.0, rect.top() + 1.0),
         egui::pos2(rect.right() - 3.0, rect.top() + 30.0),
     );
+    let weather_control = weather_control_rect(rect);
     let is_excluded = |position: egui::Pos2| {
         completion_switch.contains(position)
             || warning_seconds.contains(position)
             || moon.contains(position)
             || control_hood.contains(position)
+            || weather_control.contains(position)
     };
     let (origin, position, total_delta, primary_down) = ui.input(|input| {
         (
@@ -881,6 +946,7 @@ fn action_for(status: &WatchStatus) -> NightAction {
 struct MoonView {
     color: egui::Color32,
     tooltip: String,
+    temperature_c: Option<f64>,
 }
 
 fn moon_view(
@@ -888,27 +954,53 @@ fn moon_view(
     pending_action: Option<NightAction>,
     error: Option<&str>,
     language: Language,
+    weather_reading: Option<&WeatherReading>,
 ) -> MoonView {
+    let temperature_c = weather_reading.map(|reading| reading.temperature_c);
+    let weather_suffix = weather_reading
+        .map(|reading| {
+            format!(
+                "\n{}: {:.0} °C\n{}: {}",
+                reading.location.name,
+                reading.temperature_c,
+                language.text("Messzeit", "Observed"),
+                reading.observed_at,
+            )
+        })
+        .unwrap_or_else(|| {
+            language
+                .text(
+                    "\nTemperatur momentan nicht verfügbar",
+                    "\nTemperature currently unavailable",
+                )
+                .into()
+        });
     if matches!(pending_action, Some(NightAction::Start)) {
         return MoonView {
             color: GREEN,
-            tooltip: language
-                .text(
+            tooltip: format!(
+                "{}{}",
+                language.text(
                     "Nachtmodus wird aktiviert …\nBitte kurz warten.",
                     "Night mode is being enabled …\nPlease wait.",
-                )
-                .into(),
+                ),
+                weather_suffix
+            ),
+            temperature_c,
         };
     }
     if matches!(pending_action, Some(NightAction::Stop)) {
         return MoonView {
             color: GRAY,
-            tooltip: language
-                .text(
+            tooltip: format!(
+                "{}{}",
+                language.text(
                     "Nachtmodus wird deaktiviert …\nBitte kurz warten.",
                     "Night mode is being disabled …\nPlease wait.",
-                )
-                .into(),
+                ),
+                weather_suffix
+            ),
+            temperature_c,
         };
     }
     let (color, state, action) = match status {
@@ -1009,11 +1101,15 @@ fn moon_view(
         ),
     };
     let tooltip = if let Some(error) = error {
-        format!("{state}\nAktion fehlgeschlagen: {error}\n{action}")
+        format!("{state}\nAktion fehlgeschlagen: {error}\n{action}{weather_suffix}")
     } else {
-        format!("{state}\n{action}")
+        format!("{state}\n{action}{weather_suffix}")
     };
-    MoonView { color, tooltip }
+    MoonView {
+        color,
+        tooltip,
+        temperature_c,
+    }
 }
 
 fn agents_for(status: &WatchStatus) -> &AgentSummary {
@@ -1124,6 +1220,7 @@ fn moon_icon(
     color: egui::Color32,
     diameter: f32,
     gradient_rect: egui::Rect,
+    temperature_c: Option<f64>,
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::click());
@@ -1141,6 +1238,15 @@ fn moon_icon(
         radius * 0.86,
         gradient_color_at(gradient_rect, cutout_center),
     );
+    if let Some(temperature_c) = temperature_c {
+        painter.text(
+            cutout_center,
+            egui::Align2::CENTER_CENTER,
+            format!("{temperature_c:.0}°C"),
+            egui::FontId::proportional(15.0),
+            color,
+        );
+    }
     response
 }
 
@@ -1222,6 +1328,69 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Langu
         );
     });
     ui.spacing_mut().item_spacing.x = old_spacing;
+}
+
+fn weather_control_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 12.0, rect.bottom() - 10.0),
+        egui::vec2(22.0, 18.0),
+    )
+}
+
+fn weather_control_overlay(
+    ui: &mut egui::Ui,
+    reading: &Option<WeatherReading>,
+    language: Language,
+) -> bool {
+    let rect = weather_control_rect(ui.max_rect());
+    let response = ui.interact(
+        rect,
+        ui.make_persistent_id("live_weather_location"),
+        egui::Sense::click(),
+    );
+    let visible = response.hovered();
+    if visible {
+        ui.painter().rect_filled(
+            rect.expand(2.0),
+            egui::CornerRadius::same(6),
+            egui::Color32::from_rgba_unmultiplied(52, 54, 66, 220),
+        );
+        let color = if reading.is_some() { ACCENT } else { GRAY };
+        let center = rect.center();
+        ui.painter()
+            .circle_stroke(center, 4.0, egui::Stroke::new(1.2, color));
+        ui.painter().line_segment(
+            [
+                egui::pos2(center.x, center.y - 7.0),
+                egui::pos2(center.x, center.y + 7.0),
+            ],
+            egui::Stroke::new(1.2, color),
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(center.x - 2.0, center.y - 7.0),
+                egui::pos2(center.x + 2.0, center.y - 7.0),
+            ],
+            egui::Stroke::new(1.2, color),
+        );
+    }
+    response
+        .on_hover_text(match reading {
+            Some(reading) => format!(
+                "{}\n{}: {:.0} °C\n{}",
+                language.text("Wetterort ändern", "Change weather location"),
+                reading.location.name,
+                reading.temperature_c,
+                language.text("Klicken zum Suchen", "Click to search"),
+            ),
+            None => language
+                .text(
+                    "Wetterort festlegen\nKlicken zum Suchen",
+                    "Set weather location\nClick to search",
+                )
+                .into(),
+        })
+        .clicked()
 }
 
 fn metric_color(usage: Option<u8>) -> egui::Color32 {
