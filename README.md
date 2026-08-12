@@ -74,12 +74,17 @@ The moon also shows the current temperature for the selected weather location. L
 - **Stop and cancel shutdown**: ends the run and cancels only a pending shutdown scheduled by the watcher.
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.
 - **Open live status**: opens a freely movable status window that can be closed at any time. Left-clicking the tray icon opens it; right-clicking shows the menu.
+- **Reliable live window**: opening the live status again restores and focuses the existing window instead of creating a duplicate. Its last desktop position is stored locally and reused after the next start.
 - **Open live window at startup**: optionally reopen the live status window automatically whenever the tray app starts. The default remains tray-only until you enable this option.
 - **Completion log**: the live window's upper-right log button opens a read-only view of the last 30 requested sleep and shutdown actions.
 - **Weather location**: hover the small weather control at the lower-right of the live window to search and select a city or postal code. The selected location is stored locally in the Windows user registry.
 - **Window settings**: choose opacity from 100% (opaque) to 10% in 10-point steps. The upper-right live-window control cycles normal, always-on-top, and always-in-background placement. These settings are stored locally and can be changed while the live window is open.
 - The live-status footer gives a compact, informational view of CPU, RAM, GPU, occupied VRAM, and an available GPU power reading. Pastel yellow and red indicate medium and high utilization. Unsupported values show `—` and never affect the watcher.
 - **Start with Windows**: starts only the tray app when you log in. It does not automatically arm a night run.
+
+If a live-window start ever fails, the tray reports the failure and records a
+diagnostic line in the local `logs/ui-errors.log` file. This file is runtime
+data and is never part of the repository.
 
 Weather data uses [Open-Meteo's geocoding](https://open-meteo.com/en/docs/geocoding-api) and [forecast](https://open-meteo.com/en/docs) services. The location and temperature are never used by the safety-critical watcher.
 

@@ -8,17 +8,25 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use eframe::egui;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GetLastError, HANDLE, HWND, LPARAM};
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GWL_EXSTYLE, GetWindowLongW, LWA_ALPHA, SetLayeredWindowAttributes,
-    SetWindowLongW, WS_EX_LAYERED,
+    EnumWindows, FindWindowW, GWL_EXSTYLE, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
+    IsWindowVisible, LWA_ALPHA, SW_RESTORE, SetForegroundWindow, SetLayeredWindowAttributes,
+    SetWindowLongW, ShowWindow, WS_EX_LAYERED,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(4);
+const LIVE_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LIVE_INSTANCE_MUTEX: &str = "Local\\HerdrNachtwaechter.LiveStatus";
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
 const ACCENT_STRONG: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(74, 222, 128);
@@ -35,28 +43,162 @@ const BG_BOTTOM: egui::Color32 = egui::Color32::from_rgb(14, 19, 33);
 const WINDOW_DRAG_THRESHOLD_SQUARED: f32 = 4.0;
 
 pub fn open() -> Result<()> {
+    if let Some(hwnd) = find_live_window() {
+        activate_live_window(hwnd);
+        return Ok(());
+    }
+
     let executable =
         std::env::current_exe().context("Programmdatei konnte nicht bestimmt werden")?;
-    let mut command = Command::new(executable);
-    command
+    let mut child = Command::new(executable)
         .creation_flags(CREATE_NO_WINDOW)
         .arg("--live-status")
         .spawn()
         .context("Live-Status-Fenster konnte nicht gestartet werden")?;
-    Ok(())
+
+    let started_at = Instant::now();
+    loop {
+        if let Some(hwnd) = find_live_window() {
+            activate_live_window(hwnd);
+            return Ok(());
+        }
+        if started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT {
+            let detail = match child.try_wait() {
+                Ok(Some(status)) => format!(
+                    "Live-Status-Prozess wurde beendet, bevor ein Fenster sichtbar wurde ({status})"
+                ),
+                Ok(None) => {
+                    "Live-Status-Prozess läuft, aber nach vier Sekunden wurde kein Fenster gefunden"
+                        .into()
+                }
+                Err(error) => format!(
+                    "Live-Status-Fenster wurde nicht sichtbar; Prozessstatus konnte nicht geprüft werden: {error}"
+                ),
+            };
+            record_open_failure(&detail);
+            return Err(anyhow::anyhow!(detail));
+        }
+        thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
+    }
+}
+
+fn find_live_window() -> Option<HWND> {
+    let mut found = None;
+    unsafe {
+        let _ = EnumWindows(
+            Some(find_live_window_callback),
+            &mut found as *mut _ as LPARAM,
+        );
+    }
+    found
+}
+
+unsafe extern "system" fn find_live_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    unsafe {
+        let found = &mut *(lparam as *mut Option<HWND>);
+        if found.is_some() || IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return 1;
+        }
+        let mut title = vec![0u16; length as usize + 1];
+        let copied = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        let title = String::from_utf16_lossy(&title[..copied as usize]);
+        if title == "Herdr-Nachtwächter - Live-Status" || title == "Herdr Night Watch - Live Status"
+        {
+            *found = Some(hwnd);
+            return 0;
+        }
+    }
+    1
+}
+
+fn activate_live_window(hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+fn record_open_failure(detail: &str) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let Some(directory) = executable.parent() else {
+        return;
+    };
+    let log_directory = directory.join("logs");
+    if fs::create_dir_all(&log_directory).is_err() {
+        return;
+    }
+    let path = log_directory.join("ui-errors.log");
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(
+        file,
+        "{:?};live_status_open_failed;{}",
+        SystemTime::now(),
+        detail.replace(['\r', '\n', ';'], " ")
+    );
 }
 
 pub fn run() -> Result<()> {
+    let instance_mutex = match acquire_live_instance()? {
+        Some(handle) => handle,
+        None => {
+            if let Some(hwnd) = find_live_window() {
+                activate_live_window(hwnd);
+            }
+            return Ok(());
+        }
+    };
+
+    let result = run_window();
+    unsafe {
+        let _ = CloseHandle(instance_mutex);
+    }
+    result
+}
+
+fn acquire_live_instance() -> Result<Option<HANDLE>> {
+    let name: Vec<u16> = LIVE_INSTANCE_MUTEX
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(anyhow::anyhow!(
+            "Live-Status-Sperre konnte nicht erstellt werden"
+        ));
+    }
+    if unsafe { GetLastError() } == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        Ok(None)
+    } else {
+        Ok(Some(handle))
+    }
+}
+
+fn run_window() -> Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([400.0, 170.0])
+        .with_min_inner_size([390.0, 160.0])
+        .with_decorations(false)
+        .with_window_level(window_level(window_settings::WindowLevel::current()))
+        .with_title(match Language::current() {
+            Language::German => "Herdr-Nachtwächter - Live-Status",
+            Language::English => "Herdr Night Watch - Live Status",
+        });
+    if let Some(position) = window_settings::live_status_position() {
+        viewport = viewport.with_position(position);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 170.0])
-            .with_min_inner_size([390.0, 160.0])
-            .with_decorations(false)
-            .with_window_level(window_level(window_settings::WindowLevel::current()))
-            .with_title(match Language::current() {
-                Language::German => "Herdr-Nachtwächter - Live-Status",
-                Language::English => "Herdr Night Watch - Live Status",
-            }),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -129,6 +271,7 @@ struct LiveStatusApp {
     opacity: Option<u8>,
     window_level: window_settings::WindowLevel,
     window_drag_started: bool,
+    last_saved_position: Option<[f32; 2]>,
 }
 
 impl LiveStatusApp {
@@ -175,6 +318,7 @@ impl LiveStatusApp {
             opacity: None,
             window_level: window_settings::WindowLevel::current(),
             window_drag_started: false,
+            last_saved_position: window_settings::live_status_position(),
         }
     }
 
@@ -613,7 +757,23 @@ impl eframe::App for LiveStatusApp {
         });
         self.show_toast(ui.ctx());
         handle_window_drag(self, ui);
+        persist_window_position(self, ui.ctx());
         ui.ctx().request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+fn persist_window_position(app: &mut LiveStatusApp, ctx: &egui::Context) {
+    let position = ctx.input(|input| {
+        input
+            .viewport()
+            .outer_rect
+            .map(|rect| [rect.min.x.round(), rect.min.y.round()])
+    });
+    if position != app.last_saved_position
+        && let Some(position) = position
+        && window_settings::set_live_status_position(position).is_ok()
+    {
+        app.last_saved_position = Some(position);
     }
 }
 

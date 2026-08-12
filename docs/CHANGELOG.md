@@ -3,6 +3,17 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-12] - Live-Fenster zuverlässig öffnen
+
+### 🪟 Bedienung
+
+- **Position bleibt erhalten** - Die zuletzt gewählte Desktop-Position des Live-Fensters wird lokal gespeichert und beim nächsten Start wieder verwendet.
+- **Keine Duplikate** - Ein erneutes Öffnen restauriert und fokussiert das vorhandene Fenster. Eine benannte Windows-Sperre verhindert parallele Live-Fenster auch bei schnellen Doppelstarts.
+
+### 🔧 Diagnose
+
+- **Fehler nicht mehr unsichtbar** - Der Tray wartet auf ein tatsächlich sichtbares Live-Fenster. Startfehler werden gemeldet und zusätzlich in `logs/ui-errors.log` festgehalten.
+
 ## [2026-08-11] - Wetter im Mond
 
 ### 🌡️ Live-Status

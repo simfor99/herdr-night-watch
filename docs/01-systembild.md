@@ -63,6 +63,8 @@ Die öffentliche Anwendung speichert zwei lokale Angaben unter dem Windows-Benut
 
 Der Wetterort wird zusätzlich als lokale Windows-Registry-Einstellung gespeichert. Standardmäßig ist Leipzig hinterlegt. Die Live-App fragt die Temperatur im Hintergrund über Open-Meteo ab und zeigt bei fehlender Verbindung keinen erfundenen Wert. Diese Anzeige ist vollständig vom Wächter getrennt und kann keine Energieaktion auslösen.
 
+Auch die Position des Live-Fensters wird lokal unter dem Windows-Benutzerkonto gespeichert. Beim erneuten Öffnen wird ein vorhandenes Fenster restauriert und nach vorn geholt; der Startpfad schützt zusätzlich mit einer benannten Windows-Sperre vor doppelten Live-Fenstern. Fehlschläge beim Öffnen werden unter `logs/ui-errors.log` protokolliert.
+
 ## Persistenter Zustand und Protokoll
 
 Der Wächter legt seinen Zustand unter `~/.local/state/herdr-night-watch/` in der WSL-Distribution ab. Dieser Ort ist entscheidend für Diagnose und darf nicht ohne Grund gelöscht werden.
