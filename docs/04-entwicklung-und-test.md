@@ -63,6 +63,19 @@ cargo build --release
 
 Danach den genauen Release-Pfad prüfen und die EXE kontrolliert in den Installationsordner kopieren. Nie blind einen ganzen Ordner überschreiben und nie die aktive Anwendung ohne vorherigen Prozess- und Nachtlauf-Status ersetzen.
 
+### Windows-Energieschutz-Smoke-Test
+
+Der Tray aktiviert während eines Nachtlaufs einen Windows-Energieschutz gegen automatischen Leerlauf-Schlaf. Der manuelle Smoke-Test prüft den echten Windows-Pfad: Er setzt den Schutz für den aktuellen PowerShell-Prozess, sucht ihn mit `powercfg.exe /requests` in der `SYSTEM`-Sektion und gibt ihn anschließend wieder frei. Der Test fordert weder Energiesparmodus noch Herunterfahren an.
+
+Aus einer als Administrator gestarteten PowerShell im Repository:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+& .\windows\Test-HerdrNightWatchPowerGuard.ps1
+```
+
+Erwartet werden zwei `PASS`-Zeilen. Schlägt der Test fehl, bleibt keine absichtlich gesetzte Ausführungsanforderung zurück; die Freigabe liegt zusätzlich in einem `finally`-Block.
+
 ## Testmatrix
 
 Ein echter Windows-Shutdown wird nicht als automatischer Test ausgeführt. Die Testabdeckung entsteht aus dem sicheren Beobachtungsmodus, der Demo und gezielten Statusprüfungen.
@@ -81,6 +94,7 @@ Ein echter Windows-Shutdown wird nicht als automatischer Test ausgeführt. Die T
 | Verdeckter Start | Task über Tray starten und Desktop beobachten | Kein aufblitzendes Terminalfenster |
 | Standard-Countdown | Nachtmodus mit keiner mehr arbeitenden Herdr-Arbeit | Nach 5 Sekunden beginnt ein abbrechbarer 300-Sekunden-Countdown; das Feld im Live-Fenster kann für den nächsten Lauf 10 bis 3.600 Sekunden festlegen |
 | Gespeicherte Warnfrist | Im Live-Fenster 10 Sekunden speichern, danach per Tray oder Startskript ohne Parameter starten | `active-run.json` enthält `warning_seconds=10` |
+| Windows-Energieschutz | Als Administrator `windows\Test-HerdrNightWatchPowerGuard.ps1` ausführen | Der aktuelle PowerShell-Prozess erscheint während des Tests in `powercfg /requests`; danach ist der Request freigegeben |
 
 ## Prüfen vor dem Neustart der Tray-App
 

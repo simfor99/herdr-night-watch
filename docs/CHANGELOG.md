@@ -14,6 +14,7 @@
 - **Countdown sicher neu gestartet** - Herdr wird während der gesamten Warnfrist und unmittelbar vor der Energieaktion erneut geprüft. Neue Arbeit bricht die Warnung ab, löscht den Ruhezeit-Marker und startet nach bestätigter Ruhezeit wieder mit der vollständigen Warnfrist.
 - **Herdr-Fehler brechen Warnungen ab** - Fällt die Statusabfrage während eines bereits geplanten Countdowns aus, wird die eigene Windows-Aktion abgebrochen und der Wächter kehrt in die Überwachung zurück.
 - **Regressionstest ergänzt** - Die Python-Tests prüfen, dass beide Boot-Marken im Neustart-Token enthalten sind und der Resetpfad erhalten bleibt.
+- **Windows-Smoke-Test ergänzt** - Ein manueller, nicht-destruktiver Test prüft Aktivierung und Freigabe der Energiesperre mit `powercfg /requests`.
 
 ## [2026-08-12] - Live-Fenster zuverlässig öffnen
 

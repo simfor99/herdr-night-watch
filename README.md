@@ -83,6 +83,8 @@ The moon also shows the current temperature for the selected weather location. L
 - The live-status footer gives a compact, informational view of CPU, RAM, GPU, occupied VRAM, and an available GPU power reading. Pastel yellow and red indicate medium and high utilization. Unsupported values show `—` and never affect the watcher.
 - **Start with Windows**: starts only the tray app when you log in. It does not automatically arm a night run.
 
+For maintainers, `windows/Test-HerdrNightWatchPowerGuard.ps1` is a non-destructive Windows smoke test for this protection. Run it from an elevated PowerShell; it verifies activation and release with `powercfg /requests` and never sleeps or shuts down the computer.
+
 If a live-window start ever fails, the tray reports the failure and records a
 diagnostic line in the local `logs/ui-errors.log` file. This file is runtime
 data and is never part of the repository.

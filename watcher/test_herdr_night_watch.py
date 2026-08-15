@@ -79,6 +79,16 @@ class WindowsLauncherTests(unittest.TestCase):
 
         self.assertNotIn('Command::new("reg.exe")', sources)
 
+    def test_power_guard_smoke_test_has_activation_and_release_checks(self) -> None:
+        smoke_test = (PROJECT_ROOT / "windows" / "Test-HerdrNightWatchPowerGuard.ps1").read_text()
+
+        self.assertIn("SetThreadExecutionState", smoke_test)
+        self.assertIn("powercfg.exe", smoke_test)
+        self.assertIn("/requests", smoke_test)
+        self.assertIn("WindowsPrincipal", smoke_test)
+        self.assertIn("$esContinuous", smoke_test)
+        self.assertIn("finally", smoke_test)
+
 class CompletionActionTests(unittest.TestCase):
     def test_unknown_settings_fail_closed_to_shutdown(self) -> None:
         self.assertEqual(WATCHER.completion_action("sleep"), "sleep")
