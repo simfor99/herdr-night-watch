@@ -36,6 +36,7 @@ MIN_WARNING_SECONDS = 10
 MAX_WARNING_SECONDS = 3600
 NETWORK_GRACE_SECONDS = 300
 NETWORK_CHECK_INTERVAL_SECONDS = 15
+BOOT_MARKER_CACHE_TTL_SECONDS = 30
 CONNECTIVITY_URLS = (
     "https://www.msftconnecttest.com/connecttest.txt",
     "https://www.gstatic.com/generate_204",
@@ -53,6 +54,7 @@ DEFAULT_COMPLETION_ACTION = "shutdown"
 COMPLETION_ACTIONS = {"sleep", "shutdown"}
 STATE_SCHEMA_VERSION = 4
 _RUNTIME_BOOT_ID: str | None = None
+_RUNTIME_BOOT_ID_READ_AT: float | None = None
 
 
 def utc_now() -> datetime:
@@ -108,20 +110,60 @@ def windows_boot_id() -> str | None:
     return value if result.returncode == 0 and value else None
 
 
-def runtime_boot_id() -> str | None:
-    """Return a composite WSL and Windows boot marker."""
-    global _RUNTIME_BOOT_ID
-    if _RUNTIME_BOOT_ID is not None:
-        return _RUNTIME_BOOT_ID
+def runtime_boot_id(force: bool = False) -> str | None:
+    """Return a cached boot marker, or refresh it for safety-critical paths."""
+    global _RUNTIME_BOOT_ID, _RUNTIME_BOOT_ID_READ_AT
     wsl_marker = wsl_boot_id()
+    if not wsl_marker:
+        return None
+
+    now = time.monotonic()
+    if (
+        not force
+        and _RUNTIME_BOOT_ID is not None
+        and _RUNTIME_BOOT_ID_READ_AT is not None
+        and now - _RUNTIME_BOOT_ID_READ_AT < BOOT_MARKER_CACHE_TTL_SECONDS
+    ):
+        return _RUNTIME_BOOT_ID
+
+    cache_path = state_dir() / "boot-marker-cache.json"
+    if not force:
+        try:
+            cached = load_json(cache_path)
+        except (OSError, ValueError):
+            cached = None
+        cached_at = cached.get("cached_at") if cached else None
+        if (
+            cached
+            and cached.get("wsl_boot_id") == wsl_marker
+            and isinstance(cached.get("runtime_boot_id"), str)
+            and isinstance(cached_at, (int, float))
+            and 0 <= time.time() - cached_at < BOOT_MARKER_CACHE_TTL_SECONDS
+        ):
+            _RUNTIME_BOOT_ID = cached["runtime_boot_id"]
+            _RUNTIME_BOOT_ID_READ_AT = now
+            return _RUNTIME_BOOT_ID
+
     windows_marker = windows_boot_id()
-    if not wsl_marker or not windows_marker:
+    if not windows_marker:
         return None
     _RUNTIME_BOOT_ID = f"wsl:{wsl_marker}|windows:{windows_marker}"
+    _RUNTIME_BOOT_ID_READ_AT = now
+    try:
+        write_json(
+            cache_path,
+            {
+                "cached_at": time.time(),
+                "runtime_boot_id": _RUNTIME_BOOT_ID,
+                "wsl_boot_id": wsl_marker,
+            },
+        )
+    except OSError:
+        pass
     return _RUNTIME_BOOT_ID
 
 
-def reset_stale_run_after_restart() -> bool:
+def reset_stale_run_after_restart(force: bool = False) -> bool:
     """Finish an armed run left behind by a Windows/WSL restart.
 
     The shutdown process can terminate the watcher before it writes its final
@@ -129,7 +171,7 @@ def reset_stale_run_after_restart() -> bool:
     pending warning file.
     """
     _, state_path, warning_path, _ = paths()
-    current_boot_id = runtime_boot_id()
+    current_boot_id = runtime_boot_id(force=force)
     if not current_boot_id:
         return False
     with completion_lock():
@@ -203,7 +245,7 @@ def preferred_warning_seconds() -> int:
 def set_completion_action(action: str) -> int:
     if action not in COMPLETION_ACTIONS:
         raise RuntimeError("Unsupported completion action.")
-    reset_stale_run_after_restart()
+    reset_stale_run_after_restart(force=True)
     _, state_path, _, _ = paths()
     state = load_json(state_path)
     if state and not state.get("outcome"):
@@ -220,7 +262,7 @@ def set_warning_seconds(seconds: int) -> int:
         raise RuntimeError(
             f"Warning seconds must be between {MIN_WARNING_SECONDS} and {MAX_WARNING_SECONDS}."
         )
-    reset_stale_run_after_restart()
+    reset_stale_run_after_restart(force=True)
     _, state_path, _, _ = paths()
     state = load_json(state_path)
     if state and not state.get("outcome"):
@@ -495,7 +537,7 @@ def snapshot_target(agent: dict[str, Any]) -> dict[str, Any]:
 
 
 def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: int) -> int:
-    reset_stale_run_after_restart()
+    reset_stale_run_after_restart(force=True)
     root, state_path, warning_path, _ = paths()
     root.mkdir(parents=True, exist_ok=True)
     existing = load_json(state_path)
@@ -515,7 +557,7 @@ def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: i
         "schema_version": STATE_SCHEMA_VERSION,
         "demo": False,
         "run_id": str(uuid.uuid4()),
-        "boot_id": runtime_boot_id(),
+        "boot_id": runtime_boot_id(force=True),
         "armed_at": iso_now(),
         "dry_run": dry_run,
         "poll_seconds": poll_seconds,
@@ -539,7 +581,7 @@ def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: i
 
 def demo() -> int:
     """Run the complete visible state sequence without reading Herdr or shutting down Windows."""
-    reset_stale_run_after_restart()
+    reset_stale_run_after_restart(force=True)
     root, state_path, warning_path, _ = paths()
     root.mkdir(parents=True, exist_ok=True)
     existing = load_json(state_path)
@@ -551,7 +593,7 @@ def demo() -> int:
         "schema_version": 1,
         "demo": True,
         "run_id": str(uuid.uuid4()),
-        "boot_id": runtime_boot_id(),
+        "boot_id": runtime_boot_id(force=True),
         "armed_at": iso_now(),
         "dry_run": True,
         "poll_seconds": 1,
@@ -741,7 +783,7 @@ def abort_shutdown_if_ours() -> bool:
 
 
 def confirm_completion() -> int:
-    reset_stale_run_after_restart()
+    reset_stale_run_after_restart(force=True)
     _, _, warning_path, _ = paths()
     with completion_lock():
         state = load_json(paths()[1])
@@ -784,7 +826,7 @@ def finish(state: dict[str, Any], outcome: str, detail: str) -> None:
 
 
 def watch() -> int:
-    reset_stale_run_after_restart()
+    reset_stale_run_after_restart(force=True)
     _, state_path, _, lock_path = paths()
     state = load_json(state_path)
     if not state:
@@ -994,7 +1036,7 @@ def watch() -> int:
 
 
 def cancel(source: str) -> int:
-    reset_stale_run_after_restart()
+    reset_stale_run_after_restart(force=True)
     _, state_path, _, _ = paths()
     with completion_lock():
         state = load_json(state_path)

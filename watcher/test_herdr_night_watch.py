@@ -301,7 +301,12 @@ class ArmingTests(unittest.TestCase):
 
 class RestartResetTests(unittest.TestCase):
     def setUp(self) -> None:
+        previous_boot_id = WATCHER._RUNTIME_BOOT_ID
+        previous_read_at = WATCHER._RUNTIME_BOOT_ID_READ_AT
         WATCHER._RUNTIME_BOOT_ID = None
+        WATCHER._RUNTIME_BOOT_ID_READ_AT = None
+        self.addCleanup(setattr, WATCHER, "_RUNTIME_BOOT_ID", previous_boot_id)
+        self.addCleanup(setattr, WATCHER, "_RUNTIME_BOOT_ID_READ_AT", previous_read_at)
 
     def test_runtime_boot_id_includes_windows_boot_marker(self) -> None:
         with (
@@ -309,7 +314,7 @@ class RestartResetTests(unittest.TestCase):
             patch.object(WATCHER, "windows_boot_id", return_value="2026-08-15T05:00:00Z"),
         ):
             self.assertEqual(
-                WATCHER.runtime_boot_id(),
+                WATCHER.runtime_boot_id(force=True),
                 "wsl:wsl-boot|windows:2026-08-15T05:00:00Z",
             )
 
@@ -318,7 +323,28 @@ class RestartResetTests(unittest.TestCase):
             patch.object(WATCHER, "wsl_boot_id", return_value="wsl-boot"),
             patch.object(WATCHER, "windows_boot_id", return_value=None),
         ):
-            self.assertIsNone(WATCHER.runtime_boot_id())
+            self.assertIsNone(WATCHER.runtime_boot_id(force=True))
+
+    def test_runtime_boot_id_reuses_fresh_persisted_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with (
+                patch.object(WATCHER, "state_dir", return_value=root),
+                patch.object(WATCHER, "wsl_boot_id", return_value="wsl-boot"),
+                patch.object(
+                    WATCHER,
+                    "windows_boot_id",
+                    return_value="2026-08-15T05:00:00Z",
+                ) as windows_boot,
+            ):
+                first = WATCHER.runtime_boot_id(force=True)
+                WATCHER._RUNTIME_BOOT_ID = None
+                WATCHER._RUNTIME_BOOT_ID_READ_AT = None
+                second = WATCHER.runtime_boot_id()
+                self.assertEqual(first, second)
+                self.assertEqual(windows_boot.call_count, 1)
+                WATCHER.runtime_boot_id(force=True)
+                self.assertEqual(windows_boot.call_count, 2)
 
     def test_active_run_is_not_reset_when_current_boot_marker_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
