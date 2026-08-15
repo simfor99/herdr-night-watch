@@ -8,8 +8,11 @@
 ### 🛡️ Sicherheit
 
 - **Windows schläft nicht ungefragt ein** - Während `Watching` oder `ShutdownWarning` setzt die Tray-App eine Windows-Ausführungsanforderung gegen automatischen Leerlauf-Energiesparmodus. Die Sperre endet beim Stoppen, beim Ende des Laufs oder beim Beenden der App; die eigene bestätigte Energieaktion bleibt möglich.
+- **Guard-Fehler bleiben sichtbar und fail-safe** - Kann Windows die Energiesperre nicht setzen, wird ein neuer Nachtlauf sofort wieder gestoppt, statt ungeschützt weiterzulaufen. Der Fehler bleibt im Tray sichtbar, bis die Sperre erfolgreich hergestellt ist.
 - **Windows-Neustart sicher erkannt** - Der Wächter kombiniert WSL-Boot-ID und Windows-Bootzeit. Ein alter Nachtlauf wird nach einem Rechnerneustart nicht fortgesetzt, sondern als `system_restart` zurückgesetzt.
+- **Unvollständige Boot-Abfrage bleibt neutral** - Fehlt die Windows-Bootzeit vorübergehend, wird kein Teilmarker verglichen und kein aktiver Lauf fälschlich zurückgesetzt oder fortgesetzt.
 - **Countdown sicher neu gestartet** - Herdr wird während der gesamten Warnfrist und unmittelbar vor der Energieaktion erneut geprüft. Neue Arbeit bricht die Warnung ab, löscht den Ruhezeit-Marker und startet nach bestätigter Ruhezeit wieder mit der vollständigen Warnfrist.
+- **Herdr-Fehler brechen Warnungen ab** - Fällt die Statusabfrage während eines bereits geplanten Countdowns aus, wird die eigene Windows-Aktion abgebrochen und der Wächter kehrt in die Überwachung zurück.
 - **Regressionstest ergänzt** - Die Python-Tests prüfen, dass beide Boot-Marken im Neustart-Token enthalten sind und der Resetpfad erhalten bleibt.
 
 ## [2026-08-12] - Live-Fenster zuverlässig öffnen

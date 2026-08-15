@@ -45,6 +45,7 @@ struct App {
     result_rx: mpsc::Receiver<Result<backend::WatchStatus, String>>,
     result_tx: mpsc::Sender<Result<backend::WatchStatus, String>>,
     power_guard_active: bool,
+    power_guard_error: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -90,6 +91,7 @@ pub fn run() -> Result<()> {
         result_rx,
         result_tx,
         power_guard_active: false,
+        power_guard_error: false,
     };
     app.sync_power_guard();
     let result = event_loop.run_app(&mut app);
@@ -182,10 +184,11 @@ impl App {
                             );
                         }
                     }
-                    if self
-                        .message
-                        .as_deref()
-                        .is_some_and(|message| message.starts_with("Fehler:"))
+                    if !self.power_guard_error
+                        && self
+                            .message
+                            .as_deref()
+                            .is_some_and(|message| message.starts_with("Fehler:"))
                     {
                         self.message = None;
                     }
@@ -227,17 +230,39 @@ impl App {
         }
     }
 
+    fn set_power_guard(&mut self, active: bool) -> Result<()> {
+        if active == self.power_guard_active && !self.power_guard_error {
+            return Ok(());
+        }
+        power_guard::set_prevent_sleep(active)?;
+        self.power_guard_active = active;
+        if self.power_guard_error {
+            self.message = None;
+        }
+        self.power_guard_error = false;
+        Ok(())
+    }
+
     fn sync_power_guard(&mut self) {
         let should_prevent_sleep = matches!(
             self.status,
             backend::WatchStatus::Watching { .. } | backend::WatchStatus::ShutdownWarning { .. }
         );
-        if should_prevent_sleep == self.power_guard_active {
-            return;
-        }
-        match power_guard::set_prevent_sleep(should_prevent_sleep) {
-            Ok(()) => self.power_guard_active = should_prevent_sleep,
-            Err(error) => self.message = Some(format!("Fehler: {error}")),
+        if let Err(error) = self.set_power_guard(should_prevent_sleep) {
+            self.power_guard_error = true;
+            self.message = Some(format!("Fehler: {error}"));
+            if should_prevent_sleep {
+                let stop_result = backend::stop("power_guard_failed");
+                if let Err(stop_error) = stop_result {
+                    self.message = Some(format!(
+                        "Fehler: Windows-Energiesperre fehlgeschlagen ({error}); Nachtmodus konnte nicht sicher gestoppt werden ({stop_error})"
+                    ));
+                } else {
+                    self.message = Some(format!(
+                        "Fehler: Windows-Energiesperre fehlgeschlagen; Nachtmodus wurde sicher gestoppt ({error})"
+                    ));
+                }
+            }
         }
     }
 
@@ -337,17 +362,23 @@ impl App {
         if succeeded {
             match action {
                 ID_START | ID_OBSERVE => {
-                    if let Err(error) = power_guard::set_prevent_sleep(true) {
-                        self.message = Some(format!("Fehler: {error}"));
-                    } else {
-                        self.power_guard_active = true;
+                    if let Err(error) = self.set_power_guard(true) {
+                        self.power_guard_error = true;
+                        let rollback = backend::stop("power_guard_failed");
+                        self.message = Some(match rollback {
+                            Ok(()) => format!(
+                                "Fehler: Windows-Energiesperre fehlgeschlagen; Nachtmodus wurde sicher gestoppt ({error})"
+                            ),
+                            Err(stop_error) => format!(
+                                "Fehler: Windows-Energiesperre fehlgeschlagen ({error}); Nachtmodus konnte nicht sicher gestoppt werden ({stop_error})"
+                            ),
+                        });
                     }
                 }
                 ID_STOP => {
-                    if let Err(error) = power_guard::set_prevent_sleep(false) {
+                    if let Err(error) = self.set_power_guard(false) {
+                        self.power_guard_error = true;
                         self.message = Some(format!("Fehler: {error}"));
-                    } else {
-                        self.power_guard_active = false;
                     }
                 }
                 _ => {}

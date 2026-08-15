@@ -19,6 +19,8 @@ Nach einem Windows- oder WSL-Neustart wird ein unvollständig liegen gebliebener
 
 Wenn Windows trotz aktivem Nachtlauf schlafen möchte, prüfe zuerst, ob die Tray-App noch läuft und den Status aktuell anzeigt. Nur ein aktiver Zustand `Watching` oder `ShutdownWarning` hält den Leerlauf-Schutz. Der Schutz verhindert keinen manuellen Schlaf- oder Shutdown-Befehl und wird absichtlich aufgehoben, sobald der Nachtlauf endet.
 
+Kann Windows die Energiesperre nicht setzen, stoppt die Tray-App den gerade gestarteten Nachtlauf sicher und zeigt den Fehler weiter an. Ein vorübergehend fehlender Windows-Bootmarker führt dagegen nicht zu einem Teilvergleich: Der Reset wird erst bewertet, wenn WSL- und Windows-Marke gemeinsam vorliegen.
+
 ## Normale Betriebsprüfung
 
 Die folgenden Befehle werden in einer Windows-PowerShell ausgeführt. Sie verändern nichts.

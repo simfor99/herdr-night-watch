@@ -109,12 +109,11 @@ def windows_boot_id() -> str | None:
 
 def runtime_boot_id() -> str | None:
     """Return a composite WSL and Windows boot marker."""
-    markers = []
-    if marker := wsl_boot_id():
-        markers.append(f"wsl:{marker}")
-    if marker := windows_boot_id():
-        markers.append(f"windows:{marker}")
-    return "|".join(markers) or None
+    wsl_marker = wsl_boot_id()
+    windows_marker = windows_boot_id()
+    if not wsl_marker or not windows_marker:
+        return None
+    return f"wsl:{wsl_marker}|windows:{windows_marker}"
 
 
 def reset_stale_run_after_restart() -> bool:
@@ -855,7 +854,14 @@ def watch() -> int:
                     continue
 
                 # Recheck immediately before scheduling, then keep watching during the warning.
-                result, statuses = evaluate(state)
+                try:
+                    result, statuses = evaluate(state)
+                except RuntimeError as error:
+                    state["all_terminal_since"] = None
+                    write_json(state_path, state)
+                    log(f"Herdr check failed; retrying without shutdown: {error}")
+                    time.sleep(state["poll_seconds"])
+                    continue
                 if result == "refuse":
                     finish(state, "refused", ", ".join(statuses))
                     return 0
@@ -894,7 +900,15 @@ def watch() -> int:
                         warning_interrupted = True
                         break
                     continue
-                result, statuses = evaluate(state)
+                try:
+                    result, statuses = evaluate(state)
+                except RuntimeError as error:
+                    abort_shutdown_if_ours()
+                    state["all_terminal_since"] = None
+                    write_json(state_path, state)
+                    log(f"Completion warning cancelled because Herdr check failed: {error}")
+                    warning_interrupted = True
+                    break
                 if result == "refuse":
                     abort_shutdown_if_ours()
                     finish(state, "refused", ", ".join(statuses))

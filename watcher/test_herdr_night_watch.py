@@ -126,6 +126,142 @@ class CompletionActionTests(unittest.TestCase):
             )
 
 
+class WarningResetTests(unittest.TestCase):
+    def test_work_resuming_during_warning_requires_a_new_quiet_period(self) -> None:
+        class StopWatch(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            state = {
+                "run_id": "warning-reset-run",
+                "boot_id": "test-boot",
+                "outcome": None,
+                "demo": False,
+                "dry_run": True,
+                "monitoring_scope": WATCHER.LIVE_MONITORING_SCOPE,
+                "poll_seconds": 1,
+                "quiet_seconds": 1,
+                "warning_seconds": 2,
+                "completion_action": "shutdown",
+                "all_terminal_since": (WATCHER.utc_now() - timedelta(seconds=10)).isoformat(),
+                "network_unavailable_since": None,
+            }
+            WATCHER.write_json(state_path, state)
+            evaluate_results = iter(
+                [
+                    ("terminal", ["live_agents=0"]),
+                    ("terminal", ["live_agents=0"]),
+                    ("active", ["p1=working"]),
+                    ("terminal", ["live_agents=0"]),
+                ]
+            )
+            sleep_calls = 0
+
+            def controlled_sleep(_seconds: float) -> None:
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls >= 2:
+                    raise StopWatch()
+
+            def abort_warning() -> bool:
+                warning_path.unlink(missing_ok=True)
+                return True
+
+            with (
+                patch.object(WATCHER, "reset_stale_run_after_restart", return_value=False),
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, warning_path, root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "evaluate", side_effect=lambda _state: next(evaluate_results)),
+                patch.object(WATCHER.time, "sleep", side_effect=controlled_sleep),
+                patch.object(WATCHER, "abort_shutdown_if_ours", side_effect=abort_warning) as abort,
+            ):
+                with self.assertRaises(StopWatch):
+                    WATCHER.watch()
+
+            self.assertEqual(abort.call_count, 1)
+            updated = WATCHER.load_json(state_path)
+            self.assertIsNone(updated["outcome"])
+            self.assertIsNotNone(updated["all_terminal_since"])
+            self.assertFalse(warning_path.exists())
+
+    def test_final_warning_check_aborts_before_action_when_work_resumes(self) -> None:
+        class StopWatch(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            base_time = WATCHER.utc_now()
+            current_time = [base_time]
+            state = {
+                "run_id": "final-check-run",
+                "boot_id": "test-boot",
+                "outcome": None,
+                "demo": False,
+                "dry_run": True,
+                "monitoring_scope": WATCHER.LIVE_MONITORING_SCOPE,
+                "poll_seconds": 1,
+                "quiet_seconds": 1,
+                "warning_seconds": 1,
+                "completion_action": "shutdown",
+                "all_terminal_since": (base_time - timedelta(seconds=10)).isoformat(),
+                "network_unavailable_since": None,
+            }
+            WATCHER.write_json(state_path, state)
+            evaluate_results = iter(
+                [
+                    ("terminal", ["live_agents=0"]),
+                    ("terminal", ["live_agents=0"]),
+                    ("terminal", ["live_agents=0"]),
+                    ("active", ["p1=working"]),
+                    ("terminal", ["live_agents=0"]),
+                ]
+            )
+            sleep_calls = 0
+
+            def fake_now() -> object:
+                return current_time[0]
+
+            def controlled_sleep(seconds: float) -> None:
+                nonlocal sleep_calls
+                sleep_calls += 1
+                current_time[0] += timedelta(seconds=seconds)
+                if sleep_calls >= 2:
+                    raise StopWatch()
+
+            def abort_warning() -> bool:
+                warning_path.unlink(missing_ok=True)
+                return True
+
+            with (
+                patch.object(WATCHER, "reset_stale_run_after_restart", return_value=False),
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, warning_path, root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "utc_now", side_effect=fake_now),
+                patch.object(WATCHER, "evaluate", side_effect=lambda _state: next(evaluate_results)),
+                patch.object(WATCHER.time, "sleep", side_effect=controlled_sleep),
+                patch.object(WATCHER, "abort_shutdown_if_ours", side_effect=abort_warning) as abort,
+            ):
+                with self.assertRaises(StopWatch):
+                    WATCHER.watch()
+
+            self.assertEqual(abort.call_count, 1)
+            updated = WATCHER.load_json(state_path)
+            self.assertIsNone(updated["outcome"])
+            self.assertIsNotNone(updated["all_terminal_since"])
+            self.assertFalse(warning_path.exists())
+
+
 class ArmingTests(unittest.TestCase):
     def test_explicit_start_accepts_no_current_work(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -151,6 +287,35 @@ class RestartResetTests(unittest.TestCase):
                 WATCHER.runtime_boot_id(),
                 "wsl:wsl-boot|windows:2026-08-15T05:00:00Z",
             )
+
+    def test_runtime_boot_id_requires_both_boot_markers(self) -> None:
+        with (
+            patch.object(WATCHER, "wsl_boot_id", return_value="wsl-boot"),
+            patch.object(WATCHER, "windows_boot_id", return_value=None),
+        ):
+            self.assertIsNone(WATCHER.runtime_boot_id())
+
+    def test_active_run_is_not_reset_when_current_boot_marker_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            WATCHER.write_json(
+                state_path,
+                {"run_id": "same-run", "boot_id": "old-boot", "outcome": None},
+            )
+            WATCHER.write_json(warning_path, {"run_id": "same-run"})
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, warning_path, root / "watch.log"),
+                ),
+                patch.object(WATCHER, "runtime_boot_id", return_value=None),
+            ):
+                self.assertFalse(WATCHER.reset_stale_run_after_restart())
+            self.assertIsNone(WATCHER.load_json(state_path)["outcome"])
+            self.assertTrue(warning_path.exists())
 
     def test_active_run_is_reset_after_a_new_boot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
