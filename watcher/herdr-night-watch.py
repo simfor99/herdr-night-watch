@@ -918,6 +918,32 @@ def watch() -> int:
                 if not warning or warning.get("run_id") != state["run_id"]:
                     log("Completion action skipped because its warning is no longer active")
                     return 0
+                if warning_reason == "network_unavailable":
+                    if connectivity.refresh(state):
+                        abort_shutdown_if_ours()
+                        state["all_terminal_since"] = None
+                        write_json(state_path, state)
+                        log("Completion warning cancelled because internet connectivity returned")
+                        continue
+                else:
+                    try:
+                        result, statuses = evaluate(state)
+                    except RuntimeError as error:
+                        abort_shutdown_if_ours()
+                        state["all_terminal_since"] = None
+                        write_json(state_path, state)
+                        log(f"Completion warning cancelled because the final Herdr check failed: {error}")
+                        continue
+                    if result == "refuse":
+                        abort_shutdown_if_ours()
+                        finish(state, "refused", ", ".join(statuses))
+                        return 0
+                    if result != "terminal":
+                        abort_shutdown_if_ours()
+                        state["all_terminal_since"] = None
+                        write_json(state_path, state)
+                        log("Completion warning cancelled because Herdr reports active work again")
+                        continue
                 action = completion_action(state.get("completion_action"))
                 completion_detail = (
                     "internet was unavailable for five minutes through the warning"
