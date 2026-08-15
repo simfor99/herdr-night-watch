@@ -3,6 +3,14 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-15] - Stabilitätsrelease v0.1.17
+
+### 🔧 Zuverlässigkeit
+
+- **Gemeinsame Fenster-Schicht** - Transparenz, Fensterebenen, Farbverlauf und Glasreflexion liegen jetzt zentral in `src/window_chrome.rs`.
+- **Prozesssichere Transparenz** - Die Opazitätsänderung trifft ausschließlich Fenster der eigenen Tray-App und kann keine gleichnamigen Fremdfenster verändern.
+- **Regressionen geprüft** - Python-Wächtertests, Rust-Tests, Cross-Compile und Syntaxprüfung laufen erfolgreich; der manuelle Windows-Energieschutztest bleibt ein bewusst erhöhter, nicht-destruktiver Smoke-Test.
+
 ## [2026-08-15] - Leerlauf-Schlaf geschützt und Neustartzustand bereinigt
 
 ### 🛡️ Sicherheit
