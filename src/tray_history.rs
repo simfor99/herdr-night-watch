@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
@@ -80,13 +80,13 @@ fn log_directory() -> std::io::Result<PathBuf> {
         .ok_or_else(|| std::io::Error::other("Installationsordner fehlt"))
 }
 
-fn read_marker(path: &PathBuf) -> std::io::Result<SessionMarker> {
+fn read_marker(path: &Path) -> std::io::Result<SessionMarker> {
     let contents = fs::read_to_string(path)?;
     serde_json::from_str(&contents)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-fn write_marker(path: &PathBuf, marker: &SessionMarker) -> std::io::Result<()> {
+fn write_marker(path: &Path, marker: &SessionMarker) -> std::io::Result<()> {
     let temporary = path.with_extension("json.tmp");
     let contents = serde_json::to_string_pretty(marker).map_err(std::io::Error::other)?;
     fs::write(&temporary, format!("{contents}\n"))?;
@@ -94,7 +94,7 @@ fn write_marker(path: &PathBuf, marker: &SessionMarker) -> std::io::Result<()> {
 }
 
 fn append_event(
-    directory: &PathBuf,
+    directory: &Path,
     timestamp: &str,
     action: &str,
     trigger: &str,
@@ -134,18 +134,29 @@ fn append_event(
     replace_file(&temporary, &path)
 }
 
-fn replace_file(temporary: &PathBuf, destination: &PathBuf) -> std::io::Result<()> {
+fn replace_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
     match fs::rename(temporary, destination) {
         Ok(()) => Ok(()),
         Err(first_error) if destination.exists() => {
-            fs::remove_file(destination)?;
-            fs::rename(temporary, destination).or(Err(first_error))
+            let backup = destination.with_extension("bak");
+            let _ = fs::remove_file(&backup);
+            fs::rename(destination, &backup)?;
+            match fs::rename(temporary, destination) {
+                Ok(()) => {
+                    let _ = fs::remove_file(backup);
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = fs::rename(&backup, destination);
+                    Err(error)
+                }
+            }
         }
         Err(error) => Err(error),
     }
 }
 
-fn history_tail(directory: &PathBuf) -> Option<String> {
+fn history_tail(directory: &Path) -> Option<String> {
     let completion = read_tail(&directory.join("completion-history.csv"));
     let cancellation = read_tail(&directory.join("cancellation-history.csv"));
     if completion.is_none() && cancellation.is_none() {
@@ -158,7 +169,7 @@ fn history_tail(directory: &PathBuf) -> Option<String> {
     ))
 }
 
-fn read_tail(path: &PathBuf) -> Option<String> {
+fn read_tail(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok().and_then(|contents| {
         contents
             .lines()

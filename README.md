@@ -96,8 +96,7 @@ Weather data uses [Open-Meteo's geocoding](https://open-meteo.com/en/docs/geocod
 The Herdr Night Watch source code is MIT-licensed. The weather feature is a
 runtime service integration and has separate provider terms: Open-Meteo's free
 endpoints are for open-source and non-commercial use, are rate-limited, and
-require attribution. Forecast data is offered under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/);
-the geocoding API documents its data under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
+require attribution. Forecast and geocoding data are offered under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 For commercial deployments, use an appropriate Open-Meteo commercial/customer
 plan or replace the weather provider. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 for the exact notices and links. The core Herdr watcher remains usable under

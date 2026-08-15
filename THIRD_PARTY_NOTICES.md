@@ -18,10 +18,9 @@ Please see the official [Open-Meteo terms](https://open-meteo.com/en/terms),
 before deploying this feature.
 
 The free Open-Meteo endpoints are intended for open-source and non-commercial
-use and are subject to fair-use limits. Forecast data is published under
-[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The geocoding API
-documents its data as
-[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/). Attribution,
+use and are subject to fair-use limits. Forecast and geocoding data are
+published under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+Attribution,
 a link to the applicable license, and an indication of changes are required;
 the geocoding project asks for a link next to displayed location data.
 

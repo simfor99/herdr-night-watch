@@ -1180,12 +1180,7 @@ fn moon_view(
                 "Click to start night mode.",
             ),
         ),
-        WatchStatus::Watching {
-            observe_only,
-            quiet,
-            demo,
-            ..
-        } if *demo => (
+        WatchStatus::Watching { demo, .. } if *demo => (
             ACCENT,
             language.text("Demo läuft", "Demo running"),
             language.text(
@@ -1631,6 +1626,7 @@ fn system_metric_badge(
         egui::pos2(rect.left() + 7.0, rect.center().y),
         color,
     );
+    let has_value = value.is_some();
     let value = value.unwrap_or_else(|| "—".into());
     let text = if label.is_empty() {
         value.clone()
@@ -1642,7 +1638,7 @@ fn system_metric_badge(
         egui::Align2::LEFT_CENTER,
         text,
         egui::FontId::proportional(11.0),
-        if value == "—" { GRAY } else { color },
+        if has_value { color } else { GRAY },
     );
     response.on_hover_text(tooltip);
 }

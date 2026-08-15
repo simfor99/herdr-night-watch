@@ -248,6 +248,7 @@ impl App {
         }
         power_guard::set_prevent_sleep(active)?;
         self.power_guard_active = active;
+        self.power_guard_last_attempted = Some(active);
         if self.power_guard_error {
             self.message = None;
         }
@@ -266,6 +267,7 @@ impl App {
         self.power_guard_last_attempted = Some(should_prevent_sleep);
         if let Err(error) = self.set_power_guard(should_prevent_sleep) {
             self.power_guard_error = true;
+            self.power_guard_last_attempted = None;
             self.message = Some(format!("Fehler: {error}"));
             if should_prevent_sleep {
                 let stop_result = backend::stop("power_guard_failed");
@@ -398,6 +400,7 @@ impl App {
                 ID_START | ID_OBSERVE => {
                     if let Err(error) = self.set_power_guard(true) {
                         self.power_guard_error = true;
+                        self.power_guard_last_attempted = None;
                         let rollback = backend::stop("power_guard_failed");
                         self.message = Some(match rollback {
                             Ok(()) => format!(
@@ -413,6 +416,7 @@ impl App {
                     tray_history::set_expected_exit(false);
                     if let Err(error) = self.set_power_guard(false) {
                         self.power_guard_error = true;
+                        self.power_guard_last_attempted = None;
                         self.message = Some(format!("Fehler: {error}"));
                     }
                 }

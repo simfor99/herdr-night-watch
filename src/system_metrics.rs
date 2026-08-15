@@ -7,8 +7,10 @@ use std::mem::zeroed;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::ptr::null_mut;
+use std::time::{Duration, Instant};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const NVIDIA_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 use windows_sys::Win32::Foundation::{BOOL, FILETIME};
 use windows_sys::Win32::System::Performance::{
@@ -39,6 +41,9 @@ struct CpuSample {
 pub struct Sampler {
     cpu_previous: Option<CpuSample>,
     query: Option<PdhQuery>,
+    nvidia_available: bool,
+    nvidia_last_read: Option<Instant>,
+    nvidia_cached: Option<NvidiaTelemetry>,
 }
 
 impl Sampler {
@@ -46,7 +51,33 @@ impl Sampler {
         Self {
             cpu_previous: None,
             query: PdhQuery::new(),
+            nvidia_available: true,
+            nvidia_last_read: None,
+            nvidia_cached: None,
         }
+    }
+
+    fn sample_nvidia(&mut self) -> Option<NvidiaTelemetry> {
+        if !self.nvidia_available {
+            return self.nvidia_cached;
+        }
+        if self
+            .nvidia_last_read
+            .is_some_and(|last| last.elapsed() < NVIDIA_REFRESH_INTERVAL)
+        {
+            return self.nvidia_cached;
+        }
+        self.nvidia_last_read = Some(Instant::now());
+        match read_nvidia_gpu_telemetry() {
+            Some(telemetry) => {
+                self.nvidia_cached = Some(telemetry);
+            }
+            None => {
+                self.nvidia_available = false;
+                self.nvidia_cached = None;
+            }
+        }
+        self.nvidia_cached
     }
 
     pub fn sample(&mut self) -> SystemMetrics {
@@ -57,7 +88,7 @@ impl Sampler {
             .as_mut()
             .map(PdhQuery::sample)
             .unwrap_or_default();
-        let nvidia = read_nvidia_gpu_telemetry();
+        let nvidia = self.sample_nvidia();
         let gpu_watts = nvidia.as_ref().and_then(|telemetry| telemetry.power_watts);
         let gpu_power_percent = nvidia
             .as_ref()
