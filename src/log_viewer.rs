@@ -1,4 +1,4 @@
-use crate::{language::Language, window_settings};
+use crate::{language::Language, window_chrome, window_settings};
 use anyhow::{Context, Result};
 use eframe::egui;
 use std::fs;
@@ -6,10 +6,6 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GWL_EXSTYLE, GetWindowLongW, LWA_ALPHA, SetLayeredWindowAttributes,
-    SetWindowLongW, WS_EX_LAYERED,
-};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
@@ -17,7 +13,6 @@ const GREEN: egui::Color32 = egui::Color32::from_rgb(74, 222, 128);
 const RED: egui::Color32 = egui::Color32::from_rgb(248, 113, 113);
 const GRAY: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);
-const BG_TOP: egui::Color32 = egui::Color32::from_rgb(26, 34, 54);
 const BG_BOTTOM: egui::Color32 = egui::Color32::from_rgb(14, 19, 33);
 
 pub fn open() -> Result<()> {
@@ -38,7 +33,9 @@ pub fn run() -> Result<()> {
             .with_inner_size([720.0, 430.0])
             .with_min_inner_size([500.0, 280.0])
             .with_decorations(false)
-            .with_window_level(window_level(window_settings::WindowLevel::current()))
+            .with_window_level(window_chrome::window_level(
+                window_settings::WindowLevel::current(),
+            ))
             .with_title(log_title(language)),
         ..Default::default()
     };
@@ -124,17 +121,17 @@ impl eframe::App for LogApp {
         }
         let current_opacity = window_settings::opacity();
         if self.opacity != Some(current_opacity) {
-            apply_window_opacity(current_opacity, log_title(self.language));
+            window_chrome::apply_window_opacity(current_opacity, log_title(self.language));
             self.opacity = Some(current_opacity);
         }
 
         let window_rect = ui.max_rect();
-        paint_gradient(ui.painter(), window_rect);
+        window_chrome::default_gradient(ui.painter(), window_rect);
         let header_rect = egui::Rect::from_min_max(
             egui::pos2(window_rect.left() + 1.0, window_rect.top() + 1.0),
             egui::pos2(window_rect.right() - 1.0, window_rect.top() + 48.0),
         );
-        glass_sheen(ui.painter(), header_rect);
+        window_chrome::glass_sheen(ui.painter(), header_rect);
         let (minimize, close) = window_controls(ui);
         if minimize {
             ui.ctx()
@@ -304,7 +301,7 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         egui::CornerRadius::same(10),
         egui::Color32::from_rgba_unmultiplied(28, 29, 38, 220),
     );
-    glass_sheen(ui.painter(), hood);
+    window_chrome::glass_sheen(ui.painter(), hood);
     let minimize = ui.interact(
         minimize_rect,
         ui.make_persistent_id("log_window_minimize"),
@@ -342,97 +339,6 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         egui::Stroke::new(1.2, color),
     );
     (minimize.clicked(), close.clicked())
-}
-
-fn apply_window_opacity(opacity: u8, title: &str) {
-    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if hwnd.is_null() {
-            return;
-        }
-        let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED as i32);
-        let alpha = ((u16::from(opacity) * 255 + 50) / 100) as u8;
-        let _ = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
-    }
-}
-
-fn window_level(level: window_settings::WindowLevel) -> egui::WindowLevel {
-    match level {
-        window_settings::WindowLevel::Normal => egui::WindowLevel::Normal,
-        window_settings::WindowLevel::AlwaysOnTop => egui::WindowLevel::AlwaysOnTop,
-        window_settings::WindowLevel::AlwaysOnBottom => egui::WindowLevel::AlwaysOnBottom,
-    }
-}
-
-fn paint_gradient(painter: &egui::Painter, rect: egui::Rect) {
-    let mesh = egui::epaint::Mesh {
-        vertices: vec![
-            egui::epaint::Vertex {
-                pos: rect.left_top(),
-                uv: egui::Pos2::ZERO,
-                color: BG_TOP,
-            },
-            egui::epaint::Vertex {
-                pos: rect.right_top(),
-                uv: egui::Pos2::ZERO,
-                color: BG_TOP,
-            },
-            egui::epaint::Vertex {
-                pos: rect.right_bottom(),
-                uv: egui::Pos2::ZERO,
-                color: BG_BOTTOM,
-            },
-            egui::epaint::Vertex {
-                pos: rect.left_bottom(),
-                uv: egui::Pos2::ZERO,
-                color: BG_BOTTOM,
-            },
-        ],
-        indices: vec![0, 1, 2, 0, 2, 3],
-        ..Default::default()
-    };
-    painter.add(egui::epaint::Shape::Mesh(std::sync::Arc::new(mesh)));
-}
-
-fn glass_sheen(painter: &egui::Painter, rect: egui::Rect) {
-    let inset = 12.0_f32.min(rect.width() / 4.0);
-    let band_bottom = (rect.top() + rect.height() * 0.18).min(rect.bottom() - 1.0);
-    let band = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 1.0, rect.top() + 1.0),
-        egui::pos2(rect.right() - 1.0, band_bottom),
-    );
-    painter.rect_filled(
-        band,
-        egui::CornerRadius {
-            nw: 9,
-            ne: 9,
-            sw: 0,
-            se: 0,
-        },
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + inset, rect.top() + 1.5),
-            egui::pos2(rect.right() - inset, rect.top() + 1.5),
-        ],
-        egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
-        ),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + inset + 8.0, rect.top() + 3.0),
-            egui::pos2(rect.right() - inset - 8.0, rect.top() + 3.0),
-        ],
-        egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
-        ),
-    );
 }
 
 fn configure_visuals(context: &egui::Context) {

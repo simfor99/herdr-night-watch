@@ -21,6 +21,7 @@ Die Rust-Anwendung in diesem Projekt ist dagegen ein Controller. Sie bietet die 
 | Windows-Integration | [`src/backend.rs`](../src/backend.rs) | Verdeckte WSL-Aufrufe, Start des Hintergrundwächters und Statusübersetzung |
 | Lokale Einrichtung | [`src/configuration.rs`](../src/configuration.rs) und [`src/settings.rs`](../src/settings.rs) | WSL-Distro und Wächterpfad lokal speichern und im Setup-Fenster bearbeiten |
 | Warnfenster | [`src/notify.rs`](../src/notify.rs) | Windows-Dialog mit „Abbrechen“ in der echten Warnphase |
+| Fenster-Chrome | [`src/window_chrome.rs`](../src/window_chrome.rs) | Gemeinsame Windows-Schicht für Transparenz, Ebenen, Verlauf und Glasreflexion; Transparenz wird nur auf Fenster des eigenen Prozesses angewendet |
 | Live-Status | [`src/live_status.rs`](../src/live_status.rs) | Frei platzierbares, schließbares Fenster für Live-Arbeit und Nachtlaufzustand |
 | Wetteranzeige | [`src/weather.rs`](../src/weather.rs) und [`src/weather_location.rs`](../src/weather_location.rs) | Hintergrund-Temperaturabruf und Suchfenster für den lokalen Wetterort |
 | Autostart | [`src/autostart.rs`](../src/autostart.rs) | `HKCU\\...\\Run` für die Tray-App, nie für einen Nachtlauf |

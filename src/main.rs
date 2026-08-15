@@ -32,6 +32,8 @@ mod weather;
 #[cfg(windows)]
 mod weather_location;
 #[cfg(windows)]
+mod window_chrome;
+#[cfg(windows)]
 mod window_settings;
 
 #[cfg(windows)]

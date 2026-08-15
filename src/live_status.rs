@@ -4,7 +4,7 @@ use crate::{
     log_viewer,
     system_metrics::{self, SystemMetrics},
     weather::{self, WeatherLocation, WeatherReading},
-    weather_location, window_settings,
+    weather_location, window_chrome, window_settings,
 };
 use anyhow::{Context, Result};
 use eframe::egui;
@@ -18,9 +18,8 @@ use std::time::{Duration, Instant, SystemTime};
 use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GetLastError, HANDLE, HWND, LPARAM};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GWL_EXSTYLE, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
-    IsWindowVisible, LWA_ALPHA, SW_RESTORE, SetForegroundWindow, SetLayeredWindowAttributes,
-    SetWindowLongW, ShowWindow, WS_EX_LAYERED,
+    EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, SW_RESTORE,
+    SetForegroundWindow, ShowWindow,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -194,7 +193,9 @@ fn run_window() -> Result<()> {
         .with_inner_size([400.0, 170.0])
         .with_min_inner_size([390.0, 160.0])
         .with_decorations(false)
-        .with_window_level(window_level(window_settings::WindowLevel::current()))
+        .with_window_level(window_chrome::window_level(
+            window_settings::WindowLevel::current(),
+        ))
         .with_title(match Language::current() {
             Language::German => "Herdr-Nachtwächter - Live-Status",
             Language::English => "Herdr Night Watch - Live Status",
@@ -225,28 +226,6 @@ fn live_title(language: Language) -> &'static str {
         "Herdr-Nachtwächter - Live-Status",
         "Herdr Night Watch - Live Status",
     )
-}
-
-fn window_level(level: window_settings::WindowLevel) -> egui::WindowLevel {
-    match level {
-        window_settings::WindowLevel::Normal => egui::WindowLevel::Normal,
-        window_settings::WindowLevel::AlwaysOnTop => egui::WindowLevel::AlwaysOnTop,
-        window_settings::WindowLevel::AlwaysOnBottom => egui::WindowLevel::AlwaysOnBottom,
-    }
-}
-
-fn apply_window_opacity(opacity: u8, title: &str) {
-    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if hwnd.is_null() {
-            return;
-        }
-        let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED as i32);
-        let alpha = ((u16::from(opacity) * 255 + 50) / 100) as u8;
-        let _ = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
-    }
 }
 
 struct LiveStatusApp {
@@ -525,16 +504,16 @@ impl eframe::App for LiveStatusApp {
         }
         let current_opacity = window_settings::opacity();
         if self.opacity != Some(current_opacity) {
-            apply_window_opacity(current_opacity, live_title(self.language));
+            window_chrome::apply_window_opacity(current_opacity, live_title(self.language));
             self.opacity = Some(current_opacity);
         }
         let current_window_level = window_settings::WindowLevel::current();
         if current_window_level != self.window_level {
             self.window_level = current_window_level;
             ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
-                    current_window_level,
-                )));
+                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    window_chrome::window_level(current_window_level),
+                ));
         }
         self.collect_results();
         self.collect_actions();
@@ -542,7 +521,7 @@ impl eframe::App for LiveStatusApp {
         self.collect_weather();
         self.refresh();
         self.refresh_weather();
-        paint_gradient(ui.painter(), ui.max_rect(), BG_TOP, BG_BOTTOM);
+        window_chrome::paint_gradient(ui.painter(), ui.max_rect(), BG_TOP, BG_BOTTOM);
         let (log_clicked, level_clicked, minimize_clicked, close_clicked) =
             window_controls(ui, self.language, self.window_level);
         if log_clicked {
@@ -566,9 +545,9 @@ impl eframe::App for LiveStatusApp {
                 Ok(()) => {
                     self.window_level = next_level;
                     ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
-                            next_level,
-                        )));
+                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                            window_chrome::window_level(next_level),
+                        ));
                     self.toast = Some(Toast {
                         message: window_level_message(next_level, self.language).into(),
                         color: ACCENT,
@@ -722,7 +701,7 @@ impl eframe::App for LiveStatusApp {
                                     );
                                 }
                             });
-                            glass_sheen(ui.painter(), panel.response.rect);
+                            window_chrome::glass_sheen(ui.painter(), panel.response.rect);
                         });
                         ui.add_space(14.0);
                         ui.vertical(|ui| {
@@ -870,7 +849,7 @@ fn window_controls(
         egui::Stroke::new(1.0, egui::Color32::from_rgb(66, 74, 98)),
         egui::StrokeKind::Inside,
     );
-    glass_sheen(ui.painter(), hood_rect);
+    window_chrome::glass_sheen(ui.painter(), hood_rect);
     let log_rect = egui::Rect::from_min_max(
         egui::pos2(hood_rect.left() + 2.0, hood_rect.top()),
         egui::pos2(hood_rect.left() + button_width + 2.0, hood_rect.bottom()),
@@ -1311,7 +1290,7 @@ fn completion_switch(ui: &mut egui::Ui, action: CompletionAction, enabled: bool)
         egui::Stroke::new(1.0, border),
         egui::StrokeKind::Inside,
     );
-    glass_sheen(painter, rect);
+    window_chrome::glass_sheen(painter, rect);
 
     let knob_radius = 11.0;
     let left_center = egui::pos2(rect.left() + 14.0, rect.center().y);
@@ -1743,80 +1722,6 @@ fn glassy_frame(ui: &mut egui::Ui) -> egui::Frame {
         ))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::same(12))
-}
-
-fn glass_sheen(painter: &egui::Painter, rect: egui::Rect) {
-    let inset = 12.0_f32.min(rect.width() / 4.0);
-    let band_bottom = (rect.top() + rect.height() * 0.18).min(rect.bottom() - 1.0);
-    let band = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 1.0, rect.top() + 1.0),
-        egui::pos2(rect.right() - 1.0, band_bottom),
-    );
-    painter.rect_filled(
-        band,
-        egui::CornerRadius {
-            nw: 9,
-            ne: 9,
-            sw: 0,
-            se: 0,
-        },
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + inset, rect.top() + 1.5),
-            egui::pos2(rect.right() - inset, rect.top() + 1.5),
-        ],
-        egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
-        ),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + inset + 8.0, rect.top() + 3.0),
-            egui::pos2(rect.right() - inset - 8.0, rect.top() + 3.0),
-        ],
-        egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
-        ),
-    );
-}
-
-fn paint_gradient(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    top: egui::Color32,
-    bottom: egui::Color32,
-) {
-    let mesh = egui::epaint::Mesh {
-        vertices: vec![
-            egui::epaint::Vertex {
-                pos: rect.left_top(),
-                uv: egui::Pos2::ZERO,
-                color: top,
-            },
-            egui::epaint::Vertex {
-                pos: rect.right_top(),
-                uv: egui::Pos2::ZERO,
-                color: top,
-            },
-            egui::epaint::Vertex {
-                pos: rect.right_bottom(),
-                uv: egui::Pos2::ZERO,
-                color: bottom,
-            },
-            egui::epaint::Vertex {
-                pos: rect.left_bottom(),
-                uv: egui::Pos2::ZERO,
-                color: bottom,
-            },
-        ],
-        indices: vec![0, 1, 2, 0, 2, 3],
-        ..Default::default()
-    };
-    painter.add(egui::epaint::Shape::Mesh(std::sync::Arc::new(mesh)));
 }
 
 fn configure_visuals(context: &egui::Context) {

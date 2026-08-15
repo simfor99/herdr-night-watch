@@ -37,6 +37,7 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - Eine neue Wächterinstanz darf erst nach Freigabe des Lock des Vorgängers prüfen.
 - Tooltip und Live-Fenster zeigen die aktuelle Herdr-Sicht; die Shutdown-Prüfung liest diesen Status unabhängig erneut.
 - Die Systemtelemetrie im Live-Fenster ist reine Anzeige. Fehler oder fehlende Werte dürfen den Wächter und seine Energieentscheidung nicht beeinflussen.
+- Das visuelle Fenster-Chrome liegt zentral in `src/window_chrome.rs`; insbesondere darf die Transparenzsuche nie ein gleichnamiges Fenster eines anderen Prozesses verändern.
 
 ## Build und Auslieferung
 

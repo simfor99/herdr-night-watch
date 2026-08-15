@@ -1,7 +1,7 @@
-use crate::window_settings;
 use crate::{
     language::Language,
     weather::{self, WeatherLocation},
+    window_chrome, window_settings,
 };
 use anyhow::{Context, Result};
 use eframe::egui;
@@ -9,16 +9,12 @@ use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GWL_EXSTYLE, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongW, WS_EX_LAYERED,
-};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
 const RED: egui::Color32 = egui::Color32::from_rgb(242, 145, 150);
 const GRAY: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);
-const BG_TOP: egui::Color32 = egui::Color32::from_rgb(26, 34, 54);
 const BG_BOTTOM: egui::Color32 = egui::Color32::from_rgb(14, 19, 33);
 
 pub fn open() -> Result<()> {
@@ -39,7 +35,9 @@ pub fn run() -> Result<()> {
             .with_inner_size([560.0, 390.0])
             .with_min_inner_size([460.0, 320.0])
             .with_decorations(false)
-            .with_window_level(window_level(window_settings::WindowLevel::current()))
+            .with_window_level(window_chrome::window_level(
+                window_settings::WindowLevel::current(),
+            ))
             .with_title(window_title(language)),
         ..Default::default()
     };
@@ -59,28 +57,6 @@ fn window_title(language: Language) -> &'static str {
         "Herdr-Nachtwächter - Wetterort",
         "Herdr Night Watch - Weather location",
     )
-}
-
-fn window_level(level: window_settings::WindowLevel) -> egui::WindowLevel {
-    match level {
-        window_settings::WindowLevel::Normal => egui::WindowLevel::Normal,
-        window_settings::WindowLevel::AlwaysOnTop => egui::WindowLevel::AlwaysOnTop,
-        window_settings::WindowLevel::AlwaysOnBottom => egui::WindowLevel::AlwaysOnBottom,
-    }
-}
-
-fn apply_window_opacity(opacity: u8, title: &str) {
-    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if hwnd.is_null() {
-            return;
-        }
-        let style = windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED as i32);
-        let alpha = ((u16::from(opacity) * 255 + 50) / 100) as u8;
-        let _ = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
-    }
 }
 
 struct LocationApp {
@@ -173,7 +149,7 @@ impl eframe::App for LocationApp {
         }
         let opacity = window_settings::opacity();
         if self.opacity != Some(opacity) {
-            apply_window_opacity(opacity, window_title(self.language));
+            window_chrome::apply_window_opacity(opacity, window_title(self.language));
             self.opacity = Some(opacity);
         }
         self.collect_search();
@@ -185,12 +161,12 @@ impl eframe::App for LocationApp {
         }
 
         let rect = ui.max_rect();
-        paint_gradient(ui.painter(), rect);
+        window_chrome::default_gradient(ui.painter(), rect);
         let header = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 1.0, rect.top() + 1.0),
             egui::pos2(rect.right() - 1.0, rect.top() + 62.0),
         );
-        glass_sheen(ui.painter(), header);
+        window_chrome::glass_sheen(ui.painter(), header);
         let (minimize, close) = window_controls(ui);
         if minimize {
             ui.ctx()
@@ -369,7 +345,7 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         egui::CornerRadius::same(10),
         egui::Color32::from_rgba_unmultiplied(28, 29, 38, 220),
     );
-    glass_sheen(ui.painter(), hood);
+    window_chrome::glass_sheen(ui.painter(), hood);
     let minimize = ui.interact(
         minimize_rect,
         ui.make_persistent_id("weather_location_minimize"),
@@ -407,75 +383,6 @@ fn window_controls(ui: &mut egui::Ui) -> (bool, bool) {
         egui::Stroke::new(1.2, color),
     );
     (minimize.clicked(), close.clicked())
-}
-
-fn paint_gradient(painter: &egui::Painter, rect: egui::Rect) {
-    let mesh = egui::epaint::Mesh {
-        vertices: vec![
-            egui::epaint::Vertex {
-                pos: rect.left_top(),
-                uv: egui::Pos2::ZERO,
-                color: BG_TOP,
-            },
-            egui::epaint::Vertex {
-                pos: rect.right_top(),
-                uv: egui::Pos2::ZERO,
-                color: BG_TOP,
-            },
-            egui::epaint::Vertex {
-                pos: rect.right_bottom(),
-                uv: egui::Pos2::ZERO,
-                color: BG_BOTTOM,
-            },
-            egui::epaint::Vertex {
-                pos: rect.left_bottom(),
-                uv: egui::Pos2::ZERO,
-                color: BG_BOTTOM,
-            },
-        ],
-        indices: vec![0, 1, 2, 0, 2, 3],
-        ..Default::default()
-    };
-    painter.add(egui::epaint::Shape::Mesh(std::sync::Arc::new(mesh)));
-}
-
-fn glass_sheen(painter: &egui::Painter, rect: egui::Rect) {
-    let inset = 12.0_f32.min(rect.width() / 4.0);
-    let band_bottom = (rect.top() + rect.height() * 0.18).min(rect.bottom() - 1.0);
-    let band = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 1.0, rect.top() + 1.0),
-        egui::pos2(rect.right() - 1.0, band_bottom),
-    );
-    painter.rect_filled(
-        band,
-        egui::CornerRadius {
-            nw: 9,
-            ne: 9,
-            sw: 0,
-            se: 0,
-        },
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + inset, rect.top() + 1.5),
-            egui::pos2(rect.right() - inset, rect.top() + 1.5),
-        ],
-        egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
-        ),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + inset + 8.0, rect.top() + 3.0),
-            egui::pos2(rect.right() - inset - 8.0, rect.top() + 3.0),
-        ],
-        egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
-        ),
-    );
 }
 
 fn configure_visuals(context: &egui::Context) {
