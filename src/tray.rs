@@ -1,6 +1,6 @@
 use crate::{
-    autostart, backend, language::Language, live_status, notify, settings, weather_location,
-    window_settings,
+    autostart, backend, language::Language, live_status, notify, power_guard, settings,
+    weather_location, window_settings,
 };
 use anyhow::Result;
 use std::sync::mpsc;
@@ -44,6 +44,7 @@ struct App {
     checking: bool,
     result_rx: mpsc::Receiver<Result<backend::WatchStatus, String>>,
     result_tx: mpsc::Sender<Result<backend::WatchStatus, String>>,
+    power_guard_active: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -88,8 +89,12 @@ pub fn run() -> Result<()> {
         checking: false,
         result_rx,
         result_tx,
+        power_guard_active: false,
     };
-    event_loop.run_app(&mut app)?;
+    app.sync_power_guard();
+    let result = event_loop.run_app(&mut app);
+    let _ = power_guard::set_prevent_sleep(false);
+    result?;
     Ok(())
 }
 
@@ -116,6 +121,7 @@ impl App {
                         matches!(status, backend::WatchStatus::ShutdownWarning { .. })
                             && !matches!(self.status, backend::WatchStatus::ShutdownWarning { .. });
                     self.status = status;
+                    self.sync_power_guard();
                     if show_notice {
                         let (
                             demo,
@@ -221,6 +227,20 @@ impl App {
         }
     }
 
+    fn sync_power_guard(&mut self) {
+        let should_prevent_sleep = matches!(
+            self.status,
+            backend::WatchStatus::Watching { .. } | backend::WatchStatus::ShutdownWarning { .. }
+        );
+        if should_prevent_sleep == self.power_guard_active {
+            return;
+        }
+        match power_guard::set_prevent_sleep(should_prevent_sleep) {
+            Ok(()) => self.power_guard_active = should_prevent_sleep,
+            Err(error) => self.message = Some(format!("Fehler: {error}")),
+        }
+    }
+
     fn perform(&mut self, action: &str, event_loop: &ActiveEventLoop) {
         let result = match action {
             ID_START => backend::start(false),
@@ -260,6 +280,7 @@ impl App {
             }
             _ => return,
         };
+        let succeeded = result.is_ok();
         self.message = match result {
             Ok(()) => Some(match action {
                 ID_START => "Nachtmodus gestartet".into(),
@@ -313,6 +334,25 @@ impl App {
             }),
             Err(error) => Some(format!("Fehler: {error}")),
         };
+        if succeeded {
+            match action {
+                ID_START | ID_OBSERVE => {
+                    if let Err(error) = power_guard::set_prevent_sleep(true) {
+                        self.message = Some(format!("Fehler: {error}"));
+                    } else {
+                        self.power_guard_active = true;
+                    }
+                }
+                ID_STOP => {
+                    if let Err(error) = power_guard::set_prevent_sleep(false) {
+                        self.message = Some(format!("Fehler: {error}"));
+                    } else {
+                        self.power_guard_active = false;
+                    }
+                }
+                _ => {}
+            }
+        }
         if action == ID_LANGUAGE_DE {
             self.language = Language::German;
         }

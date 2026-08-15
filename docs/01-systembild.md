@@ -45,6 +45,8 @@ Rust-Backend startet `wsl.exe --watch` als fensterlosen Hintergrundprozess
         v
 Wächter prüft aktuellen Herdr-Status, Ruhezeit und Warnfrist
         |
+        +-- Nachtlauf aktiv -> Tray setzt Windows-Ausführungsstatus gegen automatischen Leerlauf-Energiesparmodus
+        |
         +-- Unsicherheit/blocked/fehlender Status -> refused, kein Shutdown
         |
         +-- Internet fünf Minuten nicht erreichbar -> normale Warnfrist, bei Rückkehr Abbruch
@@ -82,6 +84,10 @@ Der Wächter legt seinen Zustand unter `~/.local/state/herdr-night-watch/` in de
 Neue Läufe speichern `monitoring_scope=live_agents` und die Zahl der beim Start arbeitenden Agenten nur zur Nachvollziehbarkeit. Entscheidend ist danach immer die aktuelle Herdr-Antwort: Solange mindestens ein Agent `working` meldet, läuft der Nachtmodus weiter. Startet während der Ruhezeit oder Warnfrist neue Arbeit, wird die eigene Warnung abgebrochen und der Wächter beobachtet weiter. Alte Zustandsdateien ohne diesen Prüfbereich bleiben aus Kompatibilitätsgründen bei ihrer ursprünglichen Snapshot-Prüfung.
 
 Die Abschlussaktion und die Warnfrist werden beim Start zusätzlich in `active-run.json` eingefroren. Damit kann ein Klick im Live-Fenster keinen schon gestarteten Ablauf verändern. Der Schalter und das Sekundenfeld sind deshalb während eines aktiven Nachtlaufs bewusst gesperrt. Im Modus `sleep` läuft dieselbe gewählte Warnfrist ab; danach fordert der Wächter Windows zum Energiesparen auf. Im Modus `shutdown` wird der bekannte Windows-Shutdown angesetzt.
+
+Solange der Nachtlauf den Zustand `Watching` oder `ShutdownWarning` meldet, setzt die Tray-App den Windows-Ausführungsstatus `ES_SYSTEM_REQUIRED`. Dadurch darf ein konfigurierter Leerlauf-Timer den Rechner nicht ungefragt in den Energiesparmodus schicken, während Herdr noch überwacht wird. Der Bildschirm darf sich weiterhin ausschalten. Die Sperre wird beim Stoppen, beim Ende des Nachtlaufs und beim Beenden der Tray-App wieder freigegeben. Eine vom Wächter selbst bestätigte Energieaktion bleibt davon unberührt.
+
+Für Neustarts vergleicht der Wächter nicht nur die WSL-Boot-ID, sondern zusätzlich die letzte Windows-Bootzeit. Ändert sich eine der beiden Marken, gilt der alte Lauf als veraltet: Warnung und aktiver Zustand werden zurückgesetzt und als `system_restart` protokolliert.
 
 Der Wächter prüft zusätzlich zwei unabhängige Internet-Endpunkte. Erst wenn beide fünf Minuten durchgehend nicht erreichbar sind, startet er dieselbe sichtbare Warnfrist wie bei fertig gemeldeten Agenten. Kommt die Verbindung während dieser Frist zurück, bricht er seine eigene Warnung ab und überwacht weiter. Jeder tatsächliche Abschluss wird als angeforderter Energiesparmodus oder Shutdown in `completion-history.csv` aufgezeichnet; beim 31. Eintrag fällt der älteste der 30 bisherigen Einträge heraus.
 

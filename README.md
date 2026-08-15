@@ -70,6 +70,7 @@ The moon also shows the current temperature for the selected weather location. L
 ## Usage
 
 - **Start night mode**: continuously monitors all agents currently reported by Herdr and only shuts down Windows after the configured quiet period.
+- **Prevent idle sleep while watching**: while a night run is active, the tray app tells Windows that work is still required so an automatic idle-sleep timer cannot interrupt Herdr. The guard is released when the run stops or the app exits; the watcher's own confirmed sleep or shutdown action is still allowed.
 - **Observe only**: runs the same monitoring flow without performing a shutdown.
 - **Stop and cancel shutdown**: ends the run and cancels only a pending shutdown scheduled by the watcher.
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.
@@ -113,7 +114,7 @@ The EXE is a convenience artifact for Windows. For other architectures or after 
 
 The tooltip and live status window show the current Herdr count for information only. If Herdr cannot be read, the app never invents a number and the shutdown decision remains fail-closed.
 
-An armed night run never survives a Windows or WSL restart. On the next start, the watcher detects the changed boot marker, clears any stale warning, records the reset, and returns to the safe inactive state. A new night run must always be started deliberately.
+An armed night run never survives a Windows or WSL restart. On the next status check, the watcher compares a composite WSL and Windows boot marker, clears any stale warning, records the reset, and returns to the safe inactive state. A new night run must always be started deliberately.
 
 In a real night run, five seconds of confirmed inactivity starts the 300-second warning period. The Windows dialog offers `Cancel`; choosing it stops the watcher and cancels that specific pending shutdown.
 

@@ -82,6 +82,8 @@ Wenn das Tray-Symbol nicht direkt sichtbar ist, liegt es möglicherweise im ausg
 
 Ein Windows- oder WSL-Neustart beendet einen aktiven Nachtlauf sicher. Der Wächter vergleicht beim nächsten Statusaufruf die gespeicherte Boot-ID mit der aktuellen. Bei einer Änderung löscht er eine eventuell alte Warnung, protokolliert den Reset als `system_restart` und meldet wieder „kein Nachtlauf aktiv“. Ein neuer Nachtlauf muss bewusst gestartet werden.
 
+Während `Aktiv`, `Ruhezeit` oder `Warnfrist` setzt die Tray-App außerdem eine Windows-Ausführungsanforderung gegen automatischen Leerlauf-Energiesparmodus. Das schützt vor einem von Windows gestarteten Schlaf, solange Herdr noch arbeitet. Diese Anforderung wird beim Stoppen und beim Beenden der Tray-App aufgehoben; die vom Nachtwächter selbst bestätigte Energieaktion wird nicht blockiert.
+
 ## Live-Zahl und Nachtlauf-Zahl
 
 Der kompakte Tooltip lautet zum Beispiel `Aus · Herdr 4/10 aktiv`. Das ist die aktuelle Zahl aller von Herdr gemeldeten Agenten und beantwortet die Kontrollfrage „arbeitet Herdr gerade wirklich parallel?“, ohne an der Windows-Zeichengrenze abgeschnitten zu werden. Im laufenden Nachtmodus ist genau diese aktuelle Herdr-Sicht auch die Grundlage der Überwachung.

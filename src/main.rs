@@ -18,6 +18,8 @@ mod log_viewer;
 #[cfg(windows)]
 mod notify;
 #[cfg(windows)]
+mod power_guard;
+#[cfg(windows)]
 mod settings;
 #[cfg(windows)]
 mod system_metrics;

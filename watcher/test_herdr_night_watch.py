@@ -142,6 +142,16 @@ class ArmingTests(unittest.TestCase):
 
 
 class RestartResetTests(unittest.TestCase):
+    def test_runtime_boot_id_includes_windows_boot_marker(self) -> None:
+        with (
+            patch.object(WATCHER, "wsl_boot_id", return_value="wsl-boot"),
+            patch.object(WATCHER, "windows_boot_id", return_value="2026-08-15T05:00:00Z"),
+        ):
+            self.assertEqual(
+                WATCHER.runtime_boot_id(),
+                "wsl:wsl-boot|windows:2026-08-15T05:00:00Z",
+            )
+
     def test_active_run_is_reset_after_a_new_boot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

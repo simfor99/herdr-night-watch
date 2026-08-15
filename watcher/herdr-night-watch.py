@@ -76,13 +76,45 @@ def paths() -> tuple[Path, Path, Path, Path]:
     return root, root / "active-run.json", root / "shutdown-warning.json", root / "watch.lock"
 
 
-def runtime_boot_id() -> str | None:
+def wsl_boot_id() -> str | None:
     """Return the current WSL/Linux boot marker when the kernel exposes it."""
     try:
         value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
     except (OSError, UnicodeError):
         return None
     return value or None
+
+
+def windows_boot_id() -> str | None:
+    """Return Windows' last boot time when this watcher runs inside WSL."""
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
+
+
+def runtime_boot_id() -> str | None:
+    """Return a composite WSL and Windows boot marker."""
+    markers = []
+    if marker := wsl_boot_id():
+        markers.append(f"wsl:{marker}")
+    if marker := windows_boot_id():
+        markers.append(f"windows:{marker}")
+    return "|".join(markers) or None
 
 
 def reset_stale_run_after_restart() -> bool:
