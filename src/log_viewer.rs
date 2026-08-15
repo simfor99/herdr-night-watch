@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use eframe::egui;
 use std::fs;
 use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -59,12 +60,15 @@ fn log_title(language: Language) -> &'static str {
     )
 }
 
-fn log_path() -> Result<std::path::PathBuf> {
-    Ok(std::env::current_exe()?
+fn log_paths() -> Result<[PathBuf; 2]> {
+    let directory = std::env::current_exe()?
         .parent()
         .context("Installationsordner konnte nicht bestimmt werden")?
-        .join("logs")
-        .join("completion-history.csv"))
+        .join("logs");
+    Ok([
+        directory.join("completion-history.csv"),
+        directory.join("tray-history.csv"),
+    ])
 }
 
 #[derive(Clone)]
@@ -191,13 +195,23 @@ impl eframe::App for LogApp {
 }
 
 fn load_entries() -> Result<Vec<LogEntry>> {
-    let path = log_path()?;
+    let paths = log_paths()?;
+    let mut entries = Vec::new();
+    for path in paths {
+        entries.extend(load_entries_from(&path)?);
+    }
+    entries.sort_unstable_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    entries.truncate(30);
+    Ok(entries)
+}
+
+fn load_entries_from(path: &Path) -> Result<Vec<LogEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let text =
-        fs::read_to_string(path).context("Abschlussprotokoll konnte nicht gelesen werden")?;
-    let mut entries: Vec<_> = text
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("Protokoll konnte nicht gelesen werden: {}", path.display()))?;
+    let entries: Vec<_> = text
         .lines()
         .skip(1)
         .filter_map(|line| {
@@ -210,8 +224,6 @@ fn load_entries() -> Result<Vec<LogEntry>> {
             })
         })
         .collect();
-    entries.reverse();
-    entries.truncate(30);
     Ok(entries)
 }
 

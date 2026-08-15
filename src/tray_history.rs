@@ -7,6 +7,7 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 const HISTORY_LIMIT: usize = 30;
 const HISTORY_HEADER: &str = "Datum und Uhrzeit;Aktion;Auslöser;Lauf-ID";
+const TRAY_HISTORY_FILE: &str = "tray-history.csv";
 const UNEXPECTED_EXIT_ACTION: &str = "Tray-App unplanmäßig beendet";
 const UNEXPECTED_EXIT_TRIGGER: &str = "Vorherige Sitzung ohne sauberes Ende";
 
@@ -30,7 +31,7 @@ pub fn start_session() {
         let expected_action_recorded = previous.expected_exit
             && previous.expected_history_tail.as_deref() != history_tail(&directory).as_deref();
         if !expected_action_recorded {
-            let _ = append_event(
+            let _ = append_tray_event(
                 &directory,
                 &local_timestamp(),
                 UNEXPECTED_EXIT_ACTION,
@@ -93,14 +94,14 @@ fn write_marker(path: &Path, marker: &SessionMarker) -> std::io::Result<()> {
     replace_file(&temporary, path)
 }
 
-fn append_event(
+fn append_tray_event(
     directory: &Path,
     timestamp: &str,
     action: &str,
     trigger: &str,
     session_id: &str,
 ) -> std::io::Result<()> {
-    let path = directory.join("completion-history.csv");
+    let path = directory.join(TRAY_HISTORY_FILE);
     let mut rows: Vec<String> = if path.exists() {
         fs::read_to_string(&path)?
             .lines()

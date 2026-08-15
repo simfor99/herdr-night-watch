@@ -78,7 +78,7 @@ Der Wächter legt seinen Zustand unter `~/.local/state/herdr-night-watch/` in de
 | `settings.json` | Bevorzugte Abschlussaktion und Warnfrist für den nächsten Nachtlauf: `sleep` oder `shutdown`, 10 bis 3.600 Sekunden |
 | `watch.lock` | Verhindert zwei gleichzeitige Wächterprozesse |
 | `watch.log` | Zeitstempel-Protokoll aller wichtigen Entscheidungen |
-| Windows-Installationsordner `logs\\completion-history.csv` | Letzte 30 angeforderte Energiespar- oder Shutdown-Vorgänge mit lokaler Uhrzeit und Auslöser |
+| Windows-Installationsordner `logs\\completion-history.csv` und `logs\\tray-history.csv` | Getrennte Quellen für Energieaktionen und Tray-Ereignisse; der Viewer führt die letzten 30 Ereignisse zusammen |
 | Windows-Installationsordner `logs\\tray-session.json` | Temporärer Marker für eine laufende Tray-Sitzung; fehlt beim nächsten Start der saubere Abschluss, wird ein unplanmäßiges Ende im Abschlussprotokoll vermerkt |
 | Windows-Installationsordner `logs\\cancellation-history.csv` | Letzte 30 manuell oder vom Warnfenster abgebrochene Nachtläufe mit genauer Abbruchquelle |
 
@@ -90,9 +90,9 @@ Solange der Nachtlauf den Zustand `Watching` oder `ShutdownWarning` meldet, setz
 
 Für Neustarts vergleicht der Wächter nicht nur die WSL-Boot-ID, sondern zusätzlich die letzte Windows-Bootzeit. Ändert sich eine der beiden Marken, gilt der alte Lauf als veraltet: Warnung und aktiver Zustand werden zurückgesetzt und als `system_restart` protokolliert.
 
-Der Wächter prüft zusätzlich zwei unabhängige Internet-Endpunkte. Erst wenn beide fünf Minuten durchgehend nicht erreichbar sind, startet er dieselbe sichtbare Warnfrist wie bei fertig gemeldeten Agenten. Kommt die Verbindung während dieser Frist zurück, bricht er seine eigene Warnung ab und überwacht weiter. Jeder tatsächliche Abschluss wird als angeforderter Energiesparmodus oder Shutdown in `completion-history.csv` aufgezeichnet; beim 31. Eintrag fällt der älteste der 30 bisherigen Einträge heraus.
+Der Wächter prüft zusätzlich zwei unabhängige Internet-Endpunkte. Erst wenn beide fünf Minuten durchgehend nicht erreichbar sind, startet er dieselbe sichtbare Warnfrist wie bei fertig gemeldeten Agenten. Kommt die Verbindung während dieser Frist zurück, bricht er seine eigene Warnung ab und überwacht weiter. Jeder tatsächliche Abschluss wird als angeforderter Energiesparmodus oder Shutdown in `completion-history.csv` aufgezeichnet. Erkannte unplanmäßige Tray-Enden landen getrennt in `tray-history.csv`; der Log-Viewer führt beide Quellen zusammen und begrenzt die sichtbare Liste auf 30 Einträge.
 
-Die Tray-App schreibt zusätzlich während ihrer Laufzeit einen temporären Sitzungsmarker. Beim normalen Beenden wird er entfernt. Findet ein späterer Start den Marker ohne `expected_exit`, ergänzt er `completion-history.csv` um „Tray-App unplanmäßig beendet“. Das beweist keinen Absturz im engeren Sinn: Es kann auch ein erzwungenes Beenden, ein Windows-Neustart oder ein Stromverlust gewesen sein. Erwartete Energieaktionen werden vorher markiert und erzeugen keinen falschen Absturz-Eintrag.
+Die Tray-App schreibt zusätzlich während ihrer Laufzeit einen temporären Sitzungsmarker. Beim normalen Beenden wird er entfernt. Findet ein späterer Start den Marker ohne `expected_exit`, ergänzt er `tray-history.csv` um „Tray-App unplanmäßig beendet“. Das beweist keinen Absturz im engeren Sinn: Es kann auch ein erzwungenes Beenden, ein Windows-Neustart oder ein Stromverlust gewesen sein. Erwartete Energieaktionen werden vorher markiert und erzeugen keinen falschen Absturz-Eintrag.
 
 Abbrüche erhalten ebenfalls einen eigenen Verlauf. `cancellation-history.csv` nennt als Quelle zum Beispiel `live_window_moon`, `tray_menu`, `warning_dialog`, `manual_stop_script` oder `start_failed`. Damit ist am Folgetag nachvollziehbar, warum ein Nachtlauf nicht mehr aktiv war.
 

@@ -29,7 +29,7 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - Energiesparmodus darf weder `shutdown.exe /s` noch `shutdown.exe /a` ausführen.
 - Nur eine positive Benutzerbestätigung der eigenen aktiven Warnung darf Energiesparmodus oder Herunterfahren vor Ablauf der Warnfrist auslösen.
 - Internet-Ausfall löst erst nach fünf Minuten und nur über dieselbe sichtbare Warnfrist aus; Rückkehr der Verbindung bricht diese Warnung ab.
-- `completion-history.csv` darf höchstens 30 Ereignisse enthalten und protokolliert angeforderte Energieaktionen sowie erkannte unplanmäßige Tray-Enden.
+- `completion-history.csv` protokolliert die angeforderten Energieaktionen des WSL-Wächters. `tray-history.csv` protokolliert erkannte unplanmäßige Tray-Enden. Der Log-Viewer führt beide Dateien zusammen und zeigt höchstens 30 Ereignisse.
 - `cancellation-history.csv` darf höchstens 30 Ereignisse enthalten und muss die konkrete Abbruchquelle speichern.
 - `--cancel` darf nur einen Shutdown abbrechen, für den eine gültige eigene Warnungsdatei existiert.
 - Die Tray-App und ihre Hilfsprozesse dürfen keine sichtbaren Konsolenfenster erzeugen.
@@ -89,13 +89,13 @@ Ein echter Windows-Shutdown wird nicht als automatischer Test ausgeführt. Die T
 | Stopp-Pfad | Demo oder Beobachtung starten, dann Stopp | Task beendet, Log enthält `CANCELLED` oder Abschluss |
 | Wächter-Sicherheitslogik | Neue Herdr-Arbeit oder gezielt unklare Herdr-Situation | Ruhezeit/Warnfrist wird zurückgesetzt oder Ergebnis `refused`, niemals Shutdown |
 | Internet-Ausfall | Beide Verbindungschecks fünf Minuten unerreichbar simulieren, dann Verbindung zurückgeben | Normale Warnfrist startet mit Internet-Hinweis; Rückkehr bricht sie ab |
-| Abschlussverlauf | 31 Abschlussereignisse in Testumgebung erzeugen | `logs\\completion-history.csv` hat Header plus maximal 30 jüngste Einträge |
+| Abschlussverlauf | 31 Abschlussereignisse in Testumgebung erzeugen | `logs\\completion-history.csv` und `logs\\tray-history.csv` bleiben getrennt; der Viewer zeigt maximal 30 jüngste Einträge |
 | Abbruchverlauf | Nachtlauf über Mond, Menü, Warnfenster und Stoppskript abbrechen | `logs\\cancellation-history.csv` nennt die passende Abbruchquelle |
 | Verdeckter Start | Task über Tray starten und Desktop beobachten | Kein aufblitzendes Terminalfenster |
 | Standard-Countdown | Nachtmodus mit keiner mehr arbeitenden Herdr-Arbeit | Nach 5 Sekunden beginnt ein abbrechbarer 300-Sekunden-Countdown; das Feld im Live-Fenster kann für den nächsten Lauf 10 bis 3.600 Sekunden festlegen |
 | Gespeicherte Warnfrist | Im Live-Fenster 10 Sekunden speichern, danach per Tray oder Startskript ohne Parameter starten | `active-run.json` enthält `warning_seconds=10` |
 | Windows-Energieschutz | Als Administrator `windows\Test-HerdrNightWatchPowerGuard.ps1` ausführen | Der aktuelle PowerShell-Prozess erscheint während des Tests in `powercfg /requests`; danach ist der Request freigegeben |
-| Tray-Absturz-Erkennung | Tray starten, Prozess während eines inaktiven Zustands gezielt beenden, Tray neu starten | Abschlussprotokoll enthält genau einen Hinweis „Tray-App unplanmäßig beendet“; ein erwarteter Energiesparmodus erzeugt keinen solchen Hinweis |
+| Tray-Absturz-Erkennung | Tray starten, Prozess während eines inaktiven Zustands gezielt beenden, Tray neu starten | `logs\\tray-history.csv` enthält genau einen Hinweis „Tray-App unplanmäßig beendet“; ein erwarteter Energiesparmodus erzeugt keinen solchen Hinweis |
 
 ## Prüfen vor dem Neustart der Tray-App
 
