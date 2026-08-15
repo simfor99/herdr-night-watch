@@ -29,7 +29,7 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - Energiesparmodus darf weder `shutdown.exe /s` noch `shutdown.exe /a` ausführen.
 - Nur eine positive Benutzerbestätigung der eigenen aktiven Warnung darf Energiesparmodus oder Herunterfahren vor Ablauf der Warnfrist auslösen.
 - Internet-Ausfall löst erst nach fünf Minuten und nur über dieselbe sichtbare Warnfrist aus; Rückkehr der Verbindung bricht diese Warnung ab.
-- `completion-history.csv` darf höchstens 30 Ereignisse enthalten und protokolliert nur tatsächlich angeforderte Aktionen.
+- `completion-history.csv` darf höchstens 30 Ereignisse enthalten und protokolliert angeforderte Energieaktionen sowie erkannte unplanmäßige Tray-Enden.
 - `cancellation-history.csv` darf höchstens 30 Ereignisse enthalten und muss die konkrete Abbruchquelle speichern.
 - `--cancel` darf nur einen Shutdown abbrechen, für den eine gültige eigene Warnungsdatei existiert.
 - Die Tray-App und ihre Hilfsprozesse dürfen keine sichtbaren Konsolenfenster erzeugen.
@@ -95,6 +95,7 @@ Ein echter Windows-Shutdown wird nicht als automatischer Test ausgeführt. Die T
 | Standard-Countdown | Nachtmodus mit keiner mehr arbeitenden Herdr-Arbeit | Nach 5 Sekunden beginnt ein abbrechbarer 300-Sekunden-Countdown; das Feld im Live-Fenster kann für den nächsten Lauf 10 bis 3.600 Sekunden festlegen |
 | Gespeicherte Warnfrist | Im Live-Fenster 10 Sekunden speichern, danach per Tray oder Startskript ohne Parameter starten | `active-run.json` enthält `warning_seconds=10` |
 | Windows-Energieschutz | Als Administrator `windows\Test-HerdrNightWatchPowerGuard.ps1` ausführen | Der aktuelle PowerShell-Prozess erscheint während des Tests in `powercfg /requests`; danach ist der Request freigegeben |
+| Tray-Absturz-Erkennung | Tray starten, Prozess während eines inaktiven Zustands gezielt beenden, Tray neu starten | Abschlussprotokoll enthält genau einen Hinweis „Tray-App unplanmäßig beendet“; ein erwarteter Energiesparmodus erzeugt keinen solchen Hinweis |
 
 ## Prüfen vor dem Neustart der Tray-App
 

@@ -78,7 +78,7 @@ Damit lässt sich das sichtbare Ende des Ablaufs testen, ohne Herdr-Arbeit zu ve
 
 Der Nachtlauf beobachtet fortlaufend den aktuellen Herdr-Status. Beginnt nach dem Scharfstellen neue Arbeit in einem anderen Pane, gehört sie automatisch dazu und setzt eine laufende Ruhezeit zurück. Beginnt sie während der Warnfrist, bricht der Wächter seinen eigenen Windows-Countdown ab und beobachtet weiter. Nicht von Herdr verwaltete Shell-Prozesse sind absichtlich außerhalb der Entscheidung.
 
-Fällt die Internetverbindung aus, zählt das nicht sofort als „fertig“. Erst nach fünf Minuten ohne erfolgreiche Antwort von zwei unabhängigen Verbindungschecks beginnt die normale Warnfrist. Das Warnfenster erklärt den Grund. Kommt Internet während des Countdowns zurück, wird der Countdown abgebrochen. Im Installationsordner unter `logs\completion-history.csv` stehen die letzten 30 tatsächlich angeforderten Energiespar- oder Shutdown-Vorgänge mit Datum, Uhrzeit und Auslöser.
+Fällt die Internetverbindung aus, zählt das nicht sofort als „fertig“. Erst nach fünf Minuten ohne erfolgreiche Antwort von zwei unabhängigen Verbindungschecks beginnt die normale Warnfrist. Das Warnfenster erklärt den Grund. Kommt Internet während des Countdowns zurück, wird der Countdown abgebrochen. Im Installationsordner unter `logs\completion-history.csv` stehen die letzten 30 tatsächlich angeforderten Energiespar- oder Shutdown-Vorgänge sowie erkannte unplanmäßige Tray-Enden mit Datum, Uhrzeit und Auslöser.
 
 Wenn das Tray-Symbol nicht direkt sichtbar ist, liegt es möglicherweise im ausgeklappten Bereich der Windows-Taskleiste hinter dem Pfeil `^`. Das ist ein Windows-Verhalten und kein Zeichen, dass der Wächter gestoppt wurde.
 

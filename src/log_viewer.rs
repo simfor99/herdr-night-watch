@@ -150,8 +150,8 @@ impl eframe::App for LogApp {
                 );
                 ui.label(
                     egui::RichText::new(self.language.text(
-                        "Die letzten 30 angeforderten Energieaktionen",
-                        "The last 30 requested power actions",
+                        "Die letzten 30 Energieaktionen und Tray-Ereignisse",
+                        "The last 30 power actions and tray events",
                     ))
                     .color(GRAY),
                 );
@@ -218,7 +218,7 @@ fn load_entries() -> Result<Vec<LogEntry>> {
 fn log_entry_row(ui: &mut egui::Ui, entry: &LogEntry, language: Language) {
     let color = if entry.action.contains("Energiespar") {
         GREEN
-    } else if entry.action.contains("Herunter") {
+    } else if entry.action.contains("Herunter") || entry.action.contains("unplanmäßig") {
         RED
     } else {
         ACCENT
@@ -243,6 +243,7 @@ fn localized_action(action: &str, language: Language) -> &str {
     match (action, language) {
         ("Energiesparmodus angefordert", Language::English) => "Sleep requested",
         ("Herunterfahren angefordert", Language::English) => "Shutdown requested",
+        ("Tray-App unplanmäßig beendet", Language::English) => "Tray app ended unexpectedly",
         _ => action,
     }
 }
@@ -254,6 +255,9 @@ fn localized_trigger(trigger: &str, language: Language) -> &str {
             "Internet unavailable for 5 minutes"
         }
         ("Sofortbestätigung", Language::English) => "Immediate confirmation",
+        ("Vorherige Sitzung ohne sauberes Ende", Language::English) => {
+            "Previous session had no clean exit"
+        }
         _ => trigger,
     }
 }

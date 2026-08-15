@@ -26,6 +26,8 @@ mod system_metrics;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
+mod tray_history;
+#[cfg(windows)]
 mod weather;
 #[cfg(windows)]
 mod weather_location;

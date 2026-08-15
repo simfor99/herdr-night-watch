@@ -33,6 +33,8 @@ Erwartung: Der Wächter gibt JSON mit `state` aus. Ohne aktiven Lauf lautet die 
 
 Das Tray-Menü „Protokoll öffnen“ öffnet dieselbe Quelle. Alternativ liegt sie im WSL-Zustandsordner unter `~/.local/state/herdr-night-watch/watch.log` und `diagnostics.jsonl`.
 
+Ein Eintrag „Tray-App unplanmäßig beendet“ wird beim nächsten Start erzeugt, wenn die vorherige Tray-Sitzung keinen sauberen Abschlussmarker hinterlassen hat. Das ist ein belastbarer Hinweis auf einen unerwarteten Prozess- oder Systemabbruch, aber kein Beweis für einen spezifischen Absturzgrund. Eine erwartete Energieaktion wird nicht als Absturz protokolliert.
+
 ## Sicher stoppen
 
 Wenn ein Lauf nicht weiterlaufen soll, immer den vorgesehenen Stopp verwenden:

@@ -79,6 +79,7 @@ Der Wächter legt seinen Zustand unter `~/.local/state/herdr-night-watch/` in de
 | `watch.lock` | Verhindert zwei gleichzeitige Wächterprozesse |
 | `watch.log` | Zeitstempel-Protokoll aller wichtigen Entscheidungen |
 | Windows-Installationsordner `logs\\completion-history.csv` | Letzte 30 angeforderte Energiespar- oder Shutdown-Vorgänge mit lokaler Uhrzeit und Auslöser |
+| Windows-Installationsordner `logs\\tray-session.json` | Temporärer Marker für eine laufende Tray-Sitzung; fehlt beim nächsten Start der saubere Abschluss, wird ein unplanmäßiges Ende im Abschlussprotokoll vermerkt |
 | Windows-Installationsordner `logs\\cancellation-history.csv` | Letzte 30 manuell oder vom Warnfenster abgebrochene Nachtläufe mit genauer Abbruchquelle |
 
 Neue Läufe speichern `monitoring_scope=live_agents` und die Zahl der beim Start arbeitenden Agenten nur zur Nachvollziehbarkeit. Entscheidend ist danach immer die aktuelle Herdr-Antwort: Solange mindestens ein Agent `working` meldet, läuft der Nachtmodus weiter. Startet während der Ruhezeit oder Warnfrist neue Arbeit, wird die eigene Warnung abgebrochen und der Wächter beobachtet weiter. Alte Zustandsdateien ohne diesen Prüfbereich bleiben aus Kompatibilitätsgründen bei ihrer ursprünglichen Snapshot-Prüfung.
@@ -90,6 +91,8 @@ Solange der Nachtlauf den Zustand `Watching` oder `ShutdownWarning` meldet, setz
 Für Neustarts vergleicht der Wächter nicht nur die WSL-Boot-ID, sondern zusätzlich die letzte Windows-Bootzeit. Ändert sich eine der beiden Marken, gilt der alte Lauf als veraltet: Warnung und aktiver Zustand werden zurückgesetzt und als `system_restart` protokolliert.
 
 Der Wächter prüft zusätzlich zwei unabhängige Internet-Endpunkte. Erst wenn beide fünf Minuten durchgehend nicht erreichbar sind, startet er dieselbe sichtbare Warnfrist wie bei fertig gemeldeten Agenten. Kommt die Verbindung während dieser Frist zurück, bricht er seine eigene Warnung ab und überwacht weiter. Jeder tatsächliche Abschluss wird als angeforderter Energiesparmodus oder Shutdown in `completion-history.csv` aufgezeichnet; beim 31. Eintrag fällt der älteste der 30 bisherigen Einträge heraus.
+
+Die Tray-App schreibt zusätzlich während ihrer Laufzeit einen temporären Sitzungsmarker. Beim normalen Beenden wird er entfernt. Findet ein späterer Start den Marker ohne `expected_exit`, ergänzt er `completion-history.csv` um „Tray-App unplanmäßig beendet“. Das beweist keinen Absturz im engeren Sinn: Es kann auch ein erzwungenes Beenden, ein Windows-Neustart oder ein Stromverlust gewesen sein. Erwartete Energieaktionen werden vorher markiert und erzeugen keinen falschen Absturz-Eintrag.
 
 Abbrüche erhalten ebenfalls einen eigenen Verlauf. `cancellation-history.csv` nennt als Quelle zum Beispiel `live_window_moon`, `tray_menu`, `warning_dialog`, `manual_stop_script` oder `start_failed`. Damit ist am Folgetag nachvollziehbar, warum ein Nachtlauf nicht mehr aktiv war.
 

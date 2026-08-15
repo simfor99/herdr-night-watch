@@ -90,6 +90,14 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertIn("[Convert]::ToUInt32('80000000', 16)", smoke_test)
         self.assertIn("finally", smoke_test)
 
+    def test_tray_session_marker_records_unclean_exit_in_completion_history(self) -> None:
+        history = (PROJECT_ROOT / "src" / "tray_history.rs").read_text()
+
+        self.assertIn('"tray-session.json"', history)
+        self.assertIn('"completion-history.csv"', history)
+        self.assertIn("expected_history_tail", history)
+        self.assertIn("Tray-App unplanmäßig beendet", history)
+
 class CompletionActionTests(unittest.TestCase):
     def test_unknown_settings_fail_closed_to_shutdown(self) -> None:
         self.assertEqual(WATCHER.completion_action("sleep"), "sleep")

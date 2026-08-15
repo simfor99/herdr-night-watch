@@ -16,6 +16,7 @@
 - **Regressionstest ergänzt** - Die Python-Tests prüfen, dass beide Boot-Marken im Neustart-Token enthalten sind und der Resetpfad erhalten bleibt.
 - **Windows-Smoke-Test ergänzt** - Ein manueller, nicht-destruktiver Test prüft Aktivierung und Freigabe der Energiesperre mit `powercfg /requests`.
 - **PowerShell-Flag korrigiert** - Das Smoke-Test-Skript wandelt das hohe `ES_CONTINUOUS`-Bit explizit in `UInt32` um und läuft damit auch in Windows PowerShell 5.1.
+- **Unplanmäßige Tray-Enden sichtbar** - Eine Sitzung ohne sauberen Abschlussmarker wird beim nächsten Start im Abschlussprotokoll der letzten 30 Ereignisse vermerkt. Erwartete Energieaktionen werden dabei nicht als Absturz fehlklassifiziert.
 
 ## [2026-08-12] - Live-Fenster zuverlässig öffnen
 

@@ -1,6 +1,6 @@
 use crate::{
     autostart, backend, language::Language, live_status, notify, power_guard, settings,
-    weather_location, window_settings,
+    tray_history, weather_location, window_settings,
 };
 use anyhow::Result;
 use std::sync::mpsc;
@@ -77,6 +77,7 @@ pub fn run() -> Result<()> {
         )))
         .with_menu_on_left_click(false)
         .build()?;
+    tray_history::start_session();
     if window_settings::live_status_on_start() {
         let _ = live_status::open();
     }
@@ -94,8 +95,12 @@ pub fn run() -> Result<()> {
         power_guard_error: false,
     };
     app.sync_power_guard();
+    app.sync_expected_exit();
     let result = event_loop.run_app(&mut app);
     let _ = power_guard::set_prevent_sleep(false);
+    if result.is_ok() {
+        tray_history::finish_session();
+    }
     result?;
     Ok(())
 }
@@ -124,6 +129,7 @@ impl App {
                             && !matches!(self.status, backend::WatchStatus::ShutdownWarning { .. });
                     self.status = status;
                     self.sync_power_guard();
+                    self.sync_expected_exit();
                     if show_notice {
                         let (
                             demo,
@@ -160,13 +166,17 @@ impl App {
                                     match backend::confirm_completion() {
                                         Ok(()) => Some("Abschluss sofort bestätigt".into()),
                                         Err(error) => {
+                                            tray_history::set_expected_exit(false);
                                             Some(format!("Fehler beim Bestätigen: {error}"))
                                         }
                                     }
                                 }
                                 notify::NoticeAction::Cancel => {
                                     match backend::stop("warning_dialog") {
-                                        Ok(()) => Some("Nachtmodus abgebrochen".into()),
+                                        Ok(()) => {
+                                            tray_history::set_expected_exit(false);
+                                            Some("Nachtmodus abgebrochen".into())
+                                        }
                                         Err(error) => {
                                             Some(format!("Fehler beim Abbrechen: {error}"))
                                         }
@@ -266,6 +276,23 @@ impl App {
         }
     }
 
+    fn sync_expected_exit(&self) {
+        match self.status {
+            backend::WatchStatus::ShutdownWarning {
+                demo: false,
+                observe_only: false,
+                ..
+            } => tray_history::set_expected_exit(true),
+            backend::WatchStatus::Watching { .. } | backend::WatchStatus::Off { .. } => {
+                tray_history::set_expected_exit(false)
+            }
+            // Keep the expected marker through the brief Finished state so a
+            // completed automatic power action is not mistaken for a crash.
+            backend::WatchStatus::Finished { .. }
+            | backend::WatchStatus::ShutdownWarning { .. } => {}
+        }
+    }
+
     fn perform(&mut self, action: &str, event_loop: &ActiveEventLoop) {
         let result = match action {
             ID_START => backend::start(false),
@@ -300,6 +327,7 @@ impl App {
                     // running night watch behind when its only warning surface exits.
                     let _ = backend::stop("tray_app_quit");
                 }
+                tray_history::finish_session();
                 event_loop.exit();
                 return;
             }
@@ -376,6 +404,7 @@ impl App {
                     }
                 }
                 ID_STOP => {
+                    tray_history::set_expected_exit(false);
                     if let Err(error) = self.set_power_guard(false) {
                         self.power_guard_error = true;
                         self.message = Some(format!("Fehler: {error}"));
