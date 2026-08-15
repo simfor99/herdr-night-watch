@@ -34,7 +34,10 @@ namespace HerdrNightWatch {
 '@
 }
 
-$esContinuous = [uint32]0x80000000
+# Windows PowerShell parses 0x80000000 as a signed negative integer first.
+# Convert from the hexadecimal text explicitly so the native UInt32 flag is
+# valid in both Windows PowerShell 5.1 and PowerShell 7.
+$esContinuous = [Convert]::ToUInt32('80000000', 16)
 $esSystemRequired = [uint32]0x00000001
 $processName = [Diagnostics.Process]::GetCurrentProcess().ProcessName
 

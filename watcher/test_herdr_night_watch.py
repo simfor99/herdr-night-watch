@@ -87,6 +87,7 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertIn("/requests", smoke_test)
         self.assertIn("WindowsPrincipal", smoke_test)
         self.assertIn("$esContinuous", smoke_test)
+        self.assertIn("[Convert]::ToUInt32('80000000', 16)", smoke_test)
         self.assertIn("finally", smoke_test)
 
 class CompletionActionTests(unittest.TestCase):
