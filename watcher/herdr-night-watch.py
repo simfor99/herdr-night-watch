@@ -52,6 +52,7 @@ LIVE_MONITORING_SCOPE = "live_agents"
 DEFAULT_COMPLETION_ACTION = "shutdown"
 COMPLETION_ACTIONS = {"sleep", "shutdown"}
 STATE_SCHEMA_VERSION = 4
+_RUNTIME_BOOT_ID: str | None = None
 
 
 def utc_now() -> datetime:
@@ -109,11 +110,15 @@ def windows_boot_id() -> str | None:
 
 def runtime_boot_id() -> str | None:
     """Return a composite WSL and Windows boot marker."""
+    global _RUNTIME_BOOT_ID
+    if _RUNTIME_BOOT_ID is not None:
+        return _RUNTIME_BOOT_ID
     wsl_marker = wsl_boot_id()
     windows_marker = windows_boot_id()
     if not wsl_marker or not windows_marker:
         return None
-    return f"wsl:{wsl_marker}|windows:{windows_marker}"
+    _RUNTIME_BOOT_ID = f"wsl:{wsl_marker}|windows:{windows_marker}"
+    return _RUNTIME_BOOT_ID
 
 
 def reset_stale_run_after_restart() -> bool:
@@ -124,21 +129,24 @@ def reset_stale_run_after_restart() -> bool:
     pending warning file.
     """
     _, state_path, warning_path, _ = paths()
-    state = load_json(state_path)
-    if not state or state.get("outcome"):
-        return False
     current_boot_id = runtime_boot_id()
-    if not current_boot_id or state.get("boot_id") == current_boot_id:
+    if not current_boot_id:
         return False
+    with completion_lock():
+        state = load_json(state_path)
+        if not state or state.get("outcome"):
+            return False
+        previous_boot_id = state.get("boot_id")
+        if not previous_boot_id or previous_boot_id == current_boot_id:
+            return False
 
-    run_id = str(state.get("run_id", "unknown"))
-    previous_boot_id = state.get("boot_id")
-    state["outcome"] = "reset_after_restart"
-    state["finished_at"] = iso_now()
-    state["detail"] = "night watch reset after WSL/Windows restart"
-    state["reset_reason"] = "boot_id_changed" if previous_boot_id else "missing_boot_id_marker"
-    write_json(state_path, state)
-    warning_path.unlink(missing_ok=True)
+        run_id = str(state.get("run_id", "unknown"))
+        state["outcome"] = "reset_after_restart"
+        state["finished_at"] = iso_now()
+        state["detail"] = "night watch reset after WSL/Windows restart"
+        state["reset_reason"] = "boot_id_changed"
+        write_json(state_path, state)
+        warning_path.unlink(missing_ok=True)
     try:
         record_cancellation("system_restart", run_id)
     except (OSError, UnicodeError, csv.Error) as error:

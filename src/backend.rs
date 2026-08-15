@@ -3,6 +3,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -175,9 +177,22 @@ fn spawn_watcher() -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    command
+    let mut child = command
         .spawn()
         .context("Herdr-Hintergrundwächter konnte nicht gestartet werden")?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("Herdr-Hintergrundwächter konnte nicht geprüft werden")?
+        {
+            bail!("Herdr-Hintergrundwächter wurde beim Start beendet ({status})");
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
     Ok(())
 }
 
@@ -288,7 +303,10 @@ pub fn demo() -> Result<()> {
         .arg(watcher_path())
         .arg("--demo");
     command_output(command, "Herdr night watch demo")?;
-    spawn_watcher()?;
+    if let Err(error) = spawn_watcher() {
+        let _ = stop("demo_start_failed");
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -370,9 +388,20 @@ pub fn warning_seconds(status: &WatchStatus) -> u64 {
 }
 
 pub fn open_log() -> Result<()> {
+    let home = {
+        let mut command = wsl();
+        command.arg("/usr/bin/printenv").arg("HOME");
+        command_output(command, "WSL-Heimatverzeichnis")?
+    };
+    let home = home.trim();
+    if !home.starts_with('/') {
+        bail!("WSL-Heimatverzeichnis ist ungültig: {home}");
+    }
+    let home = home.trim_start_matches('/').replace('/', "\\");
     let path = format!(
-        r"\\wsl.localhost\{}\home\user\.local\state\herdr-night-watch\watch.log",
-        configuration::load().distro
+        r"\\wsl.localhost\{}\{}\.local\state\herdr-night-watch\watch.log",
+        configuration::load().distro,
+        home,
     );
     Command::new("notepad.exe")
         .arg(path)

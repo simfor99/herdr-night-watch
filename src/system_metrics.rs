@@ -246,6 +246,7 @@ fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
         return None;
     }
     let mut power_watts = 0.0;
+    let mut power_found = false;
     let mut power_limit_watts = 0.0;
     let mut vram_used_mib = 0.0;
     let mut vram_total_mib = 0.0;
@@ -261,6 +262,7 @@ fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
         }
         if let Some(value) = power {
             power_watts += value.max(0.0);
+            power_found = true;
         }
         if let Some(value) = power_limit {
             power_limit_watts += value.max(0.0);
@@ -280,7 +282,8 @@ fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
     let power_percent =
         (power_limit_watts > 0.0).then(|| percentage(power_watts / power_limit_watts * 100.0));
     Some(NvidiaTelemetry {
-        power_watts: Some(power_watts.round().clamp(0.0, f64::from(u16::MAX)) as u16),
+        power_watts: power_found
+            .then(|| power_watts.round().clamp(0.0, f64::from(u16::MAX)) as u16),
         power_percent,
         vram_percent,
     })

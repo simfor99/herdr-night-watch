@@ -6,6 +6,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$settings = Get-ItemProperty -Path 'HKCU:\Software\HerdrNachtwaechter' -ErrorAction SilentlyContinue
+if (-not $PSBoundParameters.ContainsKey('Distro') -and $settings.Distro) {
+    $Distro = [string]$settings.Distro
+}
+if (-not $PSBoundParameters.ContainsKey('WatcherPath') -and $settings.WatcherPath) {
+    $WatcherPath = [string]$settings.WatcherPath
+}
 $wsl = "$env:SystemRoot\System32\wsl.exe"
 $watcher = $WatcherPath
 

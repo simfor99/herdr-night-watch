@@ -5,7 +5,7 @@ Option Explicit
 Dim shell, exitCode, launcher, powershell
 Set shell = CreateObject("WScript.Shell")
 
-launcher = Replace(WScript.ScriptFullName, ".vbs", ".ps1")
+launcher = Left(WScript.ScriptFullName, Len(WScript.ScriptFullName) - 4) & ".ps1"
 powershell = shell.ExpandEnvironmentStrings("%SystemRoot%") & "\System32\WindowsPowerShell\v1.0\powershell.exe"
-exitCode = shell.Run("""" & powershell & """ -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File """" & launcher & """"", 0, True)
+exitCode = shell.Run("""" & powershell & """ -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & launcher & """", 0, True)
 WScript.Quit exitCode

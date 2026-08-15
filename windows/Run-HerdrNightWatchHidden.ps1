@@ -4,7 +4,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $settingsPath = 'HKCU:\Software\HerdrNachtwaechter'
-$settings = Get-ItemProperty -Path $settingsPath -ErrorAction Stop
+$settings = Get-ItemProperty -Path $settingsPath -ErrorAction SilentlyContinue
 $distro = if ($settings.Distro) { [string]$settings.Distro } else { 'Ubuntu' }
 $watcherPath = if ($settings.WatcherPath) { [string]$settings.WatcherPath } else { '/home/user/.codex/bin/herdr-night-watch.py' }
 $wsl = "$env:SystemRoot\System32\wsl.exe"

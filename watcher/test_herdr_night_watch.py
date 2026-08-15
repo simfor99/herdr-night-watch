@@ -54,8 +54,8 @@ class LiveScopeEvaluationTests(unittest.TestCase):
 
 class WindowsLauncherTests(unittest.TestCase):
     def test_scheduled_task_uses_the_powershell_launcher(self) -> None:
-        launcher = (PROJECT_ROOT / "windows" / "Run-HerdrNightWatchHidden.ps1").read_text()
-        installer = (PROJECT_ROOT / "windows" / "Install-HerdrNightWatch.ps1").read_text()
+        launcher = (PROJECT_ROOT / "windows" / "Run-HerdrNightWatchHidden.ps1").read_text(encoding="utf-8")
+        installer = (PROJECT_ROOT / "windows" / "Install-HerdrNightWatch.ps1").read_text(encoding="utf-8")
 
         self.assertIn("Start-Process", launcher)
         self.assertIn("-NoNewWindow", launcher)
@@ -65,7 +65,7 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertNotIn("wscript.exe", installer)
 
     def test_tray_starts_the_watcher_without_a_scheduled_task(self) -> None:
-        backend = (PROJECT_ROOT / "src" / "backend.rs").read_text()
+        backend = (PROJECT_ROOT / "src" / "backend.rs").read_text(encoding="utf-8")
 
         start_body = backend[backend.index("pub fn start"):backend.index("pub fn demo")]
         demo_body = backend[backend.index("pub fn demo"):backend.index("pub fn stop")]
@@ -75,12 +75,12 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertNotIn("schtasks.exe", demo_body)
 
     def test_tray_never_spawns_reg_exe(self) -> None:
-        sources = "\n".join(path.read_text() for path in (PROJECT_ROOT / "src").glob("*.rs"))
+        sources = "\n".join(path.read_text(encoding="utf-8") for path in (PROJECT_ROOT / "src").glob("*.rs"))
 
         self.assertNotIn('Command::new("reg.exe")', sources)
 
     def test_power_guard_smoke_test_has_activation_and_release_checks(self) -> None:
-        smoke_test = (PROJECT_ROOT / "windows" / "Test-HerdrNightWatchPowerGuard.ps1").read_text()
+        smoke_test = (PROJECT_ROOT / "windows" / "Test-HerdrNightWatchPowerGuard.ps1").read_text(encoding="utf-8")
 
         self.assertIn("SetThreadExecutionState", smoke_test)
         self.assertIn("powercfg.exe", smoke_test)
@@ -91,7 +91,7 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertIn("finally", smoke_test)
 
     def test_tray_session_marker_records_unclean_exit_in_completion_history(self) -> None:
-        history = (PROJECT_ROOT / "src" / "tray_history.rs").read_text()
+        history = (PROJECT_ROOT / "src" / "tray_history.rs").read_text(encoding="utf-8")
 
         self.assertIn('"tray-session.json"', history)
         self.assertIn('"completion-history.csv"', history)
@@ -297,6 +297,9 @@ class ArmingTests(unittest.TestCase):
 
 
 class RestartResetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        WATCHER._RUNTIME_BOOT_ID = None
+
     def test_runtime_boot_id_includes_windows_boot_marker(self) -> None:
         with (
             patch.object(WATCHER, "wsl_boot_id", return_value="wsl-boot"),

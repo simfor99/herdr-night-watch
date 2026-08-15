@@ -46,6 +46,7 @@ struct App {
     result_tx: mpsc::Sender<Result<backend::WatchStatus, String>>,
     power_guard_active: bool,
     power_guard_error: bool,
+    power_guard_last_attempted: Option<bool>,
 }
 
 pub fn run() -> Result<()> {
@@ -93,6 +94,7 @@ pub fn run() -> Result<()> {
         result_tx,
         power_guard_active: false,
         power_guard_error: false,
+        power_guard_last_attempted: None,
     };
     app.sync_power_guard();
     app.sync_expected_exit();
@@ -258,6 +260,10 @@ impl App {
             self.status,
             backend::WatchStatus::Watching { .. } | backend::WatchStatus::ShutdownWarning { .. }
         );
+        if self.power_guard_last_attempted == Some(should_prevent_sleep) {
+            return;
+        }
+        self.power_guard_last_attempted = Some(should_prevent_sleep);
         if let Err(error) = self.set_power_guard(should_prevent_sleep) {
             self.power_guard_error = true;
             self.message = Some(format!("Fehler: {error}"));

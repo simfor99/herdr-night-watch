@@ -56,30 +56,35 @@ pub fn open() -> Result<()> {
         .spawn()
         .context("Live-Status-Fenster konnte nicht gestartet werden")?;
 
-    let started_at = Instant::now();
-    loop {
-        if let Some(hwnd) = find_live_window() {
-            activate_live_window(hwnd);
-            return Ok(());
+    thread::spawn(move || {
+        let started_at = Instant::now();
+        loop {
+            if let Some(hwnd) = find_live_window() {
+                activate_live_window(hwnd);
+                return;
+            }
+            if started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT {
+                let detail = match child.try_wait() {
+                    Ok(Some(status)) => format!(
+                        "Live-Status-Prozess wurde beendet, bevor ein Fenster sichtbar wurde ({status})"
+                    ),
+                    Ok(None) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        "Live-Status-Prozess läuft, aber nach vier Sekunden wurde kein Fenster gefunden"
+                            .into()
+                    }
+                    Err(error) => format!(
+                        "Live-Status-Fenster wurde nicht sichtbar; Prozessstatus konnte nicht geprüft werden: {error}"
+                    ),
+                };
+                record_open_failure(&detail);
+                return;
+            }
+            thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
         }
-        if started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT {
-            let detail = match child.try_wait() {
-                Ok(Some(status)) => format!(
-                    "Live-Status-Prozess wurde beendet, bevor ein Fenster sichtbar wurde ({status})"
-                ),
-                Ok(None) => {
-                    "Live-Status-Prozess läuft, aber nach vier Sekunden wurde kein Fenster gefunden"
-                        .into()
-                }
-                Err(error) => format!(
-                    "Live-Status-Fenster wurde nicht sichtbar; Prozessstatus konnte nicht geprüft werden: {error}"
-                ),
-            };
-            record_open_failure(&detail);
-            return Err(anyhow::anyhow!(detail));
-        }
-        thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
-    }
+    });
+    Ok(())
 }
 
 fn find_live_window() -> Option<HWND> {
@@ -763,6 +768,9 @@ impl eframe::App for LiveStatusApp {
 }
 
 fn persist_window_position(app: &mut LiveStatusApp, ctx: &egui::Context) {
+    if ctx.input(|input| input.pointer.primary_down()) {
+        return;
+    }
     let position = ctx.input(|input| {
         input
             .viewport()

@@ -114,7 +114,7 @@ finally {
 }
 
 if ($failure) {
-    Write-Error $failure.Message
+    Write-Error $failure.Message -ErrorAction Continue
     exit 1
 }
 
@@ -127,6 +127,6 @@ try {
     exit 0
 }
 catch {
-    Write-Error $_.Exception.Message
+    Write-Error $_.Exception.Message -ErrorAction Continue
     exit 1
 }
