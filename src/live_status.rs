@@ -11,7 +11,8 @@ use eframe::egui;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::windows::process::CommandExt;
-use std::process::Command;
+use std::path::Path;
+use std::process::{Child, Command};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -25,6 +26,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(4);
 const LIVE_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LIVE_WINDOW_START_ATTEMPTS: usize = 3;
+const LIVE_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
+const LIVE_WINDOW_STARTUP_DELAY: Duration = Duration::from_secs(3);
 const LIVE_INSTANCE_MUTEX: &str = "Local\\HerdrNachtwaechter.LiveStatus";
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
 const ACCENT_STRONG: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
@@ -49,41 +53,89 @@ pub fn open() -> Result<()> {
 
     let executable =
         std::env::current_exe().context("Programmdatei konnte nicht bestimmt werden")?;
-    let mut child = Command::new(executable)
-        .creation_flags(CREATE_NO_WINDOW)
-        .arg("--live-status")
-        .spawn()
-        .context("Live-Status-Fenster konnte nicht gestartet werden")?;
+    let child = spawn_live_status_process(&executable)?;
 
     thread::spawn(move || {
-        let started_at = Instant::now();
-        loop {
-            if let Some(hwnd) = find_live_window() {
-                activate_live_window(hwnd);
-                return;
-            }
-            if started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT {
-                let detail = match child.try_wait() {
-                    Ok(Some(status)) => format!(
-                        "Live-Status-Prozess wurde beendet, bevor ein Fenster sichtbar wurde ({status})"
-                    ),
-                    Ok(None) => {
+        let mut child = child;
+        for attempt in 1..=LIVE_WINDOW_START_ATTEMPTS {
+            let started_at = Instant::now();
+            loop {
+                if let Some(hwnd) = find_live_window() {
+                    activate_live_window(hwnd);
+                    return;
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let detail = format!(
+                            "Live-Status-Prozess wurde beendet, bevor ein Fenster sichtbar wurde ({status})"
+                        );
+                        if attempt == LIVE_WINDOW_START_ATTEMPTS {
+                            record_open_failure(&detail);
+                            return;
+                        }
+                        record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
+                        break;
+                    }
+                    Ok(None) if started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT => {
                         let _ = child.kill();
                         let _ = child.wait();
-                        "Live-Status-Prozess läuft, aber nach vier Sekunden wurde kein Fenster gefunden"
-                            .into()
+                        let detail = "Live-Status-Prozess läuft, aber nach vier Sekunden wurde kein Fenster gefunden";
+                        if attempt == LIVE_WINDOW_START_ATTEMPTS {
+                            record_open_failure(detail);
+                            return;
+                        }
+                        record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
+                        break;
                     }
-                    Err(error) => format!(
-                        "Live-Status-Fenster wurde nicht sichtbar; Prozessstatus konnte nicht geprüft werden: {error}"
-                    ),
-                };
-                record_open_failure(&detail);
-                return;
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let detail = format!(
+                            "Live-Status-Fenster wurde nicht sichtbar; Prozessstatus konnte nicht geprüft werden: {error}"
+                        );
+                        if attempt == LIVE_WINDOW_START_ATTEMPTS {
+                            record_open_failure(&detail);
+                            return;
+                        }
+                        record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
+                        break;
+                    }
+                }
+                thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
             }
-            thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
+            thread::sleep(LIVE_WINDOW_RETRY_DELAY);
+            child = match spawn_live_status_process(&executable) {
+                Ok(child) => child,
+                Err(error) => {
+                    record_open_failure(&format!(
+                        "Live-Status-Prozess konnte beim Wiederholungsversuch nicht gestartet werden: {error}"
+                    ));
+                    return;
+                }
+            };
         }
     });
     Ok(())
+}
+
+pub fn open_on_startup() {
+    thread::spawn(|| {
+        thread::sleep(LIVE_WINDOW_STARTUP_DELAY);
+        if let Err(error) = open() {
+            record_open_failure(&format!(
+                "Live-Status-Prozess konnte beim Start nicht geöffnet werden: {error}"
+            ));
+        }
+    });
+}
+
+fn spawn_live_status_process(executable: &Path) -> Result<Child> {
+    Command::new(executable)
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg("--live-status")
+        .spawn()
+        .context("Live-Status-Fenster konnte nicht gestartet werden")
 }
 
 fn find_live_window() -> Option<HWND> {
@@ -161,6 +213,9 @@ pub fn run() -> Result<()> {
     };
 
     let result = run_window();
+    if let Err(error) = &result {
+        record_open_failure(&format!("Live-Status-Prozessfehler: {error}"));
+    }
     unsafe {
         let _ = CloseHandle(instance_mutex);
     }

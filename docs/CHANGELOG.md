@@ -3,6 +3,18 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-16] - Neustart- und Autostartstabilität v0.1.18
+
+### 🛡️ Sicherheit
+
+- **Kein alter Nachtlauf nach einem Boot-Rennen** - Der Wächter wartet beim Start auf vollständige WSL- und Windows-Boot-Marken und verwendet dieselbe bestätigte Marke für Reset und Überwachung.
+- **Sicheres Abbrechen bei fehlender Boot-Marke** - Sind die Marken nicht verfügbar, startet keine Überwachung auf Basis eines möglicherweise alten Zustands.
+
+### 🪟 Bedienung
+
+- **Live-Fenster beim Windows-Start robuster** - Der automatische Start wartet kurz auf die Desktop-Umgebung und wiederholt einen frühen, unsichtbaren Fensterstart bis zu drei Mal.
+- **Bessere Diagnose** - Auch Fehler beim verzögerten Autostart und die eigentliche Ursache eines Live-Status-Prozessfehlers landen in `logs/ui-errors.log`.
+
 ## [2026-08-15] - Stabilitätsrelease v0.1.17
 
 ### 🔧 Zuverlässigkeit

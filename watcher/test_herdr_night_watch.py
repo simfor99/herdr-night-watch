@@ -417,6 +417,57 @@ class RestartResetTests(unittest.TestCase):
                 self.assertFalse(WATCHER.reset_stale_run_after_restart())
             self.assertIsNone(WATCHER.load_json(state_path)["outcome"])
 
+    def test_watch_refuses_to_continue_without_a_complete_boot_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            WATCHER.write_json(
+                state_path,
+                {
+                    "run_id": "boot-race-run",
+                    "boot_id": "old-boot",
+                    "outcome": None,
+                    "poll_seconds": 1,
+                },
+            )
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "runtime_boot_id", return_value=None) as runtime_boot_id,
+                patch.object(WATCHER, "BOOT_MARKER_RETRY_ATTEMPTS", 2),
+                patch.object(WATCHER.time, "sleep") as sleep,
+                patch.object(WATCHER, "evaluate", side_effect=AssertionError("watch loop must not start")),
+                patch.object(WATCHER, "log"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boot marker"):
+                    WATCHER.watch()
+            self.assertEqual(runtime_boot_id.call_count, 2)
+            sleep.assert_called_once_with(WATCHER.BOOT_MARKER_RETRY_INTERVAL_SECONDS)
+
+    def test_watch_reuses_validated_boot_marker_for_restart_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            WATCHER.write_json(
+                state_path,
+                {"run_id": "finished-run", "boot_id": "same-boot", "outcome": "cancelled"},
+            )
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "wait_for_runtime_boot_id", return_value="validated-boot"),
+                patch.object(WATCHER, "reset_stale_run_after_restart") as reset,
+                patch.object(WATCHER, "log"),
+            ):
+                WATCHER.watch()
+            reset.assert_called_once_with(current_boot_id="validated-boot")
+
 
 class ConfirmationTests(unittest.TestCase):
     def test_confirmation_refuses_without_a_matching_warning(self) -> None:

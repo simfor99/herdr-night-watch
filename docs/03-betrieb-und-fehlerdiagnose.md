@@ -15,7 +15,7 @@ Die Bedienoberfläche ist absichtlich nicht der einzige Beobachtungspunkt. Der W
 
 Zusätzlich schreibt der Wächter `diagnostics.jsonl` neben `watch.log`. Jede Zeile ist ein einzelnes, maschinenlesbares JSON-Ereignis mit UTC-Zeit, Prozess-ID, Ereignis und Detail. Es bleiben die letzten 500 Ereignisse erhalten. Diese Datei ist der erste Anhaltspunkt, wenn ein Lauf hängen blieb, unerwartet endete oder keine Warnung auslöste; sie lässt sich von Codex direkt auswerten.
 
-Nach einem Windows- oder WSL-Neustart wird ein unvollständig liegen gebliebener Lauf nicht fortgesetzt. Der Wächter erkennt die geänderte WSL- oder Windows-Boot-Marke, schreibt ein `RESET`-Ereignis mit `reason=boot_id_changed` und entfernt die alte Warnungsdatei. Fehlt eine der beiden Marken vorübergehend, bleibt der Lauf unverändert, bis eine vollständige Frischprüfung möglich ist. Im `cancellation-history.csv` steht zusätzlich der Auslöser `system_restart`.
+Nach einem Windows- oder WSL-Neustart wird ein unvollständig liegen gebliebener Lauf nicht fortgesetzt. Der Wächter wartet beim Start kurz auf die geänderte WSL- und Windows-Boot-Marke, verwendet dieselbe bestätigte Marke für Reset und Überwachung, schreibt ein `RESET`-Ereignis mit `reason=boot_id_changed` und entfernt die alte Warnungsdatei. Fehlt eine der beiden Marken zu lange, startet die Überwachung nicht fail-open. Im `cancellation-history.csv` steht zusätzlich der Auslöser `system_restart`.
 
 Wenn Windows trotz aktivem Nachtlauf schlafen möchte, prüfe zuerst, ob die Tray-App noch läuft und den Status aktuell anzeigt. Nur ein aktiver Zustand `Watching` oder `ShutdownWarning` hält den Leerlauf-Schutz. Der Schutz verhindert keinen manuellen Schlaf- oder Shutdown-Befehl und wird absichtlich aufgehoben, sobald der Nachtlauf endet.
 
@@ -83,4 +83,4 @@ Beim raschen Stoppen und erneuten Starten kann die alte WSL-Instanz noch wenige 
 
 ## Wiederherstellung nach einer Installation
 
-Wenn die Tray-App Herdr nicht erreicht, zuerst im Setup-Fenster Distro und Wächterpfad prüfen. Danach verifizieren, dass die WSL-Distribution erreichbar ist und dort Herdr verfügbar ist. Die Tray-App selbst kann über den Menüpunkt „Mit Windows starten“ beim Benutzer-Login gestartet werden; ein Nachtlauf wird dadurch niemals automatisch aktiviert.
+Wenn die Tray-App Herdr nicht erreicht, zuerst im Setup-Fenster Distro und Wächterpfad prüfen. Beide Werte werden lokal unter `HKCU\Software\HerdrNachtwaechter` gespeichert; ein leerer oder fehlender Eintrag fällt nicht auf einen persönlichen Beispielpfad zurück, sondern muss über das Setup korrigiert werden. Danach verifizieren, dass die WSL-Distribution erreichbar ist und dort Herdr verfügbar ist. Die Tray-App selbst kann über den Menüpunkt „Mit Windows starten“ beim Benutzer-Login gestartet werden; ein Nachtlauf wird dadurch niemals automatisch aktiviert.

@@ -37,6 +37,8 @@ MAX_WARNING_SECONDS = 3600
 NETWORK_GRACE_SECONDS = 300
 NETWORK_CHECK_INTERVAL_SECONDS = 15
 BOOT_MARKER_CACHE_TTL_SECONDS = 30
+BOOT_MARKER_RETRY_INTERVAL_SECONDS = 5
+BOOT_MARKER_RETRY_ATTEMPTS = 12
 CONNECTIVITY_URLS = (
     "https://www.msftconnecttest.com/connecttest.txt",
     "https://www.gstatic.com/generate_204",
@@ -163,7 +165,10 @@ def runtime_boot_id(force: bool = False) -> str | None:
     return _RUNTIME_BOOT_ID
 
 
-def reset_stale_run_after_restart(force: bool = False) -> bool:
+def reset_stale_run_after_restart(
+    force: bool = False,
+    current_boot_id: str | None = None,
+) -> bool:
     """Finish an armed run left behind by a Windows/WSL restart.
 
     The shutdown process can terminate the watcher before it writes its final
@@ -171,7 +176,8 @@ def reset_stale_run_after_restart(force: bool = False) -> bool:
     pending warning file.
     """
     _, state_path, warning_path, _ = paths()
-    current_boot_id = runtime_boot_id(force=force)
+    if current_boot_id is None:
+        current_boot_id = runtime_boot_id(force=force)
     if not current_boot_id:
         return False
     with completion_lock():
@@ -198,6 +204,23 @@ def reset_stale_run_after_restart(force: bool = False) -> bool:
         "active night watch was cleared after restart"
     )
     return True
+
+
+def wait_for_runtime_boot_id() -> str:
+    """Wait briefly for both WSL and Windows to expose their boot markers."""
+    for attempt in range(BOOT_MARKER_RETRY_ATTEMPTS):
+        boot_id = runtime_boot_id(force=True)
+        if boot_id:
+            return boot_id
+        if attempt + 1 < BOOT_MARKER_RETRY_ATTEMPTS:
+            log(
+                "Complete WSL/Windows boot marker unavailable; "
+                f"waiting {BOOT_MARKER_RETRY_INTERVAL_SECONDS} seconds before retry"
+            )
+            time.sleep(BOOT_MARKER_RETRY_INTERVAL_SECONDS)
+    raise RuntimeError(
+        "Complete WSL/Windows boot marker unavailable; refusing to continue the night watch"
+    )
 
 
 def completion_lock_path() -> Path:
@@ -537,7 +560,8 @@ def snapshot_target(agent: dict[str, Any]) -> dict[str, Any]:
 
 
 def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: int) -> int:
-    reset_stale_run_after_restart(force=True)
+    boot_id = wait_for_runtime_boot_id()
+    reset_stale_run_after_restart(current_boot_id=boot_id)
     root, state_path, warning_path, _ = paths()
     root.mkdir(parents=True, exist_ok=True)
     existing = load_json(state_path)
@@ -557,7 +581,7 @@ def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: i
         "schema_version": STATE_SCHEMA_VERSION,
         "demo": False,
         "run_id": str(uuid.uuid4()),
-        "boot_id": runtime_boot_id(force=True),
+        "boot_id": boot_id,
         "armed_at": iso_now(),
         "dry_run": dry_run,
         "poll_seconds": poll_seconds,
@@ -581,7 +605,8 @@ def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: i
 
 def demo() -> int:
     """Run the complete visible state sequence without reading Herdr or shutting down Windows."""
-    reset_stale_run_after_restart(force=True)
+    boot_id = wait_for_runtime_boot_id()
+    reset_stale_run_after_restart(current_boot_id=boot_id)
     root, state_path, warning_path, _ = paths()
     root.mkdir(parents=True, exist_ok=True)
     existing = load_json(state_path)
@@ -593,7 +618,7 @@ def demo() -> int:
         "schema_version": 1,
         "demo": True,
         "run_id": str(uuid.uuid4()),
-        "boot_id": runtime_boot_id(force=True),
+        "boot_id": boot_id,
         "armed_at": iso_now(),
         "dry_run": True,
         "poll_seconds": 1,
@@ -826,7 +851,8 @@ def finish(state: dict[str, Any], outcome: str, detail: str) -> None:
 
 
 def watch() -> int:
-    reset_stale_run_after_restart(force=True)
+    boot_id = wait_for_runtime_boot_id()
+    reset_stale_run_after_restart(current_boot_id=boot_id)
     _, state_path, _, lock_path = paths()
     state = load_json(state_path)
     if not state:

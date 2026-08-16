@@ -4,7 +4,7 @@ use winreg::enums::HKEY_CURRENT_USER;
 
 const KEY: &str = r"Software\HerdrNachtwaechter";
 const DEFAULT_DISTRO: &str = "Ubuntu";
-const DEFAULT_WATCHER_PATH: &str = "/home/user/.codex/bin/herdr-night-watch.py";
+const DEFAULT_WATCHER_PATH: &str = "";
 
 #[derive(Clone, Debug)]
 pub struct Configuration {
