@@ -19,8 +19,8 @@ use std::time::{Duration, Instant, SystemTime};
 use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GetLastError, HANDLE, HWND, LPARAM};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, SW_RESTORE,
-    SetForegroundWindow, ShowWindow,
+    EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -59,7 +59,7 @@ pub fn open() -> Result<()> {
         for attempt in 1..=LIVE_WINDOW_START_ATTEMPTS {
             let started_at = Instant::now();
             loop {
-                if let Some(hwnd) = find_live_window() {
+                if let Some(hwnd) = find_live_window_for_pid(child.id()) {
                     activate_live_window(hwnd);
                     return;
                 }
@@ -137,6 +137,25 @@ fn find_live_window() -> Option<HWND> {
     found
 }
 
+fn find_live_window_for_pid(pid: u32) -> Option<HWND> {
+    let mut search = LiveWindowSearch {
+        target_pid: pid,
+        found: None,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(find_live_window_for_pid_callback),
+            &mut search as *mut _ as LPARAM,
+        );
+    }
+    search.found
+}
+
+struct LiveWindowSearch {
+    target_pid: u32,
+    found: Option<HWND>,
+}
+
 unsafe extern "system" fn find_live_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
         let found = &mut *(lparam as *mut Option<HWND>);
@@ -153,6 +172,28 @@ unsafe extern "system" fn find_live_window_callback(hwnd: HWND, lparam: LPARAM) 
         if title == "Herdr-Nachtwächter - Live-Status" || title == "Herdr Night Watch - Live Status"
         {
             *found = Some(hwnd);
+            return 0;
+        }
+    }
+    1
+}
+
+unsafe extern "system" fn find_live_window_for_pid_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    unsafe {
+        let search = &mut *(lparam as *mut LiveWindowSearch);
+        if search.found.is_some() {
+            return 1;
+        }
+        // eframe/winit creates a visible 4x4 event-target window before the
+        // actual Live-Status window is shown. Only accept a titled window so
+        // the startup monitor can restore the real 400x170 window.
+        if GetWindowTextLengthW(hwnd) <= 0 {
+            return 1;
+        }
+        let mut window_pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut window_pid);
+        if window_pid == search.target_pid {
+            search.found = Some(hwnd);
             return 0;
         }
     }
