@@ -80,7 +80,7 @@ pub fn run() -> Result<()> {
         .build()?;
     tray_history::start_session();
     if window_settings::live_status_on_start() {
-        live_status::open_on_startup();
+        let _ = live_status::open();
     }
     let mut app = App {
         language,

@@ -28,7 +28,6 @@ const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(4);
 const LIVE_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_WINDOW_START_ATTEMPTS: usize = 3;
 const LIVE_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
-const LIVE_WINDOW_STARTUP_DELAY: Duration = Duration::from_secs(3);
 const LIVE_INSTANCE_MUTEX: &str = "Local\\HerdrNachtwaechter.LiveStatus";
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
 const ACCENT_STRONG: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
@@ -117,17 +116,6 @@ pub fn open() -> Result<()> {
         }
     });
     Ok(())
-}
-
-pub fn open_on_startup() {
-    thread::spawn(|| {
-        thread::sleep(LIVE_WINDOW_STARTUP_DELAY);
-        if let Err(error) = open() {
-            record_open_failure(&format!(
-                "Live-Status-Prozess konnte beim Start nicht geöffnet werden: {error}"
-            ));
-        }
-    });
 }
 
 fn spawn_live_status_process(executable: &Path) -> Result<Child> {
