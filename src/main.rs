@@ -24,6 +24,8 @@ mod settings;
 #[cfg(windows)]
 mod system_metrics;
 #[cfg(windows)]
+mod taskbar;
+#[cfg(windows)]
 mod tray;
 #[cfg(windows)]
 mod tray_history;

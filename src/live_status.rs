@@ -3,6 +3,7 @@ use crate::{
     language::Language,
     log_viewer,
     system_metrics::{self, SystemMetrics},
+    taskbar,
     weather::{self, WeatherLocation, WeatherReading},
     weather_location, window_chrome, window_settings,
 };
@@ -46,6 +47,7 @@ const WINDOW_DRAG_THRESHOLD_SQUARED: f32 = 4.0;
 
 pub fn open() -> Result<()> {
     if let Some(hwnd) = find_live_window() {
+        apply_taskbar_visibility(hwnd);
         activate_live_window(hwnd);
         return Ok(());
     }
@@ -60,6 +62,7 @@ pub fn open() -> Result<()> {
             let started_at = Instant::now();
             loop {
                 if let Some(hwnd) = find_live_window_for_pid(child.id()) {
+                    apply_taskbar_visibility(hwnd);
                     activate_live_window(hwnd);
                     return;
                 }
@@ -207,6 +210,19 @@ fn activate_live_window(hwnd: HWND) {
     }
 }
 
+fn apply_taskbar_visibility(hwnd: HWND) {
+    let _ = taskbar::set_visible(hwnd, window_settings::live_status_in_taskbar());
+}
+
+pub fn apply_taskbar_setting() -> Result<()> {
+    if let Some(hwnd) = find_live_window() {
+        if !taskbar::set_visible(hwnd, window_settings::live_status_in_taskbar()) {
+            anyhow::bail!("Windows konnte die Taskleistenanzeige nicht ändern");
+        }
+    }
+    Ok(())
+}
+
 fn record_open_failure(detail: &str) {
     let Ok(executable) = std::env::current_exe() else {
         return;
@@ -235,6 +251,7 @@ pub fn run() -> Result<()> {
         Some(handle) => handle,
         None => {
             if let Some(hwnd) = find_live_window() {
+                apply_taskbar_visibility(hwnd);
                 activate_live_window(hwnd);
             }
             return Ok(());
@@ -338,6 +355,7 @@ struct LiveStatusApp {
     last_weather_location_check: Instant,
     opacity: Option<u8>,
     window_level: window_settings::WindowLevel,
+    taskbar_visible: Option<bool>,
     window_drag_started: bool,
     last_saved_position: Option<[f32; 2]>,
 }
@@ -385,6 +403,7 @@ impl LiveStatusApp {
             last_weather_location_check: Instant::now() - Duration::from_secs(6),
             opacity: None,
             window_level: window_settings::WindowLevel::current(),
+            taskbar_visible: None,
             window_drag_started: false,
             last_saved_position: window_settings::live_status_position(),
         }
@@ -599,6 +618,14 @@ impl eframe::App for LiveStatusApp {
                     window_chrome::window_level(current_window_level),
                 ));
         }
+        let current_taskbar_visibility = window_settings::live_status_in_taskbar();
+        if self.taskbar_visible != Some(current_taskbar_visibility) {
+            if let Some(hwnd) = find_live_window() {
+                if taskbar::set_visible(hwnd, current_taskbar_visibility) {
+                    self.taskbar_visible = Some(current_taskbar_visibility);
+                }
+            }
+        }
         self.collect_results();
         self.collect_actions();
         self.collect_metrics();
@@ -705,7 +732,7 @@ impl eframe::App for LiveStatusApp {
                                 let seconds_response = ui.add_enabled(
                                     !night_mode_active && !self.action_in_progress,
                                     egui::TextEdit::singleline(&mut self.warning_seconds_input)
-                                        .desired_width(31.0)
+                                        .desired_width(50.0)
                                         .horizontal_align(egui::Align::Center),
                                 );
                                 let seconds_response = seconds_response.on_hover_text(

@@ -5,6 +5,7 @@ const KEY: &str = r"Software\HerdrNachtwaechter";
 const OPACITY_VALUE: &str = "WindowOpacity";
 const LEVEL_VALUE: &str = "WindowLevel";
 const LIVE_STATUS_START_VALUE: &str = "OpenLiveStatusOnStartup";
+const LIVE_STATUS_TASKBAR_VALUE: &str = "ShowLiveStatusInTaskbar";
 const LIVE_STATUS_POS_X_VALUE: &str = "LiveStatusPositionX";
 const LIVE_STATUS_POS_Y_VALUE: &str = "LiveStatusPositionY";
 
@@ -86,6 +87,20 @@ pub fn live_status_on_start() -> bool {
 pub fn set_live_status_on_start(enabled: bool) -> anyhow::Result<()> {
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
     key.set_value(LIVE_STATUS_START_VALUE, &u32::from(enabled))?;
+    Ok(())
+}
+
+pub fn live_status_in_taskbar() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .and_then(|key| key.get_value::<u32, _>(LIVE_STATUS_TASKBAR_VALUE))
+        .map(|value| value != 0)
+        .unwrap_or(true)
+}
+
+pub fn set_live_status_in_taskbar(show: bool) -> anyhow::Result<()> {
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
+    key.set_value(LIVE_STATUS_TASKBAR_VALUE, &u32::from(show))?;
     Ok(())
 }
 

@@ -79,7 +79,7 @@ The moon also shows the current temperature for the selected weather location. L
 - **Open live window at startup**: optionally reopen the live status window automatically whenever the tray app starts. The default remains tray-only until you enable this option.
 - **Completion log**: the live window's upper-right log button opens a read-only view of the last 30 requested sleep and shutdown actions plus detected unclean tray exits. An unclean exit is recorded when the tray starts again without finding a clean session marker.
 - **Weather location**: hover the small weather control at the lower-right of the live window to search and select a city or postal code. The selected location is stored locally in the Windows user registry.
-- **Window settings**: choose opacity from 100% (opaque) to 10% in 10-point steps. The upper-right live-window control cycles normal, always-on-top, and always-in-background placement. These settings are stored locally and can be changed while the live window is open.
+- **Window settings**: choose opacity from 100% (opaque) to 10% in 10-point steps, cycle the live window between normal, always-on-top, and always-in-background placement, and choose whether the live window appears in the Windows taskbar. These settings are stored locally and can be changed while the live window is open; hiding the taskbar entry does not hide the desktop window.
 - The live-status footer gives a compact, informational view of CPU, RAM, GPU, occupied VRAM, and an available GPU power reading. Pastel yellow and red indicate medium and high utilization. Unsupported values show `—` and never affect the watcher.
 - **Start with Windows**: starts only the tray app when you log in. It does not automatically arm a night run.
 

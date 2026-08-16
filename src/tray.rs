@@ -20,6 +20,7 @@ const ID_LOG: &str = "log";
 const ID_LIVE_STATUS: &str = "live_status";
 const ID_WEATHER_LOCATION: &str = "weather_location";
 const ID_LIVE_STATUS_ON_START: &str = "live_status_on_start";
+const ID_LIVE_STATUS_TASKBAR: &str = "live_status_taskbar";
 const ID_DEMO: &str = "demo";
 const ID_AUTOSTART: &str = "autostart";
 const ID_QUIT: &str = "quit";
@@ -212,13 +213,14 @@ impl App {
 
     fn render(&mut self) {
         let view = format!(
-            "{:?}|{:?}|{}|{}|{:?}|{}",
+            "{:?}|{:?}|{}|{}|{:?}|{}|{}",
             self.status,
             self.message,
             autostart::enabled(),
             window_settings::opacity(),
             window_settings::WindowLevel::current(),
             window_settings::live_status_on_start(),
+            window_settings::live_status_in_taskbar(),
         );
         if view == self.last_view {
             return;
@@ -312,6 +314,11 @@ impl App {
             ID_LIVE_STATUS_ON_START => {
                 window_settings::set_live_status_on_start(!window_settings::live_status_on_start())
             }
+            ID_LIVE_STATUS_TASKBAR => {
+                let show = !window_settings::live_status_in_taskbar();
+                window_settings::set_live_status_in_taskbar(show)
+                    .and_then(|()| live_status::apply_taskbar_setting())
+            }
             ID_DEMO => backend::demo(),
             ID_SETTINGS => settings::open(),
             ID_AUTOSTART => autostart::set_enabled(!autostart::enabled()),
@@ -359,6 +366,10 @@ impl App {
                         "Live-Fenster-Start geändert",
                         "Live-window startup setting changed",
                     )
+                    .into(),
+                ID_LIVE_STATUS_TASKBAR => self
+                    .language
+                    .text("Taskleistenanzeige geändert", "Taskbar visibility changed")
                     .into(),
                 ID_DEMO => "Demo gestartet - kein Shutdown".into(),
                 ID_SETTINGS => "Einrichtung geöffnet".into(),
@@ -587,6 +598,16 @@ fn menu_for(
         None,
     ));
     let _ = window_submenu.append(&level_submenu);
+    let _ = window_submenu.append(&CheckMenuItem::with_id(
+        ID_LIVE_STATUS_TASKBAR,
+        language.text(
+            "Live-Fenster in Taskleiste anzeigen",
+            "Show live window in taskbar",
+        ),
+        true,
+        window_settings::live_status_in_taskbar(),
+        None,
+    ));
     let _ = menu.append(&window_submenu);
     let _ = menu.append(&MenuItem::with_id(
         ID_LOG,
