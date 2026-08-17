@@ -417,6 +417,69 @@ class RestartResetTests(unittest.TestCase):
                 self.assertFalse(WATCHER.reset_stale_run_after_restart())
             self.assertIsNone(WATCHER.load_json(state_path)["outcome"])
 
+    def test_legacy_active_run_is_reset_after_windows_reboot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            WATCHER.write_json(
+                state_path,
+                {
+                    "run_id": "legacy-run",
+                    "schema_version": 3,
+                    "armed_at": "2026-08-16T20:36:32+00:00",
+                    "outcome": None,
+                },
+            )
+            WATCHER.write_json(warning_path, {"run_id": "legacy-run"})
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, warning_path, root / "watch.lock"),
+                ),
+                patch.object(
+                    WATCHER,
+                    "runtime_boot_id",
+                    return_value="wsl:new|windows:2026-08-17T04:51:22.5000000Z",
+                ),
+                patch.object(WATCHER, "record_cancellation"),
+                patch.object(WATCHER, "log"),
+            ):
+                self.assertTrue(WATCHER.reset_stale_run_after_restart())
+            state = WATCHER.load_json(state_path)
+            self.assertEqual(state["outcome"], "reset_after_restart")
+            self.assertEqual(state["reset_reason"], "legacy_state_after_reboot")
+            self.assertFalse(warning_path.exists())
+
+    def test_legacy_active_run_survives_same_boot_watcher_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            WATCHER.write_json(
+                state_path,
+                {
+                    "run_id": "legacy-run",
+                    "schema_version": 3,
+                    "armed_at": "2026-08-17T05:00:00+00:00",
+                    "outcome": None,
+                },
+            )
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(
+                    WATCHER,
+                    "runtime_boot_id",
+                    return_value="wsl:same|windows:2026-08-17T04:51:22.5000000Z",
+                ),
+            ):
+                self.assertFalse(WATCHER.reset_stale_run_after_restart())
+            self.assertIsNone(WATCHER.load_json(state_path)["outcome"])
+
     def test_watch_refuses_to_continue_without_a_complete_boot_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
