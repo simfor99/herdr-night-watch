@@ -19,15 +19,19 @@ Please see the official [Open-Meteo terms](https://open-meteo.com/en/terms),
 before deploying this feature.
 
 The free Open-Meteo endpoints are intended for open-source and non-commercial
-use and are subject to fair-use limits. Forecast and geocoding data are
-published under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
-Attribution,
-a link to the applicable license, and an indication of changes are required;
-the geocoding project asks for a link next to displayed location data.
+use and are subject to fair-use limits. The Forecast API's temperature and
+`moon_phase` response fields are covered by [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+The Geocoding API's location data are covered by
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
+Attribution, a link to the applicable license, and an indication of changes
+are required. The geocoding project specifically asks for a link next to
+displayed location data.
 
 Herdr Night Watch shows an Open-Meteo attribution in the weather-location
 dialog and links to the official service documentation here. The application
-does not use weather or location data for the safety-critical watcher.
+does not use weather, location, or moon-phase data for the safety-critical
+watcher. The moon phase is not copied from a separate astronomy database; it
+is the `daily=moon_phase` field returned by the Forecast API.
 
 The MIT license of this repository does not grant permission to use the free
 Open-Meteo service commercially. A commercial deployment must use an

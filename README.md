@@ -100,9 +100,12 @@ Weather data uses [Open-Meteo's geocoding](https://open-meteo.com/en/docs/geocod
 ### Licensing and weather service
 
 The Herdr Night Watch source code is MIT-licensed. The weather feature is a
-runtime service integration and has separate provider terms: Open-Meteo's free
-endpoints are for open-source and non-commercial use, are rate-limited, and
-require attribution. Forecast and geocoding data are offered under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+runtime service integration and has separate provider terms. Open-Meteo's free
+API is limited to open-source and non-commercial use, is rate-limited, and
+requires attribution. The Forecast API data used for temperature and the
+`moon_phase` value are provided under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+The Geocoding API data used for the searchable location picker are provided
+under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
 For commercial deployments, use an appropriate Open-Meteo commercial/customer
 plan or replace the weather provider. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 for the exact notices and links. The core Herdr watcher remains usable under
