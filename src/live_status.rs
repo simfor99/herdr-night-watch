@@ -227,10 +227,10 @@ fn apply_taskbar_visibility(hwnd: HWND) {
 }
 
 pub fn apply_taskbar_setting() -> Result<()> {
-    if let Some(hwnd) = find_live_window() {
-        if !taskbar::set_visible(hwnd, window_settings::live_status_in_taskbar()) {
-            anyhow::bail!("Windows konnte die Taskleistenanzeige nicht ändern");
-        }
+    if let Some(hwnd) = find_live_window()
+        && !taskbar::set_visible(hwnd, window_settings::live_status_in_taskbar())
+    {
+        anyhow::bail!("Windows konnte die Taskleistenanzeige nicht ändern");
     }
     Ok(())
 }
@@ -632,12 +632,11 @@ impl eframe::App for LiveStatusApp {
                 ));
         }
         let current_taskbar_visibility = window_settings::live_status_in_taskbar();
-        if self.taskbar_visible != Some(current_taskbar_visibility) {
-            if let Some(hwnd) = find_live_window() {
-                if taskbar::set_visible(hwnd, current_taskbar_visibility) {
-                    self.taskbar_visible = Some(current_taskbar_visibility);
-                }
-            }
+        if self.taskbar_visible != Some(current_taskbar_visibility)
+            && let Some(hwnd) = find_live_window()
+            && taskbar::set_visible(hwnd, current_taskbar_visibility)
+        {
+            self.taskbar_visible = Some(current_taskbar_visibility);
         }
         self.collect_results();
         self.collect_actions();
@@ -857,10 +856,10 @@ impl eframe::App for LiveStatusApp {
                 );
                 ui.add_space(6.0);
                 system_metrics_row(ui, self.metrics, self.language);
-                if weather_control_overlay(ui, &self.weather_reading, self.language) {
-                    if let Err(error) = weather_location::open() {
-                        self.error = Some(error.to_string());
-                    }
+                if weather_control_overlay(ui, &self.weather_reading, self.language)
+                    && let Err(error) = weather_location::open()
+                {
+                    self.error = Some(error.to_string());
                 }
         });
         self.show_toast(ui.ctx());
