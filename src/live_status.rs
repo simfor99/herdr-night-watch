@@ -306,8 +306,8 @@ fn acquire_live_instance() -> Result<Option<HANDLE>> {
 
 fn run_window() -> Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([381.0, 188.0])
-        .with_min_inner_size([371.0, 178.0])
+        .with_inner_size([393.0, 190.0])
+        .with_min_inner_size([383.0, 180.0])
         .with_decorations(false)
         .with_window_level(window_chrome::window_level(
             window_settings::WindowLevel::current(),
@@ -708,7 +708,7 @@ impl eframe::App for LiveStatusApp {
         egui::Frame::new()
             .inner_margin(egui::Margin {
                 left: 20,
-                right: 2,
+                right: 1,
                 top: 14,
                 bottom: 14,
             })
@@ -849,7 +849,7 @@ impl eframe::App for LiveStatusApp {
                             window_chrome::glass_sheen(ui.painter(), panel.response.rect);
                         });
                         let moon_centering_space =
-                            ((ui.available_width() - MOON_SLOT_WIDTH) / 2.0 - 4.5).max(0.0);
+                            ((ui.available_width() - MOON_SLOT_WIDTH) / 2.0 - 9.0).max(0.0);
                         ui.add_space(moon_centering_space);
                         ui.allocate_ui_with_layout(
                             egui::vec2(MOON_SLOT_WIDTH, 88.0),
@@ -885,7 +885,7 @@ impl eframe::App for LiveStatusApp {
                 ui.add_space(6.0);
                 let metrics_text_right = system_metrics_row(ui, self.metrics, self.language);
                 if let Some(media) = &self.media_snapshot {
-                    ui.add_space(2.0);
+                    ui.add_space(4.0);
                     if let Some(position) = media_info_row(ui, media, metrics_text_right) {
                         let _ = self.media_command_tx.send(MediaCommand::Seek(position));
                     }
@@ -1753,15 +1753,9 @@ fn media_info_row(
         None
     };
     let hover_dots = hover_progress.map(|value| ((DOT_COUNT - 1) as f32 * value).round() as usize);
-    // Keep the played portion tied to the artist pill and the hover preview
-    // tied to the title pill. Lower alpha keeps both states pleasantly quiet
+    // The played portion transitions from the artist pill's color to the
+    // title pill's color. Lower alpha keeps the gradient pleasantly quiet
     // against the dark background while preserving the visual distinction.
-    let completed_color = egui::Color32::from_rgba_unmultiplied(
-        artist_color.r(),
-        artist_color.g(),
-        artist_color.b(),
-        165,
-    );
     let preview_color = egui::Color32::from_rgba_unmultiplied(
         title_color.r(),
         title_color.g(),
@@ -1775,6 +1769,7 @@ fn media_info_row(
             (hover > completed_dots && index > completed_dots && index <= hover)
                 || (hover < completed_dots && index >= hover && index < completed_dots)
         });
+        let completed_color = blend_media_colors(artist_color, title_color, fraction, 165);
         let color = if in_preview_range {
             preview_color
         } else if media.seek_enabled && index <= completed_dots {
@@ -1797,6 +1792,24 @@ fn media_info_row(
     let pointer_x = timeline_response.interact_pointer_pos()?.x;
     let ratio = ((pointer_x - track_left) / track_width).clamp(0.0, 1.0);
     Some(media.start_100ns + (duration as f32 * ratio) as i64)
+}
+
+fn blend_media_colors(
+    start: egui::Color32,
+    end: egui::Color32,
+    amount: f32,
+    alpha: u8,
+) -> egui::Color32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let blend = |from: u8, to: u8| {
+        (f32::from(from) + (f32::from(to) - f32::from(from)) * amount).round() as u8
+    };
+    egui::Color32::from_rgba_unmultiplied(
+        blend(start.r(), end.r()),
+        blend(start.g(), end.g()),
+        blend(start.b(), end.b()),
+        alpha,
+    )
 }
 
 fn draw_media_panel(
