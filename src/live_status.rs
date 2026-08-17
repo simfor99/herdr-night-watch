@@ -829,13 +829,20 @@ impl eframe::App for LiveStatusApp {
                                     let old_spacing = ui.spacing().item_spacing.x;
                                     ui.spacing_mut().item_spacing.x = 4.0;
                                     ui.horizontal(|ui| {
-                                        metric(ui, self.language.text("Erkannt", "Detected"), agents.total, TEXT);
+                                        metric(ui, self.language.text("Erkannt", "Detected"), agents.total, TEXT, false);
                                         divider(ui);
-                                        metric(ui, self.language.text("Arbeitet", "Working"), agents.working, GREEN);
+                                        metric(ui, self.language.text("Arbeitet", "Working"), agents.working, GREEN, false);
                                         divider(ui);
-                                        metric(ui, self.language.text("Bereit", "Ready"), agents.idle, ACCENT);
+                                        metric(ui, self.language.text("Bereit", "Ready"), agents.idle, ACCENT, false);
                                         divider(ui);
-                                        metric(ui, self.language.text("Fertig", "Finished"), agents.done, GRAY);
+                                        let finished = agents.done > 0;
+                                        metric(
+                                            ui,
+                                            self.language.text("Fertig", "Finished"),
+                                            agents.done,
+                                            if finished { GREEN } else { GRAY },
+                                            finished,
+                                        );
                                     });
                                     ui.spacing_mut().item_spacing.x = old_spacing;
                                 } else {
@@ -1759,16 +1766,59 @@ fn gradient_color_at(rect: egui::Rect, point: egui::Pos2) -> egui::Color32 {
     )
 }
 
-fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32) {
+fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32, highlight: bool) {
     ui.vertical(|ui| {
+        let value_text = value.to_string();
+        if highlight {
+            glowing_metric_text(ui, &value_text, 26.0, color);
+        } else {
+            ui.label(
+                egui::RichText::new(value_text)
+                    .size(26.0)
+                    .strong()
+                    .color(color),
+            );
+        }
         ui.label(
-            egui::RichText::new(value.to_string())
-                .size(26.0)
-                .strong()
-                .color(color),
+            egui::RichText::new(label)
+                .small()
+                .color(if highlight { GREEN } else { GRAY }),
         );
-        ui.label(egui::RichText::new(label).small().color(GRAY));
     });
+}
+
+fn glowing_metric_text(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32) {
+    let font_id = egui::FontId::proportional(size);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font_id, color);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    for (radius, color, alpha) in [
+        (3.0, (255, 215, 110), 12),
+        (2.0, (255, 225, 140), 24),
+        (1.0, (255, 255, 255), 42),
+    ] {
+        let halo = egui::Color32::from_rgba_unmultiplied(color.0, color.1, color.2, alpha);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                ui.painter().text(
+                    rect.min + egui::vec2(dx as f32 * radius, dy as f32 * radius),
+                    egui::Align2::LEFT_TOP,
+                    text,
+                    egui::FontId::proportional(size),
+                    halo,
+                );
+            }
+        }
+    }
+    ui.painter().text(
+        rect.min,
+        egui::Align2::LEFT_TOP,
+        text,
+        egui::FontId::proportional(size),
+        color,
+    );
 }
 
 fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Language) -> f32 {

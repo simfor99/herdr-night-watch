@@ -29,7 +29,7 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - Energiesparmodus darf weder `shutdown.exe /s` noch `shutdown.exe /a` ausführen.
 - Nur eine positive Benutzerbestätigung der eigenen aktiven Warnung darf Energiesparmodus oder Herunterfahren vor Ablauf der Warnfrist auslösen.
 - Internet-Ausfall löst erst nach fünf Minuten und nur über dieselbe sichtbare Warnfrist aus; Rückkehr der Verbindung bricht diese Warnung ab.
-- `completion-history.csv` protokolliert die angeforderten Energieaktionen des WSL-Wächters. `tray-history.csv` protokolliert erkannte unplanmäßige Tray-Enden. Der Log-Viewer führt beide Dateien zusammen und zeigt höchstens 30 Ereignisse.
+- `completion-history.csv` protokolliert die angeforderten Energieaktionen des WSL-Wächters. `tray-history.csv` protokolliert erkannte unplanmäßige Tray-Enden. Der Log-Viewer zeigt beide Dateien in getrennten Bereichen und höchstens 30 Einträge je Bereich.
 - `cancellation-history.csv` darf höchstens 30 Ereignisse enthalten und muss die konkrete Abbruchquelle speichern.
 - `--cancel` darf nur einen Shutdown abbrechen, für den eine gültige eigene Warnungsdatei existiert.
 - Die Tray-App und ihre Hilfsprozesse dürfen keine sichtbaren Konsolenfenster erzeugen.

@@ -37,6 +37,7 @@ pub fn run() -> Result<()> {
                 window_settings::WindowLevel::current(),
             ))
             .with_title(log_title(language)),
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(
@@ -76,9 +77,17 @@ struct LogEntry {
     run_id: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogSection {
+    Energy,
+    Tray,
+}
+
 struct LogApp {
     language: Language,
-    entries: Vec<LogEntry>,
+    energy_entries: Vec<LogEntry>,
+    tray_entries: Vec<LogEntry>,
+    section: LogSection,
     error: Option<String>,
     opacity: Option<u8>,
 }
@@ -87,15 +96,19 @@ impl LogApp {
     fn new() -> Self {
         let language = Language::current();
         match load_entries() {
-            Ok(entries) => Self {
+            Ok((energy_entries, tray_entries)) => Self {
                 language,
-                entries,
+                energy_entries,
+                tray_entries,
+                section: LogSection::Energy,
                 error: None,
                 opacity: None,
             },
             Err(_) => Self {
                 language,
-                entries: Vec::new(),
+                energy_entries: Vec::new(),
+                tray_entries: Vec::new(),
+                section: LogSection::Energy,
                 error: Some(
                     language
                         .text(
@@ -151,12 +164,38 @@ impl eframe::App for LogApp {
                 );
                 ui.label(
                     egui::RichText::new(self.language.text(
-                        "Die letzten 30 Energieaktionen und Tray-Ereignisse",
-                        "The last 30 power actions and tray events",
+                        "Energieaktionen und Tray-Diagnose getrennt",
+                        "Power actions and tray diagnostics, separated",
                     ))
                     .color(GRAY),
                 );
                 ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let energy_count = self.energy_entries.len();
+                    let tray_count = self.tray_entries.len();
+                    let energy_label = format!(
+                        "{} ({energy_count})",
+                        self.language.text("Energieaktionen", "Power actions")
+                    );
+                    let tray_label = format!(
+                        "{} ({tray_count})",
+                        self.language
+                            .text("Tray und Diagnose", "Tray and diagnostics")
+                    );
+                    if ui
+                        .selectable_label(self.section == LogSection::Energy, energy_label)
+                        .clicked()
+                    {
+                        self.section = LogSection::Energy;
+                    }
+                    if ui
+                        .selectable_label(self.section == LogSection::Tray, tray_label)
+                        .clicked()
+                    {
+                        self.section = LogSection::Tray;
+                    }
+                });
+                ui.add_space(8.0);
                 egui::Frame::group(ui.style())
                     .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10))
                     .stroke(egui::Stroke::new(
@@ -168,16 +207,28 @@ impl eframe::App for LogApp {
                     .show(ui, |ui| {
                         if let Some(error) = &self.error {
                             ui.colored_label(RED, error);
-                        } else if self.entries.is_empty() {
-                            ui.label(
-                                self.language
-                                    .text("Noch keine Einträge.", "No entries yet."),
-                            );
                         } else {
+                            let entries = match self.section {
+                                LogSection::Energy => &self.energy_entries,
+                                LogSection::Tray => &self.tray_entries,
+                            };
+                            let empty_message = match self.section {
+                                LogSection::Energy => self
+                                    .language
+                                    .text("Noch keine Energieaktionen.", "No power actions yet."),
+                                LogSection::Tray => self.language.text(
+                                    "Noch keine Tray- oder Diagnoseereignisse.",
+                                    "No tray or diagnostic events yet.",
+                                ),
+                            };
+                            if entries.is_empty() {
+                                ui.label(empty_message);
+                                return;
+                            }
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    for (index, entry) in self.entries.iter().enumerate() {
+                                    for (index, entry) in entries.iter().enumerate() {
                                         if index > 0 {
                                             ui.separator();
                                         }
@@ -191,15 +242,15 @@ impl eframe::App for LogApp {
     }
 }
 
-fn load_entries() -> Result<Vec<LogEntry>> {
+fn load_entries() -> Result<(Vec<LogEntry>, Vec<LogEntry>)> {
     let paths = log_paths()?;
-    let mut entries = Vec::new();
-    for path in paths {
-        entries.extend(load_entries_from(&path)?);
+    let mut energy_entries = load_entries_from(&paths[0])?;
+    let mut tray_entries = load_entries_from(&paths[1])?;
+    for entries in [&mut energy_entries, &mut tray_entries] {
+        entries.sort_unstable_by(|left, right| right.timestamp.cmp(&left.timestamp));
+        entries.truncate(30);
     }
-    entries.sort_unstable_by(|left, right| right.timestamp.cmp(&left.timestamp));
-    entries.truncate(30);
-    Ok(entries)
+    Ok((energy_entries, tray_entries))
 }
 
 fn load_entries_from(path: &Path) -> Result<Vec<LogEntry>> {

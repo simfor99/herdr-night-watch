@@ -5,6 +5,14 @@
 
 ## [2026-08-17] - Medienzeile und Live-Layout v0.1.19
 
+### 📋 Abschlussprotokoll
+
+- **Energie und Diagnose getrennt** - Das Abschlussprotokoll trennt Energieaktionen von Tray- und Diagnoseereignissen. Beide Bereiche zeigen jeweils bis zu 30 Einträge und übersetzen Beschriftungen sowie Meldungen vollständig ins Englische.
+
+### 📊 Live-Dashboard
+
+- **Fertige Agenten sichtbar hervorgehoben** - Sobald mindestens ein Agent fertig gemeldet ist, werden Zahl und Beschriftung grün dargestellt. Die Zahl erhält zusätzlich eine feine weiße 1-Pixel-Kontur und einen sehr dezenten Lichtsaum. Bei null kehren beide zu Grau zurück.
+
 ### 🎵 Live-Status
 
 - **Kompakte Medienanzeige** - Aktueller Interpret und Songtitel erscheinen im Footer, wenn Windows eine Mediensession meldet.
