@@ -16,6 +16,8 @@ mod live_status;
 #[cfg(windows)]
 mod log_viewer;
 #[cfg(windows)]
+mod media;
+#[cfg(windows)]
 mod notify;
 #[cfg(windows)]
 mod power_guard;

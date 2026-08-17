@@ -2,6 +2,7 @@ use crate::{
     backend::{self, AgentSummary, CompletionAction, WatchStatus},
     language::Language,
     log_viewer,
+    media::{self, MediaCommand, MediaSnapshot},
     system_metrics::{self, SystemMetrics},
     taskbar,
     weather::{self, WeatherLocation, WeatherReading},
@@ -303,8 +304,8 @@ fn acquire_live_instance() -> Result<Option<HANDLE>> {
 
 fn run_window() -> Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([400.0, 170.0])
-        .with_min_inner_size([390.0, 160.0])
+        .with_inner_size([400.0, 180.0])
+        .with_min_inner_size([390.0, 170.0])
         .with_decorations(false)
         .with_window_level(window_chrome::window_level(
             window_settings::WindowLevel::current(),
@@ -359,6 +360,9 @@ struct LiveStatusApp {
     editing_warning_seconds: bool,
     metrics_rx: Receiver<SystemMetrics>,
     metrics: SystemMetrics,
+    media_command_tx: Sender<MediaCommand>,
+    media_rx: Receiver<Result<Option<MediaSnapshot>, String>>,
+    media_snapshot: Option<MediaSnapshot>,
     weather_rx: Receiver<Result<WeatherReading, String>>,
     weather_tx: Sender<Result<WeatherReading, String>>,
     weather_location: WeatherLocation,
@@ -378,6 +382,7 @@ impl LiveStatusApp {
         let (status_tx, status_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         let (metrics_tx, metrics_rx) = mpsc::channel();
+        let (media_command_tx, media_rx) = media::spawn_worker();
         let (weather_tx, weather_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut sampler = system_metrics::Sampler::new();
@@ -407,6 +412,9 @@ impl LiveStatusApp {
             editing_warning_seconds: false,
             metrics_rx,
             metrics: SystemMetrics::default(),
+            media_command_tx,
+            media_rx,
+            media_snapshot: None,
             weather_rx,
             weather_tx,
             weather_location: weather::current_location(),
@@ -437,6 +445,12 @@ impl LiveStatusApp {
     fn collect_metrics(&mut self) {
         while let Ok(metrics) = self.metrics_rx.try_recv() {
             self.metrics = metrics;
+        }
+    }
+
+    fn collect_media(&mut self) {
+        while let Ok(result) = self.media_rx.try_recv() {
+            self.media_snapshot = result.ok().flatten();
         }
     }
 
@@ -641,6 +655,7 @@ impl eframe::App for LiveStatusApp {
         self.collect_results();
         self.collect_actions();
         self.collect_metrics();
+        self.collect_media();
         self.collect_weather();
         self.refresh();
         self.refresh_weather();
@@ -856,6 +871,12 @@ impl eframe::App for LiveStatusApp {
                 );
                 ui.add_space(6.0);
                 system_metrics_row(ui, self.metrics, self.language);
+                if let Some(media) = &self.media_snapshot {
+                    ui.add_space(2.0);
+                    if let Some(position) = media_info_row(ui, media) {
+                        let _ = self.media_command_tx.send(MediaCommand::Seek(position));
+                    }
+                }
                 if weather_control_overlay(ui, &self.weather_reading, self.language)
                     && let Err(error) = weather_location::open()
                 {
@@ -1593,6 +1614,251 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Langu
         );
     });
     ui.spacing_mut().item_spacing.x = old_spacing;
+}
+
+fn media_info_row(ui: &mut egui::Ui, media: &MediaSnapshot) -> Option<i64> {
+    let (artist_color, _, title_color, _) = media_colors(media);
+    let artist = if media.artist.trim().is_empty() {
+        "Unbekannter Interpret".to_string()
+    } else {
+        media.artist.clone()
+    };
+    let timeline_reserve = 110.0;
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
+    let text_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(
+            (rect.right() - timeline_reserve - 6.0).max(rect.left()),
+            rect.bottom(),
+        ),
+    );
+    let max_chars = (text_rect.width() / 6.2).floor().max(18.0) as usize;
+    let artist_part = truncate_media_text(&artist, (max_chars as f32 * 0.68) as usize);
+    let title_budget = max_chars.saturating_sub(artist_part.chars().count()).max(8);
+    let title_part = truncate_media_text(&media.title, title_budget);
+    let painter = ui.painter();
+    let artist_galley =
+        painter.layout_no_wrap(artist_part, egui::FontId::proportional(10.5), artist_color);
+    let title_galley =
+        painter.layout_no_wrap(title_part, egui::FontId::proportional(10.5), title_color);
+    let artist_panel = egui::Rect::from_min_size(
+        text_rect.min,
+        egui::vec2(artist_galley.size().x + 8.0, text_rect.height()),
+    );
+    let title_panel = egui::Rect::from_min_size(
+        egui::pos2(artist_panel.right() + 3.0, text_rect.top()),
+        egui::vec2(
+            (title_galley.size().x + 8.0)
+                .min((text_rect.right() - artist_panel.right() - 3.0).max(0.0)),
+            text_rect.height(),
+        ),
+    );
+    draw_media_panel(
+        painter,
+        artist_panel,
+        artist_color,
+        artist_color,
+        12,
+        42,
+        52,
+    );
+    draw_media_panel(painter, title_panel, title_color, title_color, 11, 38, 50);
+    painter.galley(
+        egui::pos2(
+            artist_panel.left() + 4.0,
+            text_rect.center().y - artist_galley.size().y / 2.0,
+        ),
+        artist_galley,
+        artist_color,
+    );
+    painter.galley(
+        egui::pos2(
+            title_panel.left() + 4.0,
+            text_rect.center().y - title_galley.size().y / 2.0,
+        ),
+        title_galley,
+        title_color,
+    );
+
+    let timeline_left = (title_panel.right() + 6.0).min(rect.right() - timeline_reserve);
+    let timeline_rect = egui::Rect::from_min_max(
+        egui::pos2(timeline_left, rect.top()),
+        egui::pos2(rect.right() - 24.0, rect.bottom()),
+    );
+    let track_left = timeline_rect.left() + 5.0;
+    let track_right = timeline_rect.right() - 5.0;
+    let track_y = timeline_rect.center().y;
+    let track_width = (track_right - track_left).max(1.0);
+    let duration = media.end_100ns.saturating_sub(media.start_100ns);
+    let progress = if media.seek_enabled && duration > 0 {
+        ((media.position_100ns - media.start_100ns) as f32 / duration as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let timeline_response = ui.interact(
+        timeline_rect,
+        ui.make_persistent_id("media_playback_timeline"),
+        egui::Sense::click(),
+    );
+    const DOT_COUNT: usize = 72;
+    const DOT_STACK: [f32; 6] = [-7.5, -4.5, -1.5, 1.5, 4.5, 7.5];
+    let completed_dots = if media.seek_enabled && duration > 0 {
+        ((DOT_COUNT - 1) as f32 * progress).round() as usize
+    } else {
+        0
+    };
+    let hover_progress = if timeline_response.hovered() && media.seek_enabled && duration > 0 {
+        timeline_response
+            .hover_pos()
+            .map(|position| ((position.x - track_left) / track_width).clamp(0.0, 1.0))
+    } else {
+        None
+    };
+    let hover_dots = hover_progress.map(|value| ((DOT_COUNT - 1) as f32 * value).round() as usize);
+    // Keep the played portion tied to the artist pill and the hover preview
+    // tied to the title pill. Lower alpha keeps both states pleasantly quiet
+    // against the dark background while preserving the visual distinction.
+    let completed_color = egui::Color32::from_rgba_unmultiplied(
+        artist_color.r(),
+        artist_color.g(),
+        artist_color.b(),
+        165,
+    );
+    let preview_color = egui::Color32::from_rgba_unmultiplied(
+        title_color.r(),
+        title_color.g(),
+        title_color.b(),
+        180,
+    );
+    let remaining_color = egui::Color32::from_rgb(72, 78, 92);
+    for index in 0..DOT_COUNT {
+        let fraction = index as f32 / (DOT_COUNT - 1) as f32;
+        let in_preview_range = hover_dots.is_some_and(|hover| {
+            (hover > completed_dots && index > completed_dots && index <= hover)
+                || (hover < completed_dots && index >= hover && index < completed_dots)
+        });
+        let color = if in_preview_range {
+            preview_color
+        } else if media.seek_enabled && index <= completed_dots {
+            completed_color
+        } else {
+            remaining_color
+        };
+        let radius = if hover_dots == Some(index) { 1.65 } else { 1.1 };
+        for offset in DOT_STACK {
+            painter.circle_filled(
+                egui::pos2(track_left + track_width * fraction, track_y + offset),
+                radius,
+                color,
+            );
+        }
+    }
+    if !timeline_response.clicked() || !media.seek_enabled || duration <= 0 {
+        return None;
+    }
+    let pointer_x = timeline_response.interact_pointer_pos()?.x;
+    let ratio = ((pointer_x - track_left) / track_width).clamp(0.0, 1.0);
+    Some(media.start_100ns + (duration as f32 * ratio) as i64)
+}
+
+fn draw_media_panel(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    text_color: egui::Color32,
+    background: egui::Color32,
+    glow_alpha: u8,
+    fill_alpha: u8,
+    stroke_alpha: u8,
+) {
+    painter.rect_stroke(
+        rect.expand(1.5),
+        egui::CornerRadius::same(6),
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(
+                text_color.r(),
+                text_color.g(),
+                text_color.b(),
+                glow_alpha,
+            ),
+        ),
+        egui::StrokeKind::Outside,
+    );
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(5),
+        egui::Color32::from_rgba_unmultiplied(
+            background.r(),
+            background.g(),
+            background.b(),
+            fill_alpha,
+        ),
+    );
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(5),
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(
+                text_color.r(),
+                text_color.g(),
+                text_color.b(),
+                stroke_alpha,
+            ),
+        ),
+        egui::StrokeKind::Inside,
+    );
+}
+
+fn truncate_media_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
+fn media_colors(
+    media: &MediaSnapshot,
+) -> (egui::Color32, egui::Color32, egui::Color32, egui::Color32) {
+    let mut hash = 2_166_136_261u32;
+    for byte in media.title.bytes().chain(media.artist.bytes()) {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    let base_hue = (hash % 360) as f32;
+    let artist_color = hsv_color(base_hue, 0.34, 0.98);
+    let artist_background = hsv_color(base_hue + 180.0, 0.60, 0.46);
+    let title_color = hsv_color(base_hue + 52.0, 0.34, 0.98);
+    let title_background = hsv_color(base_hue + 232.0, 0.60, 0.44);
+    (
+        artist_color,
+        artist_background,
+        title_color,
+        title_background,
+    )
+}
+
+fn hsv_color(hue: f32, saturation: f32, value: f32) -> egui::Color32 {
+    let hue = (hue.rem_euclid(360.0)) / 60.0;
+    let chroma = value * saturation;
+    let x = chroma * (1.0 - ((hue % 2.0) - 1.0).abs());
+    let (red, green, blue) = match hue as u32 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let match_value = value - chroma;
+    egui::Color32::from_rgb(
+        ((red + match_value) * 255.0).round() as u8,
+        ((green + match_value) * 255.0).round() as u8,
+        ((blue + match_value) * 255.0).round() as u8,
+    )
 }
 
 fn weather_control_rect(rect: egui::Rect) -> egui::Rect {
