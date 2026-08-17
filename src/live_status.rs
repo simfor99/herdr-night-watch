@@ -1573,73 +1573,130 @@ fn moon_icon(
     let halo_inner = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 32);
     painter.circle_filled(center, radius * 1.28, halo_outer);
     painter.circle_filled(center, radius * 1.14, halo_inner);
-    // Start with the unlit lunar disc, then paint the illuminated side as
-    // narrow horizontal slices. This gives us every phase, not just a fixed
-    // crescent, while keeping the existing soft halo and compact footprint.
-    painter.circle_filled(center, radius, gradient_color_at(gradient_rect, center));
-    paint_illuminated_moon(painter, center, radius, color, phase);
-
     let illumination = (1.0 - (std::f32::consts::TAU * phase as f32).cos()) * 0.5;
-    let temperature_center = if illumination > 0.92 {
-        center
-    } else {
-        let dark_side = if phase < 0.5 { 1.0 } else { -1.0 };
-        egui::pos2(center.x + radius * 0.42 * dark_side, center.y)
-    };
-    let temperature_color = if illumination > 0.92 {
-        gradient_color_at(gradient_rect, center)
-    } else {
-        color
-    };
+    let dark_side = if phase < 0.5 { 1.0 } else { -1.0 };
+    let separation = moon_disc_separation(illumination) * radius;
+    let dark_center = egui::pos2(center.x + separation * dark_side, center.y);
+    painter.circle_filled(center, radius, color);
+    painter.circle_filled(
+        dark_center,
+        radius,
+        gradient_color_at(gradient_rect, dark_center),
+    );
     if let Some(temperature_c) = temperature_c {
-        painter.text(
-            temperature_center,
-            egui::Align2::CENTER_CENTER,
-            format!("{temperature_c:.0}°C"),
-            egui::FontId::proportional(15.0),
-            temperature_color,
+        paint_moon_temperature(
+            painter,
+            rect,
+            center,
+            dark_side,
+            separation,
+            illumination,
+            temperature_c,
         );
     }
     response
 }
 
-fn paint_illuminated_moon(
+fn paint_moon_temperature(
     painter: &egui::Painter,
+    moon_rect: egui::Rect,
     center: egui::Pos2,
-    radius: f32,
-    color: egui::Color32,
-    phase: f64,
+    dark_side: f32,
+    separation: f32,
+    illumination: f32,
+    temperature_c: f64,
 ) {
-    let waxing = phase < 0.5;
-    let terminator_scale = (std::f32::consts::TAU * phase as f32).cos();
-    const SLICES: usize = 64;
-    for index in 0..SLICES {
-        let y0 = -radius + (index as f32 / SLICES as f32) * radius * 2.0;
-        let y1 = -radius + ((index + 1) as f32 / SLICES as f32) * radius * 2.0;
-        let y = (y0 + y1) * 0.5;
-        let half_width = (radius * radius - y * y).max(0.0).sqrt();
-        let terminator = if waxing {
-            -terminator_scale * half_width
-        } else {
-            terminator_scale * half_width
-        };
-        let (left, right) = if waxing {
-            (-half_width, terminator)
-        } else {
-            (terminator, half_width)
-        };
-        if right <= left {
-            continue;
-        }
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(center.x + left, center.y + y0),
-                egui::pos2(center.x + right, center.y + y1),
-            ),
-            0.0,
-            color,
+    let position = egui::Align2::CENTER_CENTER;
+    let radius = moon_rect.width() * 0.5;
+    let text = format!("{temperature_c:.0}°C");
+    let dark_text = egui::Color32::from_rgb(24, 31, 47);
+    let light_text = egui::Color32::from_rgb(247, 241, 229);
+
+    if illumination <= 0.12 {
+        painter.text(
+            center,
+            position,
+            text,
+            egui::FontId::proportional(15.0),
+            light_text,
         );
+        return;
     }
+
+    if illumination >= 0.88 {
+        painter.text(
+            center,
+            position,
+            text,
+            egui::FontId::proportional(15.0),
+            dark_text,
+        );
+        return;
+    }
+
+    // For crescents and gibbous moons, keep the complete label in the dark
+    // overlap region. Its centre on the moon's horizontal axis is half-way
+    // between the two disc centres, which keeps all glyphs on the dark side.
+    let near_half_moon = (0.34..=0.88).contains(&illumination);
+    if !near_half_moon {
+        let dark_center = egui::pos2(center.x + dark_side * separation * 0.5, center.y);
+        painter.text(
+            dark_center,
+            position,
+            text,
+            egui::FontId::proportional(15.0),
+            light_text,
+        );
+        return;
+    }
+
+    // For a gibbous/half-moon view keep the label centred and colour each
+    // side independently at the actual terminator, not at an arbitrary
+    // midpoint between the two circle centres.
+    let split_x = center.x + dark_side * (separation - radius);
+    let left_clip =
+        egui::Rect::from_min_max(moon_rect.min, egui::pos2(split_x, moon_rect.bottom()));
+    let right_clip = egui::Rect::from_min_max(egui::pos2(split_x, moon_rect.top()), moon_rect.max);
+    let lit_is_left = dark_side > 0.0;
+    let lit_painter = if lit_is_left {
+        painter.with_clip_rect(left_clip)
+    } else {
+        painter.with_clip_rect(right_clip)
+    };
+    let dark_painter = if lit_is_left {
+        painter.with_clip_rect(right_clip)
+    } else {
+        painter.with_clip_rect(left_clip)
+    };
+    let font = egui::FontId::proportional(13.0);
+    lit_painter.text(center, position, text.clone(), font.clone(), dark_text);
+    dark_painter.text(center, position, text, font, light_text);
+}
+
+fn moon_disc_separation(illumination: f32) -> f32 {
+    let target_overlap = 1.0 - illumination.clamp(0.0, 1.0);
+    let mut low = 0.0;
+    let mut high = 2.0;
+    for _ in 0..24 {
+        let middle = (low + high) * 0.5;
+        if circle_overlap_fraction(middle) > target_overlap {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    (low + high) * 0.5
+}
+
+fn circle_overlap_fraction(separation: f32) -> f32 {
+    if separation <= 0.0 {
+        return 1.0;
+    }
+    if separation >= 2.0 {
+        return 0.0;
+    }
+    let root = (4.0 - separation * separation).sqrt();
+    (2.0 * (separation / 2.0).acos() - 0.5 * separation * root) / std::f32::consts::PI
 }
 
 fn gradient_color_at(rect: egui::Rect, point: egui::Pos2) -> egui::Color32 {
