@@ -59,10 +59,9 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 
 ## Live status
 
-<p>
-  <img src="https://raw.githubusercontent.com/simfor99/herdr-night-watch/main/docs/images/live-status-de-latest.png" alt="Herdr Night Watch live status in German" width="49%">
-  <img src="https://raw.githubusercontent.com/simfor99/herdr-night-watch/main/docs/images/live-status-en-latest.png" alt="Herdr Night Watch live status in English" width="49%">
-</p>
+![Herdr Night Watch live status in German](docs/images/live-status-de-latest.png)
+
+![Herdr Night Watch live status in English](docs/images/live-status-en-latest.png)
 
 The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer turns it into a quick system monitor without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed. The small upper-right control hood opens the last 30 completion actions and cycles the window between normal, always-on-top, and always-in-background modes. Its glass surfaces use a subtle top reflection to keep the dashboard calm but tactile. The tray menu lets you choose window opacity from 100% down to 10%.
 
