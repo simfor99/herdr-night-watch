@@ -71,7 +71,7 @@ When Windows exposes an active media session, the footer shows the current artis
 
 The dotted timeline gives an immediate playback overview. Hovering previews the position that would be selected; clicking seeks there when the media session allows playback-position changes. The played dots transition softly from the artist color toward the title color, while the unplayed track remains subdued. This makes the current song readable at a glance without adding a full music player, album art, volume controls, or playback buttons. The media strip is informational and independent of the Herdr watcher: music can continue while Herdr works, and Herdr monitoring continues when no media session exists.
 
-The moon also shows the current temperature for the selected weather location. Leipzig is used initially; the small weather control at the lower-right appears on hover and opens a searchable city selector. Weather is informational only, is refreshed in the background, and falls back to the last value or `—` when the network is unavailable.
+The moon also shows the current temperature and the real current lunar phase for the selected weather location. Open-Meteo supplies the daily phase value, so the icon shifts between crescent, quarter, gibbous, full, and new moon; the temperature stays inside the unlit part whenever possible. Leipzig is used initially; the small weather control at the lower-right appears on hover and opens a searchable city selector. Weather and moon data are informational only, are refreshed in the background, and fall back to the last value or a local phase estimate when the network is unavailable.
 
 ## Usage
 
@@ -95,7 +95,7 @@ If a live-window start ever fails, the tray reports the failure and records a
 diagnostic line in the local `logs/ui-errors.log` file. This file is runtime
 data and is never part of the repository.
 
-Weather data uses [Open-Meteo's geocoding](https://open-meteo.com/en/docs/geocoding-api) and [forecast](https://open-meteo.com/en/docs) services. The location and temperature are never used by the safety-critical watcher.
+Weather data uses [Open-Meteo's geocoding](https://open-meteo.com/en/docs/geocoding-api) and [forecast](https://open-meteo.com/en/docs) services. The location, temperature, and moon phase are never used by the safety-critical watcher.
 
 ### Licensing and weather service
 

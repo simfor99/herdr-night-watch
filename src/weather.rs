@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
@@ -31,6 +32,7 @@ pub struct WeatherReading {
     pub temperature_c: f64,
     pub observed_at: String,
     pub location: WeatherLocation,
+    pub moon_phase: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -41,12 +43,18 @@ struct GeocodingResponse {
 #[derive(Clone, Debug, Deserialize)]
 struct ForecastResponse {
     current: Option<CurrentWeather>,
+    daily: Option<DailyWeather>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct CurrentWeather {
     temperature_2m: f64,
     time: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DailyWeather {
+    moon_phase: Option<Vec<f64>>,
 }
 
 pub fn current_location() -> WeatherLocation {
@@ -89,7 +97,7 @@ pub fn search_locations(
 
 pub fn fetch_current(location: WeatherLocation) -> Result<WeatherReading> {
     let url = format!(
-        "{FORECAST_ENDPOINT}?latitude={:.5}&longitude={:.5}&current=temperature_2m&temperature_unit=celsius&timezone=auto",
+        "{FORECAST_ENDPOINT}?latitude={:.5}&longitude={:.5}&current=temperature_2m&daily=moon_phase&temperature_unit=celsius&timezone=auto",
         location.latitude, location.longitude
     );
     let payload: ForecastResponse = fetch_json(&url)?;
@@ -100,7 +108,26 @@ pub fn fetch_current(location: WeatherLocation) -> Result<WeatherReading> {
         temperature_c: current.temperature_2m,
         observed_at: current.time,
         location,
+        moon_phase: payload
+            .daily
+            .and_then(|daily| daily.moon_phase)
+            .and_then(|phases| phases.first().copied())
+            .filter(|phase| phase.is_finite())
+            .unwrap_or_else(estimated_moon_phase),
     })
+}
+
+/// Returns the current lunar phase as a fraction in [0, 1): new moon at 0,
+/// full moon at 0.5. This keeps the UI useful while the weather request is
+/// still loading or temporarily unavailable.
+pub fn estimated_moon_phase() -> f64 {
+    const KNOWN_NEW_MOON_UNIX: f64 = 947_182_440.0; // 2000-01-06 18:14 UTC
+    const SYNODIC_MONTH_SECONDS: f64 = 29.530_588_853 * 86_400.0;
+    let unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(KNOWN_NEW_MOON_UNIX);
+    ((unix_seconds - KNOWN_NEW_MOON_UNIX) / SYNODIC_MONTH_SECONDS).rem_euclid(1.0)
 }
 
 fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T> {

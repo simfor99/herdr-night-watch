@@ -8,7 +8,8 @@ Open-Meteo source code or a copy of its service data.
 
 The live window uses the following Open-Meteo services:
 
-- [Forecast API](https://open-meteo.com/en/docs) for the current temperature.
+- [Forecast API](https://open-meteo.com/en/docs) for the current temperature and
+  daily moon phase.
 - [Geocoding API](https://open-meteo.com/en/docs/geocoding-api) for searching a
   city or postal code.
 

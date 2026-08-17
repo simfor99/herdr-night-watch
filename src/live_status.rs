@@ -874,6 +874,7 @@ impl eframe::App for LiveStatusApp {
                                         MOON_ICON_DIAMETER,
                                         gradient_rect,
                                         moon.temperature_c,
+                                        moon.phase,
                                     )
                                     .on_hover_text(moon.tooltip);
                                 if response.hovered() && !self.action_in_progress {
@@ -1263,6 +1264,7 @@ struct MoonView {
     color: egui::Color32,
     tooltip: String,
     temperature_c: Option<f64>,
+    phase: f64,
 }
 
 fn moon_view(
@@ -1273,6 +1275,14 @@ fn moon_view(
     weather_reading: Option<&WeatherReading>,
 ) -> MoonView {
     let temperature_c = weather_reading.map(|reading| reading.temperature_c);
+    let phase = weather_reading
+        .map(|reading| reading.moon_phase)
+        .unwrap_or_else(weather::estimated_moon_phase);
+    let phase_suffix = format!(
+        "\n{}: {}",
+        language.text("Mondphase", "Moon phase"),
+        moon_phase_label(phase, language),
+    );
     let weather_suffix = weather_reading
         .map(|reading| {
             format!(
@@ -1295,28 +1305,32 @@ fn moon_view(
         return MoonView {
             color: GREEN,
             tooltip: format!(
-                "{}{}",
+                "{}{}{}",
                 language.text(
                     "Nachtmodus wird aktiviert …\nBitte kurz warten.",
                     "Night mode is being enabled …\nPlease wait.",
                 ),
-                weather_suffix
+                phase_suffix,
+                weather_suffix,
             ),
             temperature_c,
+            phase,
         };
     }
     if matches!(pending_action, Some(NightAction::Stop)) {
         return MoonView {
             color: GRAY,
             tooltip: format!(
-                "{}{}",
+                "{}{}{}",
                 language.text(
                     "Nachtmodus wird deaktiviert …\nBitte kurz warten.",
                     "Night mode is being disabled …\nPlease wait.",
                 ),
-                weather_suffix
+                phase_suffix,
+                weather_suffix,
             ),
             temperature_c,
+            phase,
         };
     }
     let (color, state, action) = match status {
@@ -1412,14 +1426,29 @@ fn moon_view(
         ),
     };
     let tooltip = if let Some(error) = error {
-        format!("{state}\nAktion fehlgeschlagen: {error}\n{action}{weather_suffix}")
+        format!("{state}\nAktion fehlgeschlagen: {error}\n{action}{phase_suffix}{weather_suffix}")
     } else {
-        format!("{state}\n{action}{weather_suffix}")
+        format!("{state}\n{action}{phase_suffix}{weather_suffix}")
     };
     MoonView {
         color,
         tooltip,
         temperature_c,
+        phase,
+    }
+}
+
+fn moon_phase_label(phase: f64, language: Language) -> &'static str {
+    let phase = phase.rem_euclid(1.0);
+    match phase {
+        value if !(0.0625..0.9375).contains(&value) => language.text("Neumond", "New moon"),
+        value if value < 0.1875 => language.text("Zunehmende Sichel", "Waxing crescent"),
+        value if value < 0.3125 => language.text("Erstes Viertel", "First quarter"),
+        value if value < 0.4375 => language.text("Zunehmender Mond", "Waxing gibbous"),
+        value if value < 0.5625 => language.text("Vollmond", "Full moon"),
+        value if value < 0.6875 => language.text("Abnehmender Mond", "Waning gibbous"),
+        value if value < 0.8125 => language.text("Letztes Viertel", "Last quarter"),
+        _ => language.text("Abnehmende Sichel", "Waning crescent"),
     }
 }
 
@@ -1532,33 +1561,85 @@ fn moon_icon(
     diameter: f32,
     gradient_rect: egui::Rect,
     temperature_c: Option<f64>,
+    phase: f64,
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::click());
     let center = rect.center();
     let radius = diameter / 2.0;
     let painter = ui.painter();
+    let phase = phase.rem_euclid(1.0);
     let halo_outer = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18);
     let halo_inner = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 32);
     painter.circle_filled(center, radius * 1.28, halo_outer);
     painter.circle_filled(center, radius * 1.14, halo_inner);
-    painter.circle_filled(center, radius, color);
-    let cutout_center = egui::pos2(center.x + radius * 0.45, center.y - radius * 0.28);
-    painter.circle_filled(
-        cutout_center,
-        radius * 0.86,
-        gradient_color_at(gradient_rect, cutout_center),
-    );
+    // Start with the unlit lunar disc, then paint the illuminated side as
+    // narrow horizontal slices. This gives us every phase, not just a fixed
+    // crescent, while keeping the existing soft halo and compact footprint.
+    painter.circle_filled(center, radius, gradient_color_at(gradient_rect, center));
+    paint_illuminated_moon(painter, center, radius, color, phase);
+
+    let illumination = (1.0 - (std::f32::consts::TAU * phase as f32).cos()) * 0.5;
+    let temperature_center = if illumination > 0.92 {
+        center
+    } else {
+        let dark_side = if phase < 0.5 { 1.0 } else { -1.0 };
+        egui::pos2(center.x + radius * 0.42 * dark_side, center.y)
+    };
+    let temperature_color = if illumination > 0.92 {
+        gradient_color_at(gradient_rect, center)
+    } else {
+        color
+    };
     if let Some(temperature_c) = temperature_c {
         painter.text(
-            cutout_center,
+            temperature_center,
             egui::Align2::CENTER_CENTER,
             format!("{temperature_c:.0}°C"),
             egui::FontId::proportional(15.0),
-            color,
+            temperature_color,
         );
     }
     response
+}
+
+fn paint_illuminated_moon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    color: egui::Color32,
+    phase: f64,
+) {
+    let waxing = phase < 0.5;
+    let terminator_scale = (std::f32::consts::TAU * phase as f32).cos();
+    const SLICES: usize = 64;
+    for index in 0..SLICES {
+        let y0 = -radius + (index as f32 / SLICES as f32) * radius * 2.0;
+        let y1 = -radius + ((index + 1) as f32 / SLICES as f32) * radius * 2.0;
+        let y = (y0 + y1) * 0.5;
+        let half_width = (radius * radius - y * y).max(0.0).sqrt();
+        let terminator = if waxing {
+            -terminator_scale * half_width
+        } else {
+            terminator_scale * half_width
+        };
+        let (left, right) = if waxing {
+            (-half_width, terminator)
+        } else {
+            (terminator, half_width)
+        };
+        if right <= left {
+            continue;
+        }
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(center.x + left, center.y + y0),
+                egui::pos2(center.x + right, center.y + y1),
+            ),
+            0.0,
+            color,
+        );
+    }
 }
 
 fn gradient_color_at(rect: egui::Rect, point: egui::Pos2) -> egui::Color32 {

@@ -15,6 +15,12 @@
 
 - **Feinabgleich abgeschlossen** - Mondhalo, KPI-Zeile, Wattwert und Timeline sind auf gemeinsame rechte Abschlusslinien ausgerichtet.
 
+### 🌙 Mondphase
+
+- **Mondphase aus dem Wetterort** - Die Open-Meteo-Abfrage liefert zusätzlich die aktuelle tägliche Mondphase. Das Mondsymbol zeigt jetzt je nach Phase Sichel, Viertel, zunehmenden oder abnehmenden Mond, Vollmond oder Neumond.
+- **Temperatur bleibt lesbar** - Die Temperatur wandert in den dunklen Bereich der Mondgrafik und bleibt bei Vollmond kontrastreich zentriert.
+- **Fail-safe** - Wenn die Phase noch nicht vom Wetterdienst vorliegt, verwendet die Anzeige eine lokale astronomische Näherung. Nachtwächter, Countdown und Energieaktion bleiben vollständig unabhängig.
+
 ## [2026-08-16] - Neustart- und Autostartstabilität v0.1.18
 
 ### 🛡️ Sicherheit
