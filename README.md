@@ -65,6 +65,8 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 
 The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer turns it into a quick system monitor without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed. The small upper-right control hood opens the last 30 completion actions and cycles the window between normal, always-on-top, and always-in-background modes. Its glass surfaces use a subtle top reflection to keep the dashboard calm but tactile. The tray menu lets you choose window opacity from 100% down to 10%.
 
+When Windows exposes an active media session, the footer also shows the current artist and title in compact color-coded pills. The dotted timeline gives an immediate playback overview, previews a seek position on hover, and seeks there on click when the media session supports playback-position changes. Media control is informational and independent of the Herdr watcher.
+
 The moon also shows the current temperature for the selected weather location. Leipzig is used initially; the small weather control at the lower-right appears on hover and opens a searchable city selector. Weather is informational only, is refreshed in the background, and falls back to the last value or `—` when the network is unavailable.
 
 ## Usage

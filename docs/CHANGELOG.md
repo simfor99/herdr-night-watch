@@ -3,6 +3,18 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-17] - Medienzeile und Live-Layout v0.1.19
+
+### 🎵 Live-Status
+
+- **Kompakte Medienanzeige** - Aktueller Interpret und Songtitel erscheinen im Footer, wenn Windows eine Mediensession meldet.
+- **Dotted Timeline** - Die Wiedergabe wird als platzsparende Punktzeile dargestellt. Hover zeigt die Sprungvorschau, ein Klick springt an diese Stelle, sofern die Session dies unterstützt.
+- **Unabhängig vom Wächter** - Medienmetadaten und Wiedergabeposition beeinflussen weder Herdr-Überwachung noch Ruhezeit oder Energieaktion.
+
+### 🎛️ Layout
+
+- **Feinabgleich abgeschlossen** - Mondhalo, KPI-Zeile, Wattwert und Timeline sind auf gemeinsame rechte Abschlusslinien ausgerichtet.
+
 ## [2026-08-16] - Neustart- und Autostartstabilität v0.1.18
 
 ### 🛡️ Sicherheit

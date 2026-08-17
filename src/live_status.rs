@@ -48,6 +48,8 @@ const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);
 const BG_TOP: egui::Color32 = egui::Color32::from_rgb(26, 34, 54);
 const BG_BOTTOM: egui::Color32 = egui::Color32::from_rgb(14, 19, 33);
 const WINDOW_DRAG_THRESHOLD_SQUARED: f32 = 4.0;
+const MOON_SLOT_WIDTH: f32 = 77.0;
+const MOON_ICON_DIAMETER: f32 = 59.5;
 
 pub fn open() -> Result<()> {
     if let Some(hwnd) = find_live_window() {
@@ -304,8 +306,8 @@ fn acquire_live_instance() -> Result<Option<HANDLE>> {
 
 fn run_window() -> Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([400.0, 180.0])
-        .with_min_inner_size([390.0, 170.0])
+        .with_inner_size([381.0, 188.0])
+        .with_min_inner_size([371.0, 178.0])
         .with_decorations(false)
         .with_window_level(window_chrome::window_level(
             window_settings::WindowLevel::current(),
@@ -704,7 +706,12 @@ impl eframe::App for LiveStatusApp {
             return;
         }
         egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(14, 14))
+            .inner_margin(egui::Margin {
+                left: 20,
+                right: 2,
+                top: 14,
+                bottom: 14,
+            })
             .show(ui, |ui| {
                 let moon = moon_view(
                     &self.status,
@@ -841,39 +848,45 @@ impl eframe::App for LiveStatusApp {
                             });
                             window_chrome::glass_sheen(ui.painter(), panel.response.rect);
                         });
-                        ui.add_space(14.0);
-                        ui.vertical(|ui| {
-                            ui.add_space(30.0);
-                            let response = moon_icon(
-                                    ui,
-                                    moon.color,
-                                    59.5,
-                                    gradient_rect,
-                                    moon.temperature_c,
-                                )
-                                .on_hover_text(moon.tooltip);
-                            if response.hovered() && !self.action_in_progress {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            }
-                            if !self.action_in_progress && response.clicked() {
-                                self.run_action(action);
-                            }
-                            if let Some(seconds_remaining) = countdown_seconds {
-                                ui.add_space(1.0);
-                                ui.label(
-                                    egui::RichText::new(format_countdown(seconds_remaining))
-                                        .strong()
-                                        .color(RED),
-                                );
-                            }
-                        });
+                        let moon_centering_space =
+                            ((ui.available_width() - MOON_SLOT_WIDTH) / 2.0 - 4.5).max(0.0);
+                        ui.add_space(moon_centering_space);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(MOON_SLOT_WIDTH, 88.0),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(30.0);
+                                let response = moon_icon(
+                                        ui,
+                                        moon.color,
+                                        MOON_ICON_DIAMETER,
+                                        gradient_rect,
+                                        moon.temperature_c,
+                                    )
+                                    .on_hover_text(moon.tooltip);
+                                if response.hovered() && !self.action_in_progress {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if !self.action_in_progress && response.clicked() {
+                                    self.run_action(action);
+                                }
+                                if let Some(seconds_remaining) = countdown_seconds {
+                                    ui.add_space(1.0);
+                                    ui.label(
+                                        egui::RichText::new(format_countdown(seconds_remaining))
+                                            .strong()
+                                            .color(RED),
+                                    );
+                                }
+                            },
+                        );
                     },
                 );
                 ui.add_space(6.0);
-                system_metrics_row(ui, self.metrics, self.language);
+                let metrics_text_right = system_metrics_row(ui, self.metrics, self.language);
                 if let Some(media) = &self.media_snapshot {
                     ui.add_space(2.0);
-                    if let Some(position) = media_info_row(ui, media) {
+                    if let Some(position) = media_info_row(ui, media, metrics_text_right) {
                         let _ = self.media_command_tx.send(MediaCommand::Seek(position));
                     }
                 }
@@ -919,8 +932,8 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
         egui::pos2(rect.left() + 244.0, rect.top() + 50.0),
     );
     let moon = egui::Rect::from_min_max(
-        egui::pos2(rect.right() - 104.0, rect.top() + 40.0),
-        egui::pos2(rect.right() - 38.0, rect.top() + 106.0),
+        egui::pos2(rect.right() - 200.0, rect.top() + 28.0),
+        egui::pos2(rect.right() - 20.0, rect.top() + 116.0),
     );
     let control_hood = egui::Rect::from_min_max(
         egui::pos2(rect.right() - 138.0, rect.top() + 1.0),
@@ -1560,63 +1573,86 @@ fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32) {
     });
 }
 
-fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Language) {
+fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Language) -> f32 {
     let available = ui.available_width();
     let spacing = 7.0;
     let item_width = ((available - spacing * 4.0) / 5.0).max(52.0);
+    let power_value = metrics.gpu_watts.map(|value| format!("{value:>3}W"));
     let old_spacing = ui.spacing().item_spacing.x;
     ui.spacing_mut().item_spacing.x = spacing;
-    ui.horizontal(|ui| {
-        system_metric_badge(
-            ui,
-            item_width,
-            MetricIcon::Cpu,
-            "CPU",
-            metrics.cpu_percent.map(|value| format!("{value:>2}%")),
-            metric_color(metrics.cpu_percent),
-            language,
-        );
-        system_metric_badge(
-            ui,
-            item_width,
-            MetricIcon::Ram,
-            "RAM",
-            metrics.ram_percent.map(|value| format!("{value:>2}%")),
-            metric_color(metrics.ram_percent),
-            language,
-        );
-        system_metric_badge(
-            ui,
-            item_width,
-            MetricIcon::Gpu,
-            "GPU",
-            metrics.gpu_percent.map(|value| format!("{value:>2}%")),
-            metric_color(metrics.gpu_percent),
-            language,
-        );
-        system_metric_badge(
-            ui,
-            item_width,
-            MetricIcon::Vram,
-            "VRAM",
-            metrics.vram_percent.map(|value| format!("{value:>2}%")),
-            metric_color(metrics.vram_percent),
-            language,
-        );
-        system_metric_badge(
-            ui,
-            item_width,
-            MetricIcon::Power,
-            "",
-            metrics.gpu_watts.map(|value| format!("{value:>3}W")),
-            metric_color(metrics.gpu_power_percent),
-            language,
-        );
-    });
+    let power_rect = ui
+        .horizontal(|ui| {
+            system_metric_badge(
+                ui,
+                item_width,
+                MetricIcon::Cpu,
+                "CPU",
+                metrics.cpu_percent.map(|value| format!("{value:>2}%")),
+                metric_color(metrics.cpu_percent),
+                language,
+                false,
+            );
+            system_metric_badge(
+                ui,
+                item_width,
+                MetricIcon::Ram,
+                "RAM",
+                metrics.ram_percent.map(|value| format!("{value:>2}%")),
+                metric_color(metrics.ram_percent),
+                language,
+                false,
+            );
+            system_metric_badge(
+                ui,
+                item_width,
+                MetricIcon::Gpu,
+                "GPU",
+                metrics.gpu_percent.map(|value| format!("{value:>2}%")),
+                metric_color(metrics.gpu_percent),
+                language,
+                false,
+            );
+            system_metric_badge(
+                ui,
+                item_width,
+                MetricIcon::Vram,
+                "VRAM",
+                metrics.vram_percent.map(|value| format!("{value:>2}%")),
+                metric_color(metrics.vram_percent),
+                language,
+                false,
+            );
+            system_metric_badge(
+                ui,
+                item_width,
+                MetricIcon::Power,
+                "",
+                power_value.clone(),
+                metric_color(metrics.gpu_power_percent),
+                language,
+                true,
+            )
+        })
+        .inner;
     ui.spacing_mut().item_spacing.x = old_spacing;
+    let power_text = power_value.unwrap_or_else(|| "—".into());
+    let power_text_width = ui
+        .painter()
+        .layout_no_wrap(
+            power_text,
+            egui::FontId::proportional(11.0),
+            metric_color(metrics.gpu_power_percent),
+        )
+        .size()
+        .x;
+    power_rect.center().x - 5.0 + power_text_width / 2.0
 }
 
-fn media_info_row(ui: &mut egui::Ui, media: &MediaSnapshot) -> Option<i64> {
+fn media_info_row(
+    ui: &mut egui::Ui,
+    media: &MediaSnapshot,
+    metrics_text_right: f32,
+) -> Option<i64> {
     let (artist_color, _, title_color, _) = media_colors(media);
     let artist = if media.artist.trim().is_empty() {
         "Unbekannter Interpret".to_string()
@@ -1647,10 +1683,10 @@ fn media_info_row(ui: &mut egui::Ui, media: &MediaSnapshot) -> Option<i64> {
         egui::vec2(artist_galley.size().x + 8.0, text_rect.height()),
     );
     let title_panel = egui::Rect::from_min_size(
-        egui::pos2(artist_panel.right() + 3.0, text_rect.top()),
+        egui::pos2(artist_panel.right() + 7.0, text_rect.top()),
         egui::vec2(
             (title_galley.size().x + 8.0)
-                .min((text_rect.right() - artist_panel.right() - 3.0).max(0.0)),
+                .min((text_rect.right() - artist_panel.right() - 7.0).max(0.0)),
             text_rect.height(),
         ),
     );
@@ -1682,9 +1718,10 @@ fn media_info_row(ui: &mut egui::Ui, media: &MediaSnapshot) -> Option<i64> {
     );
 
     let timeline_left = (title_panel.right() + 6.0).min(rect.right() - timeline_reserve);
+    let timeline_right = (metrics_text_right + 5.0).clamp(timeline_left, rect.right());
     let timeline_rect = egui::Rect::from_min_max(
         egui::pos2(timeline_left, rect.top()),
-        egui::pos2(rect.right() - 24.0, rect.bottom()),
+        egui::pos2(timeline_right, rect.bottom()),
     );
     let track_left = timeline_rect.left() + 5.0;
     let track_right = timeline_rect.right() - 5.0;
@@ -1950,7 +1987,8 @@ fn system_metric_badge(
     value: Option<String>,
     color: egui::Color32,
     language: Language,
-) {
+    center_content: bool,
+) -> egui::Rect {
     let tooltip = match value.as_deref() {
         Some(value) if matches!(icon, MetricIcon::Vram) => {
             format!(
@@ -1988,12 +2026,6 @@ fn system_metric_badge(
         ),
     };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
-    draw_metric_icon(
-        ui.painter(),
-        icon,
-        egui::pos2(rect.left() + 7.0, rect.center().y),
-        color,
-    );
     let has_value = value.is_some();
     let value = value.unwrap_or_else(|| "—".into());
     let text = if label.is_empty() {
@@ -2001,14 +2033,40 @@ fn system_metric_badge(
     } else {
         format!("{label} {value}")
     };
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(
+            text.clone(),
+            egui::FontId::proportional(11.0),
+            if has_value { color } else { GRAY },
+        )
+        .size()
+        .x;
+    let text_left = if center_content {
+        rect.center().x - 5.0 - text_width / 2.0
+    } else {
+        rect.left() + 17.0
+    };
+    let icon_x = if center_content {
+        text_left - 10.0
+    } else {
+        rect.left() + 7.0
+    };
+    draw_metric_icon(
+        ui.painter(),
+        icon,
+        egui::pos2(icon_x, rect.center().y),
+        color,
+    );
     ui.painter().text(
-        egui::pos2(rect.left() + 17.0, rect.center().y),
+        egui::pos2(text_left, rect.center().y),
         egui::Align2::LEFT_CENTER,
         text,
         egui::FontId::proportional(11.0),
         if has_value { color } else { GRAY },
     );
-    response.on_hover_text(tooltip);
+    let _ = response.on_hover_text(tooltip);
+    rect
 }
 
 fn draw_metric_icon(
