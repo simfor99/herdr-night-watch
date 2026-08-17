@@ -50,6 +50,8 @@ const BG_BOTTOM: egui::Color32 = egui::Color32::from_rgb(14, 19, 33);
 const WINDOW_DRAG_THRESHOLD_SQUARED: f32 = 4.0;
 const MOON_SLOT_WIDTH: f32 = 77.0;
 const MOON_ICON_DIAMETER: f32 = 59.5;
+const MOON_RIGHT_INSET: f32 = 34.0;
+const KPI_PANEL_WIDTH: f32 = 264.0;
 
 pub fn open() -> Result<()> {
     if let Some(hwnd) = find_live_window() {
@@ -818,8 +820,14 @@ impl eframe::App for LiveStatusApp {
                             }
                             ui.add_space(5.0);
                             let panel = glassy_frame(ui).show(ui, |ui| {
+                                // Keep the KPI card geometrically stable across
+                                // languages; English labels are fitted inside
+                                // the German-sized card instead of widening it.
+                                ui.set_width(KPI_PANEL_WIDTH - 24.0);
                                 let agents = agents_for(&self.status);
                                 if agents.available {
+                                    let old_spacing = ui.spacing().item_spacing.x;
+                                    ui.spacing_mut().item_spacing.x = 4.0;
                                     ui.horizontal(|ui| {
                                         metric(ui, self.language.text("Erkannt", "Detected"), agents.total, TEXT);
                                         divider(ui);
@@ -829,6 +837,7 @@ impl eframe::App for LiveStatusApp {
                                         divider(ui);
                                         metric(ui, self.language.text("Fertig", "Finished"), agents.done, GRAY);
                                     });
+                                    ui.spacing_mut().item_spacing.x = old_spacing;
                                 } else {
                                     ui.colored_label(
                                         YELLOW,
@@ -848,9 +857,12 @@ impl eframe::App for LiveStatusApp {
                             });
                             window_chrome::glass_sheen(ui.painter(), panel.response.rect);
                         });
-                        let moon_centering_space =
-                            ((ui.available_width() - MOON_SLOT_WIDTH) / 2.0 - 9.0).max(0.0);
-                        ui.add_space(moon_centering_space);
+                        let moon_space = (ui.max_rect().right()
+                            - MOON_RIGHT_INSET
+                            - MOON_SLOT_WIDTH
+                            - ui.cursor().left())
+                            .max(0.0);
+                        ui.add_space(moon_space);
                         ui.allocate_ui_with_layout(
                             egui::vec2(MOON_SLOT_WIDTH, 88.0),
                             egui::Layout::top_down(egui::Align::Center),
