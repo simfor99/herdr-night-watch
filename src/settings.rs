@@ -26,7 +26,7 @@ pub fn run() -> Result<()> {
         options,
         Box::new(|_| Ok(Box::new(SettingsApp::new()))),
     )
-    .map_err(Into::into)
+    .map_err(|error| anyhow::anyhow!("Einrichtung konnte nicht ausgeführt werden: {error}"))
 }
 struct SettingsApp {
     configuration: Configuration,

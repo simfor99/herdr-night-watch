@@ -71,6 +71,28 @@ def parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def windows_boot_time_from_marker(boot_id: str | None) -> datetime | None:
+    """Extract the Windows boot timestamp from a composite runtime marker."""
+    if not isinstance(boot_id, str) or "|windows:" not in boot_id:
+        return None
+    value = boot_id.split("|windows:", 1)[1].strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    # .NET's round-trip format may contain seven fractional digits while
+    # Python's datetime accepts at most six.
+    if "." in value and "+" in value:
+        prefix, suffix = value.split("+", 1)
+        fraction = prefix.rsplit(".", 1)[1]
+        if len(fraction) > 6:
+            prefix = prefix[: -(len(fraction) - 6)]
+        value = f"{prefix}+{suffix}"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def state_dir() -> Path:
     root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     return root / "herdr-night-watch"
@@ -185,14 +207,26 @@ def reset_stale_run_after_restart(
         if not state or state.get("outcome"):
             return False
         previous_boot_id = state.get("boot_id")
-        if not previous_boot_id or previous_boot_id == current_boot_id:
+        reset_reason: str | None = None
+        if previous_boot_id and previous_boot_id != current_boot_id:
+            reset_reason = "boot_id_changed"
+        elif not previous_boot_id:
+            # Runs created by watcher schema 3 predate persisted boot markers.
+            # Only clear them when their armed time is demonstrably before the
+            # current Windows boot. This keeps a normal watcher restart on the
+            # same machine from cancelling a still-valid legacy run.
+            armed_at = parse_time(state.get("armed_at"))
+            current_windows_boot = windows_boot_time_from_marker(current_boot_id)
+            if armed_at and current_windows_boot and armed_at < current_windows_boot:
+                reset_reason = "legacy_state_after_reboot"
+        if not reset_reason:
             return False
 
         run_id = str(state.get("run_id", "unknown"))
         state["outcome"] = "reset_after_restart"
         state["finished_at"] = iso_now()
         state["detail"] = "night watch reset after WSL/Windows restart"
-        state["reset_reason"] = "boot_id_changed"
+        state["reset_reason"] = reset_reason
         write_json(state_path, state)
         warning_path.unlink(missing_ok=True)
     try:

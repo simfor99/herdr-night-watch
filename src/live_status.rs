@@ -25,9 +25,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(4);
+// WGPU can take noticeably longer to initialize after a Windows reboot while
+// the graphics driver and desktop compositor are still waking up. Four
+// seconds caused the tray opener to kill a healthy process during startup.
+const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const LIVE_WINDOW_START_ATTEMPTS: usize = 3;
+const LIVE_WINDOW_START_ATTEMPTS: usize = 2;
 const LIVE_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
 const LIVE_INSTANCE_MUTEX: &str = "Local\\HerdrNachtwaechter.LiveStatus";
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
@@ -81,7 +84,7 @@ pub fn open() -> Result<()> {
                     Ok(None) if started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT => {
                         let _ = child.kill();
                         let _ = child.wait();
-                        let detail = "Live-Status-Prozess läuft, aber nach vier Sekunden wurde kein Fenster gefunden";
+                        let detail = "Live-Status-Prozess läuft, aber nach 30 Sekunden wurde kein Fenster gefunden";
                         if attempt == LIVE_WINDOW_START_ATTEMPTS {
                             record_open_failure(detail);
                             return;
@@ -187,10 +190,19 @@ unsafe extern "system" fn find_live_window_for_pid_callback(hwnd: HWND, lparam: 
         if search.found.is_some() {
             return 1;
         }
-        // eframe/winit creates a visible 4x4 event-target window before the
-        // actual Live-Status window is shown. Only accept a titled window so
-        // the startup monitor can restore the real 400x170 window.
-        if GetWindowTextLengthW(hwnd) <= 0 {
+        // eframe/winit creates a 4x4 event-target window before the actual
+        // Live-Status window is shown. The real window can still be marked
+        // hidden while it is being prepared, so match its title rather than
+        // requiring IsWindowVisible here. activate_live_window restores it.
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return 1;
+        }
+        let mut title = vec![0u16; length as usize + 1];
+        let copied = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        let title = String::from_utf16_lossy(&title[..copied as usize]);
+        if title != "Herdr-Nachtwächter - Live-Status" && title != "Herdr Night Watch - Live Status"
+        {
             return 1;
         }
         let mut window_pid = 0;
@@ -306,6 +318,7 @@ fn run_window() -> Result<()> {
     }
     let options = eframe::NativeOptions {
         viewport,
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(
