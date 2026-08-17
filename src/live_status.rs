@@ -1578,7 +1578,9 @@ fn moon_icon(
     let separation = moon_disc_separation(illumination) * radius;
     let dark_center = egui::pos2(center.x + separation * dark_side, center.y);
     painter.circle_filled(center, radius, color);
-    painter.circle_filled(
+    paint_moon_shadow(
+        painter,
+        center,
         dark_center,
         radius,
         gradient_color_at(gradient_rect, dark_center),
@@ -1595,6 +1597,52 @@ fn moon_icon(
         );
     }
     response
+}
+
+fn paint_moon_shadow(
+    painter: &egui::Painter,
+    moon_center: egui::Pos2,
+    shadow_center: egui::Pos2,
+    radius: f32,
+    color: egui::Color32,
+) {
+    let delta = shadow_center - moon_center;
+    let separation = delta.length();
+    if separation <= f32::EPSILON {
+        painter.circle_filled(moon_center, radius, color);
+        return;
+    }
+    if separation >= radius * 2.0 {
+        return;
+    }
+
+    // The shadow is the intersection of two equal circles. Drawing that
+    // lens directly keeps the unlit disc inside the actual moon boundary.
+    let direction = delta.y.atan2(delta.x);
+    let half_angle = (separation / (radius * 2.0)).clamp(-1.0, 1.0).acos();
+    let arc_steps = 24;
+    let mut points = Vec::with_capacity(arc_steps * 2 + 2);
+    for step in 0..=arc_steps {
+        let t = step as f32 / arc_steps as f32;
+        let angle = direction - half_angle + 2.0 * half_angle * t;
+        points.push(egui::pos2(
+            moon_center.x + radius * angle.cos(),
+            moon_center.y + radius * angle.sin(),
+        ));
+    }
+    for step in 0..=arc_steps {
+        let t = step as f32 / arc_steps as f32;
+        let angle = direction + std::f32::consts::PI - half_angle + 2.0 * half_angle * t;
+        points.push(egui::pos2(
+            shadow_center.x + radius * angle.cos(),
+            shadow_center.y + radius * angle.sin(),
+        ));
+    }
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 fn paint_moon_temperature(
