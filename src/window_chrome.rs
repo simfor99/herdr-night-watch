@@ -4,7 +4,8 @@ use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GWL_EXSTYLE, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongW, WS_EX_LAYERED,
+    GetWindowThreadProcessId, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, WS_EX_LAYERED,
 };
 
 const BG_TOP: egui::Color32 = egui::Color32::from_rgb(26, 34, 54);
@@ -36,9 +37,35 @@ pub fn apply_window_opacity(opacity: u8, title: &str) {
     };
     unsafe {
         let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED as i32);
-        let alpha = ((u16::from(opacity) * 255 + 50) / 100) as u8;
-        let _ = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+        if let Some(alpha) = layered_window_alpha(opacity) {
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED as i32);
+            let _ = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+            return;
+        }
+        // Glow/OpenGL cannot present into a layered HWND. At full opacity the
+        // layered bit must be cleared, otherwise the first frame flashes and
+        // the window stays white.
+        let cleared = style & !(WS_EX_LAYERED as i32);
+        if cleared != style {
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, cleared);
+            let _ = SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+    }
+}
+
+pub(crate) fn layered_window_alpha(opacity: u8) -> Option<u8> {
+    if opacity >= 100 {
+        None
+    } else {
+        Some(((u16::from(opacity) * 255 + 50) / 100) as u8)
     }
 }
 
@@ -149,4 +176,22 @@ pub fn glass_sheen(painter: &egui::Painter, rect: egui::Rect) {
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
         ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::layered_window_alpha;
+
+    #[test]
+    fn full_opacity_does_not_use_layered_style() {
+        assert_eq!(layered_window_alpha(100), None);
+        assert_eq!(layered_window_alpha(101), None);
+    }
+
+    #[test]
+    fn reduced_opacity_uses_layered_alpha() {
+        assert_eq!(layered_window_alpha(90), Some(230));
+        assert_eq!(layered_window_alpha(50), Some(128));
+        assert_eq!(layered_window_alpha(10), Some(26));
+    }
 }

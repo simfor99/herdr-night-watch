@@ -3,6 +3,19 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-18] - Skalierungsvorschau bleibt lesbar
+
+### 🪟 Bedienung
+
+- **Zahlen bleiben sichtbar** - Beim Verkleinern über den Anfasser bleibt das aktuelle Fenster stehen. Die kleinere Zielfläche liegt darin, Prozentwert und Pixelmaß werden nicht mehr vom schrumpfenden Fenster überdeckt.
+
+## [2026-08-18] - Live-Fenster bleibt gezeichnet
+
+### 🪟 Bedienung
+
+- **Kein weißes Aufblitzen mehr** - Das Tray holt das Live-Fenster erst nach dem ersten echten Zeichenframe nach vorn. Ein noch verstecktes Vorbereitungsfenster wird nicht mehr vorzeitig eingeblendet.
+- **Volle Deckkraft bleibt undurchsichtig** - Bei 100 Prozent Transparenz wird der Windows-Layered-Stil nicht mehr gesetzt. Glow kann das Fenster dadurch dauerhaft zeichnen statt nach einem kurzen Flash weiß zu bleiben.
+
 ## [2026-08-17] - Medienzeile und Live-Layout v0.1.19
 
 ### 📋 Abschlussprotokoll

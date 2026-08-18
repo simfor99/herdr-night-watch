@@ -55,6 +55,7 @@ Das Skript ruft zuerst `herdr-night-watch.py --cancel` auf und stoppt danach den
 | Kein Popup im aktiven Lauf. | Tray-App ist beendet oder erkennt die Warnphase nicht; der Wächter läuft trotzdem weiter. | WSL-Status prüfen, bei Bedarf mit dem Stopp-Pfad abbrechen. |
 | Warnung nennt fehlendes Internet. | Beide Verbindungschecks waren fünf Minuten nicht erreichbar. | Internet wiederherstellen: Die eigene Warnung wird abgebrochen. Andernfalls Countdown bewusst bestätigen oder abbrechen. |
 | Kurz sichtbare Terminalfenster. | Eine alte EXE verwendet noch den früheren Skriptstarter. | Aktuelle EXE installieren und die Tray-App neu starten. |
+| Live-Fenster blitzt weiß auf und bleibt leer. | Der Tray hat ein ungemaltes Fenster eingeblendet oder `WS_EX_LAYERED` steht bei voller Deckkraft. | Aktuelle EXE installieren, Tray-App neu starten und `logs\\ui-errors.log` prüfen. |
 | Neuer Lauf meldet, ein anderer Wächter laufe noch. | Ein vorheriger Task gibt seine Dateisperre gerade frei. | Der neue Wächter wartet bis zu 15 Sekunden auf die Freigabe; danach nur bei weiter bestehender Sperre Diagnose beginnen. |
 | Das Symbol ist nicht zu sehen. | Windows hat es in den ausgeklappten Taskleistenbereich verschoben. | Pfeil `^` in der Taskleiste öffnen; Prozess erst danach prüfen. |
 

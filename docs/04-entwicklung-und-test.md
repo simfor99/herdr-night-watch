@@ -39,6 +39,8 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - Tooltip und Live-Fenster zeigen die aktuelle Herdr-Sicht; die Shutdown-Prüfung liest diesen Status unabhängig erneut.
 - Die Systemtelemetrie im Live-Fenster ist reine Anzeige. Fehler oder fehlende Werte dürfen den Wächter und seine Energieentscheidung nicht beeinflussen.
 - Das visuelle Fenster-Chrome liegt zentral in `src/window_chrome.rs`; insbesondere darf die Transparenzsuche nie ein gleichnamiges Fenster eines anderen Prozesses verändern.
+- `WS_EX_LAYERED` darf nur bei einer echten Transparenz unter 100 Prozent gesetzt werden. Bei voller Deckkraft muss der Layered-Stil entfernt bleiben, sonst bleibt das Glow-Fenster weiß.
+- Der Tray darf ein Live-Fenster erst nach dem ersten gezeichneten Frame nach vorn holen. Ein verstecktes oder 4x4-Vorbereitungsfenster darf nicht mit `ShowWindow` sichtbar gemacht werden.
 
 ## Build und Auslieferung
 
@@ -86,7 +88,7 @@ Ein echter Windows-Shutdown wird nicht als automatischer Test ausgeführt. Die T
 |---|---|---|
 | Tray-Text, Menü oder Symbol | App starten, Menü und Tooltip ansehen | Kein zusätzliches Fenster, passende Menü-Sperren |
 | Live-Status | Mehrere Herdr-Agenten laufen lassen, Live-Status öffnen | Live-Zahl, großer Mond mit echter Mondphase und Hover-Hinweis sowie funktionierender Start- oder Stoppknopf sind sichtbar; die Temperatur bleibt in der dunklen Mondfläche lesbar; Abschluss-Schalter und Sekundenfeld liegen rechts neben „Herdr jetzt“, speichern nur außerhalb eines aktiven Laufes; bei Warnfrist zeigt das Fenster einen roten Countdown; die schmale Fußzeile zeigt CPU, GPU, belegten VRAM, RAM und einen verfügbaren Grafikkarten-Wattwert oder `—`; Fenster ist beweglich und schließbar |
-| Live-Status nach Neustart | Tray-App mit aktivierter Startoption nach Windows-Login starten; anschließend ein verstecktes Live-Fenster erneut öffnen | Der automatische Start wartet kurz auf den Windows-Desktop; ein vorhandenes verstecktes Fenster wird gefunden, wiederhergestellt und nicht durch eine zweite Mutex-Instanz ersetzt |
+| Live-Status nach Neustart | Tray-App mit aktivierter Startoption nach Windows-Login starten; anschließend ein verstecktes Live-Fenster erneut öffnen | Der automatische Start wartet kurz auf den Windows-Desktop; ein vorhandenes Fenster wird erst nach dem ersten gezeichneten Frame restauriert und nicht durch eine zweite Mutex-Instanz ersetzt |
 | WSL-/PowerShell-Start | Beobachtungsmodus mit echter Herdr-Arbeit | Task läuft, Status hat `monitoring_scope=live_agents`, kein Shutdown; bei einem Boot-Rennen wartet der Wächter auf beide Boot-Marken |
 | Warnfenster | `Demo: Abschluss simulieren` | Ruhezeit, rotes Symbol und Dialog sichtbar; Windows bleibt an |
 | Stopp-Pfad | Demo oder Beobachtung starten, dann Stopp | Task beendet, Log enthält `CANCELLED` oder Abschluss |
@@ -97,7 +99,7 @@ Ein echter Windows-Shutdown wird nicht als automatischer Test ausgeführt. Die T
 | Verdeckter Start | Task über Tray starten und Desktop beobachten | Kein aufblitzendes Terminalfenster |
 | Standard-Countdown | Nachtmodus mit keiner mehr arbeitenden Herdr-Arbeit | Nach 5 Sekunden beginnt ein abbrechbarer 300-Sekunden-Countdown; das Feld im Live-Fenster kann für den nächsten Lauf 10 bis 3.600 Sekunden festlegen |
 | Gespeicherte Warnfrist | Im Live-Fenster 10 Sekunden speichern, danach per Tray oder Startskript ohne Parameter starten | `active-run.json` enthält `warning_seconds=10` |
-| Proportionale Live-Skalierung | Den Anfasser unten rechts ziehen, Vorschau prüfen, loslassen, danach neu öffnen und per Rechtsklick zurücksetzen | Während des Ziehens bleibt das Layout stabil; beim Loslassen wächst oder schrumpft das komplette Layout ohne Verzerrung, die Größe bleibt gespeichert und `Auf 100 % zurücksetzen` stellt den Ausgangswert wieder her |
+| Proportionale Live-Skalierung | Den Anfasser unten rechts ziehen, Vorschau prüfen, loslassen, danach neu öffnen und per Rechtsklick zurücksetzen | Während des Ziehens bleibt das Layout stabil; beim Verkleinern bleiben Prozent- und Pixelangabe im aktuellen Fenster sichtbar; beim Loslassen wächst oder schrumpft das komplette Layout ohne Verzerrung, die Größe bleibt gespeichert und `Auf 100 % zurücksetzen` stellt den Ausgangswert wieder her |
 | Windows-Energieschutz | Als Administrator `windows\Test-HerdrNightWatchPowerGuard.ps1` ausführen | Der aktuelle PowerShell-Prozess erscheint während des Tests in `powercfg /requests`; danach ist der Request freigegeben |
 | Tray-Absturz-Erkennung | Tray starten, Prozess während eines inaktiven Zustands gezielt beenden, Tray neu starten | `logs\\tray-history.csv` enthält genau einen Hinweis „Tray-App unplanmäßig beendet“; ein erwarteter Energiesparmodus erzeugt keinen solchen Hinweis |
 
