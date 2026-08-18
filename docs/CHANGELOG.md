@@ -26,6 +26,10 @@
 ### 🌙 Mondphase
 
 - **Mondphase aus dem Wetterort** - Die Open-Meteo-Abfrage liefert zusätzlich die aktuelle tägliche Mondphase. Das Mondsymbol zeigt jetzt je nach Phase Sichel, Viertel, zunehmenden oder abnehmenden Mond, Vollmond oder Neumond.
+
+### 🖼️ Live-Fenster
+
+- **Proportionale freie Skalierung** - Das Hauptfenster kann über einen dezenten Griff unten rechts frei zwischen 75 und 1.000 Prozent vergrößert oder verkleinert werden. Während des Ziehens bleibt das Layout stabil und zeigt nur eine Vorschau; beim Loslassen wird die globale egui-Skalierung einmalig angewendet. Mond, KPI-Karte, Systemwerte, Medienzeile und Timeline bleiben zusammen. Die Einstellung bleibt gespeichert und lässt sich per Rechtsklick auf 100 Prozent zurücksetzen.
 - **Temperatur bleibt lesbar** - Die Temperatur wandert in den dunklen Bereich der Mondgrafik und bleibt bei Vollmond kontrastreich zentriert.
 - **Fail-safe** - Wenn die Phase noch nicht vom Wetterdienst vorliegt, verwendet die Anzeige eine lokale astronomische Näherung. Nachtwächter, Countdown und Energieaktion bleiben vollständig unabhängig.
 

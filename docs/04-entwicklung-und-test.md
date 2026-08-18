@@ -97,6 +97,7 @@ Ein echter Windows-Shutdown wird nicht als automatischer Test ausgeführt. Die T
 | Verdeckter Start | Task über Tray starten und Desktop beobachten | Kein aufblitzendes Terminalfenster |
 | Standard-Countdown | Nachtmodus mit keiner mehr arbeitenden Herdr-Arbeit | Nach 5 Sekunden beginnt ein abbrechbarer 300-Sekunden-Countdown; das Feld im Live-Fenster kann für den nächsten Lauf 10 bis 3.600 Sekunden festlegen |
 | Gespeicherte Warnfrist | Im Live-Fenster 10 Sekunden speichern, danach per Tray oder Startskript ohne Parameter starten | `active-run.json` enthält `warning_seconds=10` |
+| Proportionale Live-Skalierung | Den Anfasser unten rechts ziehen, Vorschau prüfen, loslassen, danach neu öffnen und per Rechtsklick zurücksetzen | Während des Ziehens bleibt das Layout stabil; beim Loslassen wächst oder schrumpft das komplette Layout ohne Verzerrung, die Größe bleibt gespeichert und `Auf 100 % zurücksetzen` stellt den Ausgangswert wieder her |
 | Windows-Energieschutz | Als Administrator `windows\Test-HerdrNightWatchPowerGuard.ps1` ausführen | Der aktuelle PowerShell-Prozess erscheint während des Tests in `powercfg /requests`; danach ist der Request freigegeben |
 | Tray-Absturz-Erkennung | Tray starten, Prozess während eines inaktiven Zustands gezielt beenden, Tray neu starten | `logs\\tray-history.csv` enthält genau einen Hinweis „Tray-App unplanmäßig beendet“; ein erwarteter Energiesparmodus erzeugt keinen solchen Hinweis |
 

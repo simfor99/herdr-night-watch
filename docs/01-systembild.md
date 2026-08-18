@@ -22,7 +22,7 @@ Die Rust-Anwendung in diesem Projekt ist dagegen ein Controller. Sie bietet die 
 | Lokale Einrichtung | [`src/configuration.rs`](../src/configuration.rs) und [`src/settings.rs`](../src/settings.rs) | WSL-Distro und Wächterpfad lokal speichern und im Setup-Fenster bearbeiten |
 | Warnfenster | [`src/notify.rs`](../src/notify.rs) | Windows-Dialog mit „Abbrechen“ in der echten Warnphase |
 | Fenster-Chrome | [`src/window_chrome.rs`](../src/window_chrome.rs) | Gemeinsame Windows-Schicht für Transparenz, Ebenen, Verlauf und Glasreflexion; Transparenz wird nur auf Fenster des eigenen Prozesses angewendet |
-| Live-Status | [`src/live_status.rs`](../src/live_status.rs) | Frei platzierbares, schließbares Fenster für Live-Arbeit und Nachtlaufzustand |
+| Live-Status | [`src/live_status.rs`](../src/live_status.rs) | Frei platzierbares, schließbares Fenster für Live-Arbeit und Nachtlaufzustand; proportional zwischen 75 und 1.000 Prozent skalierbar |
 | Wetteranzeige | [`src/weather.rs`](../src/weather.rs) und [`src/weather_location.rs`](../src/weather_location.rs) | Hintergrund-Temperaturabruf und Suchfenster für den lokalen Wetterort |
 | Autostart | [`src/autostart.rs`](../src/autostart.rs) | `HKCU\\...\\Run` für die Tray-App, nie für einen Nachtlauf |
 | Wächter | [`herdr-night-watch.py`](../watcher/herdr-night-watch.py) | Prüfung aller aktuellen Herdr-Agenten, Ruhezeit, Shutdown und Abbruch |
@@ -66,7 +66,7 @@ Die öffentliche Anwendung speichert zwei lokale Angaben unter dem Windows-Benut
 
 Der Wetterort wird zusätzlich als lokale Windows-Registry-Einstellung gespeichert. Standardmäßig ist Leipzig hinterlegt. Die Live-App fragt die Temperatur im Hintergrund über Open-Meteo ab und zeigt bei fehlender Verbindung keinen erfundenen Wert. Diese Anzeige ist vollständig vom Wächter getrennt und kann keine Energieaktion auslösen.
 
-Auch die Position des Live-Fensters wird lokal unter dem Windows-Benutzerkonto gespeichert. Beim erneuten Öffnen wird ein vorhandenes Fenster restauriert und nach vorn geholt; der Startpfad schützt zusätzlich mit einer benannten Windows-Sperre vor doppelten Live-Fenstern. Fehlschläge beim Öffnen werden unter `logs/ui-errors.log` protokolliert.
+Auch die Position und die proportionale Größe des Live-Fensters werden lokal unter dem Windows-Benutzerkonto gespeichert. Beim erneuten Öffnen wird ein vorhandenes Fenster restauriert und nach vorn geholt; der Startpfad schützt zusätzlich mit einer benannten Windows-Sperre vor doppelten Live-Fenstern. Fehlschläge beim Öffnen werden unter `logs/ui-errors.log` protokolliert. Ein Rechtsklick auf freie Fläche setzt die Größe auf 100 Prozent zurück.
 
 ## Persistenter Zustand und Protokoll
 

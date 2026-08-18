@@ -48,6 +48,9 @@ const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);
 const BG_TOP: egui::Color32 = egui::Color32::from_rgb(26, 34, 54);
 const BG_BOTTOM: egui::Color32 = egui::Color32::from_rgb(14, 19, 33);
 const WINDOW_DRAG_THRESHOLD_SQUARED: f32 = 4.0;
+const DESIGN_WIDTH: f32 = 393.0;
+const DESIGN_HEIGHT: f32 = 190.0;
+const RESIZE_GRIP_SIZE: f32 = 16.0;
 const MOON_SLOT_WIDTH: f32 = 77.0;
 const MOON_ICON_DIAMETER: f32 = 59.5;
 const MOON_RIGHT_INSET: f32 = 34.0;
@@ -308,9 +311,18 @@ fn acquire_live_instance() -> Result<Option<HANDLE>> {
 }
 
 fn run_window() -> Result<()> {
+    let scale = window_settings::live_status_scale();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([393.0, 190.0])
-        .with_min_inner_size([383.0, 180.0])
+        .with_inner_size([DESIGN_WIDTH * scale, DESIGN_HEIGHT * scale])
+        .with_min_inner_size([
+            DESIGN_WIDTH * window_settings::MIN_LIVE_STATUS_SCALE,
+            DESIGN_HEIGHT * window_settings::MIN_LIVE_STATUS_SCALE,
+        ])
+        .with_max_inner_size([
+            DESIGN_WIDTH * window_settings::MAX_LIVE_STATUS_SCALE,
+            DESIGN_HEIGHT * window_settings::MAX_LIVE_STATUS_SCALE,
+        ])
+        .with_resizable(false)
         .with_decorations(false)
         .with_window_level(window_chrome::window_level(
             window_settings::WindowLevel::current(),
@@ -333,9 +345,10 @@ fn run_window() -> Result<()> {
             Language::English => "Herdr Night Watch - Live Status",
         },
         options,
-        Box::new(|creation_context| {
+        Box::new(move |creation_context| {
+            creation_context.egui_ctx.set_zoom_factor(scale);
             configure_visuals(&creation_context.egui_ctx);
-            Ok(Box::new(LiveStatusApp::new()))
+            Ok(Box::new(LiveStatusApp::new(scale)))
         }),
     )
     .map_err(|error| anyhow::anyhow!("Live-Status-Fenster konnte nicht ausgeführt werden: {error}"))
@@ -379,11 +392,16 @@ struct LiveStatusApp {
     window_level: window_settings::WindowLevel,
     taskbar_visible: Option<bool>,
     window_drag_started: bool,
+    resize_drag: Option<(egui::Pos2, f32, egui::Vec2)>,
+    resize_preview_scale: Option<f32>,
+    resize_preview_window_size: Option<egui::Vec2>,
+    context_menu_pos: Option<egui::Pos2>,
+    scale: f32,
     last_saved_position: Option<[f32; 2]>,
 }
 
 impl LiveStatusApp {
-    fn new() -> Self {
+    fn new(scale: f32) -> Self {
         let (status_tx, status_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         let (metrics_tx, metrics_rx) = mpsc::channel();
@@ -431,6 +449,11 @@ impl LiveStatusApp {
             window_level: window_settings::WindowLevel::current(),
             taskbar_visible: None,
             window_drag_started: false,
+            resize_drag: None,
+            resize_preview_scale: None,
+            resize_preview_window_size: None,
+            context_menu_pos: None,
+            scale,
             last_saved_position: window_settings::live_status_position(),
         }
     }
@@ -917,7 +940,9 @@ impl eframe::App for LiveStatusApp {
                     self.error = Some(error.to_string());
                 }
         });
+        handle_context_menu(self, ui);
         self.show_toast(ui.ctx());
+        handle_window_resize(self, ui);
         handle_window_drag(self, ui);
         persist_window_position(self, ui.ctx());
         ui.ctx().request_repaint_after(Duration::from_millis(250));
@@ -942,7 +967,284 @@ fn persist_window_position(app: &mut LiveStatusApp, ctx: &egui::Context) {
     }
 }
 
+fn apply_live_status_scale(
+    app: &mut LiveStatusApp,
+    ctx: &egui::Context,
+    requested_scale: f32,
+    persist: bool,
+) {
+    let scale = window_settings::clamp_live_status_scale(requested_scale);
+    let previous_zoom = ctx.zoom_factor().max(f32::EPSILON);
+    app.scale = scale;
+    ctx.set_zoom_factor(scale);
+    // ViewportCommand sizes are interpreted with the zoom factor that is
+    // active for the current pass. Compensate for that so the physical window
+    // reaches the requested size immediately, without a one-frame jump.
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+        DESIGN_WIDTH * scale / previous_zoom,
+        DESIGN_HEIGHT * scale / previous_zoom,
+    )));
+    if persist {
+        let _ = window_settings::set_live_status_scale(scale);
+    }
+}
+
+fn physical_pointer(ctx: &egui::Context, position: egui::Pos2) -> egui::Pos2 {
+    let pixels_per_point = ctx.pixels_per_point();
+    egui::pos2(position.x * pixels_per_point, position.y * pixels_per_point)
+}
+
+fn resize_grip_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            rect.right() - RESIZE_GRIP_SIZE,
+            rect.bottom() - RESIZE_GRIP_SIZE,
+        ),
+        rect.right_bottom(),
+    )
+}
+
+fn handle_window_resize(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
+    let rect = ui.max_rect();
+    let grip = resize_grip_rect(rect);
+    let response = ui.interact(
+        grip,
+        ui.make_persistent_id("live_window_resize"),
+        egui::Sense::drag(),
+    );
+    if response.drag_started() {
+        let pointer = ui
+            .ctx()
+            .input(|input| input.pointer.interact_pos())
+            .unwrap_or(grip.right_bottom());
+        let initial_window_size = ui
+            .ctx()
+            .input(|input| input.viewport().inner_rect.map(|rect| rect.size()))
+            .unwrap_or_else(|| rect.size());
+        app.resize_drag = Some((
+            physical_pointer(ui.ctx(), pointer),
+            app.scale,
+            initial_window_size,
+        ));
+        app.resize_preview_scale = Some(app.scale);
+        app.resize_preview_window_size = None;
+    }
+    if let Some((start_pointer, initial_scale, initial_window_size)) = app.resize_drag {
+        let primary_down = ui.ctx().input(|input| input.pointer.primary_down());
+        if primary_down && let Some(pointer) = ui.ctx().input(|input| input.pointer.interact_pos())
+        {
+            let pointer = physical_pointer(ui.ctx(), pointer);
+            let delta = pointer.x - start_pointer.x;
+            let native_pixels_per_point = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
+            let scale_delta = delta / (DESIGN_WIDTH * native_pixels_per_point);
+            let requested_scale = initial_scale + scale_delta;
+            let preview_scale = window_settings::clamp_live_status_scale(requested_scale);
+            app.resize_preview_scale = Some(preview_scale);
+
+            // Resize only the native preview surface. The egui zoom and all
+            // content stay at the old scale until release, so the user gets
+            // a fence preview without a redraw storm. The drag handler is
+            // disabled while this is active, keeping the window anchored.
+            let preview_window_size =
+                initial_window_size * (preview_scale / initial_scale.max(f32::EPSILON));
+            let should_resize = app.resize_preview_window_size.is_none_or(|last| {
+                (last.x - preview_window_size.x).abs() > 1.0
+                    || (last.y - preview_window_size.y).abs() > 1.0
+            });
+            if should_resize {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::InnerSize(preview_window_size));
+                app.resize_preview_window_size = Some(preview_window_size);
+            }
+        }
+
+        // Keep the actual layout frozen while the pointer is held. Applying a
+        // new zoom here would move the very grip that is currently being
+        // dragged, which can make a release look like a continued drag.
+        if response.drag_stopped() || !primary_down {
+            if let Some(preview_scale) = app.resize_preview_scale {
+                apply_live_status_scale(app, ui.ctx(), preview_scale, true);
+            }
+            app.resize_drag = None;
+            app.resize_preview_scale = None;
+            app.resize_preview_window_size = None;
+            // Prevent the release frame from falling through into
+            // StartDrag when the platform reports the button state one frame
+            // late.
+            app.window_drag_started = true;
+        }
+    }
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+    }
+    let color = if response.hovered() || response.dragged() {
+        egui::Color32::from_rgba_unmultiplied(226, 232, 240, 150)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(148, 163, 184, 65)
+    };
+    for offset in [0.0, 5.0, 10.0] {
+        ui.painter().line_segment(
+            [
+                egui::pos2(grip.right() - 4.0 - offset, grip.bottom() - 1.0),
+                egui::pos2(grip.right() - 1.0, grip.bottom() - 4.0 - offset),
+            ],
+            egui::Stroke::new(1.0, color),
+        );
+    }
+    if let Some(preview_scale) = app.resize_preview_scale {
+        // The native viewport is the translucent target surface while the
+        // content itself remains at the old zoom until release.
+        let preview_rect = rect.shrink(4.0);
+        let preview_color = egui::Color32::from_rgba_unmultiplied(147, 197, 253, 230);
+        // The target is a clearly visible dark-blue surface at roughly 50 %
+        // opacity, not just a thin outline. The old content remains readable
+        // underneath so the user can still orient themselves while dragging.
+        let preview_fill = egui::Color32::from_rgba_unmultiplied(15, 31, 56, 128);
+        ui.painter()
+            .rect_filled(preview_rect, egui::CornerRadius::same(8), preview_fill);
+        ui.painter().rect_stroke(
+            preview_rect,
+            egui::CornerRadius::same(8),
+            egui::Stroke::new(1.0, preview_color),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().rect_stroke(
+            preview_rect.shrink(4.0),
+            egui::CornerRadius::same(6),
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(226, 232, 240, 65),
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let target_width = (DESIGN_WIDTH * preview_scale).round() as u32;
+        let target_height = (DESIGN_HEIGHT * preview_scale).round() as u32;
+        let label = format!(
+            "{:.0} % · {} × {} px",
+            preview_scale * 100.0,
+            target_width,
+            target_height
+        );
+        let galley = ui
+            .painter()
+            .layout_no_wrap(label, egui::FontId::proportional(10.0), TEXT);
+        let label_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.bottom() - 10.0),
+            galley.size() + egui::vec2(12.0, 5.0),
+        );
+        ui.painter().rect_filled(
+            label_rect,
+            egui::CornerRadius::same(5),
+            egui::Color32::from_rgba_unmultiplied(15, 23, 42, 225),
+        );
+        ui.painter().rect_stroke(
+            label_rect,
+            egui::CornerRadius::same(5),
+            egui::Stroke::new(1.0, preview_color),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter()
+            .galley(label_rect.center() - galley.size() / 2.0, galley, TEXT);
+    }
+}
+
+fn is_window_interactive_position(rect: egui::Rect, position: egui::Pos2) -> bool {
+    let completion_switch = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 86.0, rect.top() + 12.0),
+        egui::pos2(rect.left() + 168.0, rect.top() + 50.0),
+    );
+    let warning_seconds = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 176.0, rect.top() + 12.0),
+        egui::pos2(rect.left() + 244.0, rect.top() + 50.0),
+    );
+    let moon = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - 200.0, rect.top() + 28.0),
+        egui::pos2(rect.right() - 20.0, rect.top() + 116.0),
+    );
+    let control_hood = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - 138.0, rect.top() + 1.0),
+        egui::pos2(rect.right() - 3.0, rect.top() + 30.0),
+    );
+    completion_switch.contains(position)
+        || warning_seconds.contains(position)
+        || moon.contains(position)
+        || control_hood.contains(position)
+        || weather_control_rect(rect).contains(position)
+        || resize_grip_rect(rect).contains(position)
+}
+
+fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
+    let rect = ui.max_rect();
+    let (pointer, secondary_clicked, any_click) = ui.ctx().input(|input| {
+        (
+            input.pointer.interact_pos(),
+            input.pointer.secondary_clicked(),
+            input.pointer.any_click(),
+        )
+    });
+    if secondary_clicked
+        && pointer.is_some_and(|position| !is_window_interactive_position(rect, position))
+    {
+        app.context_menu_pos = pointer;
+    }
+    let Some(menu_position) = app.context_menu_pos else {
+        return;
+    };
+
+    let scale_label = format!("{:.0} %", app.scale * 100.0);
+    let mut reset_requested = false;
+    let menu = egui::Area::new(egui::Id::new("live_status_context_menu"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(menu_position + egui::vec2(4.0, 4.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}: {scale_label}",
+                        app.language.text("Fenstergröße", "Window size")
+                    ))
+                    .color(GRAY),
+                );
+                if ui
+                    .button(app.language.text("Auf 100 % zurücksetzen", "Reset to 100%"))
+                    .clicked()
+                {
+                    reset_requested = true;
+                }
+            });
+        });
+    if reset_requested {
+        apply_live_status_scale(
+            app,
+            ui.ctx(),
+            window_settings::DEFAULT_LIVE_STATUS_SCALE,
+            false,
+        );
+        let _ = window_settings::reset_live_status_scale();
+        app.context_menu_pos = None;
+        app.toast = Some(Toast {
+            message: app
+                .language
+                .text("Fenster auf 100 % zurückgesetzt", "Window reset to 100%")
+                .into(),
+            color: ACCENT,
+            expires_at: Instant::now() + Duration::from_secs(3),
+        });
+    } else if any_click
+        && !secondary_clicked
+        && pointer.is_some_and(|position| !menu.response.rect.contains(position))
+    {
+        app.context_menu_pos = None;
+    }
+}
+
 fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
+    // A resize drag must never fall through to the window-drag handler. Both
+    // gestures use the primary button; starting a native window drag here
+    // makes the whole window move instead of keeping it fixed for the preview.
+    if app.resize_drag.is_some() || app.resize_preview_scale.is_some() {
+        return;
+    }
     let rect = ui.max_rect();
     let completion_switch = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 86.0, rect.top() + 12.0),
@@ -960,13 +1262,13 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
         egui::pos2(rect.right() - 138.0, rect.top() + 1.0),
         egui::pos2(rect.right() - 3.0, rect.top() + 30.0),
     );
-    let weather_control = weather_control_rect(rect);
     let is_excluded = |position: egui::Pos2| {
         completion_switch.contains(position)
             || warning_seconds.contains(position)
             || moon.contains(position)
             || control_hood.contains(position)
-            || weather_control.contains(position)
+            || weather_control_rect(rect).contains(position)
+            || resize_grip_rect(rect).contains(position)
     };
     let (origin, position, total_delta, primary_down) = ui.input(|input| {
         (
