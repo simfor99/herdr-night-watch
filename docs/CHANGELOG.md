@@ -3,7 +3,28 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-18] - Skalierungsvorschau bleibt lesbar
+
+### 🪟 Bedienung
+
+- **Zahlen bleiben sichtbar** - Beim Verkleinern über den Anfasser bleibt das aktuelle Fenster stehen. Die kleinere Zielfläche liegt darin, Prozentwert und Pixelmaß werden nicht mehr vom schrumpfenden Fenster überdeckt.
+
+## [2026-08-18] - Live-Fenster bleibt gezeichnet
+
+### 🪟 Bedienung
+
+- **Kein weißes Aufblitzen mehr** - Das Tray holt das Live-Fenster erst nach dem ersten echten Zeichenframe nach vorn. Ein noch verstecktes Vorbereitungsfenster wird nicht mehr vorzeitig eingeblendet.
+- **Volle Deckkraft bleibt undurchsichtig** - Bei 100 Prozent Transparenz wird der Windows-Layered-Stil nicht mehr gesetzt. Glow kann das Fenster dadurch dauerhaft zeichnen statt nach einem kurzen Flash weiß zu bleiben.
+
 ## [2026-08-17] - Medienzeile und Live-Layout v0.1.19
+
+### 📋 Abschlussprotokoll
+
+- **Energie und Diagnose getrennt** - Das Abschlussprotokoll trennt Energieaktionen von Tray- und Diagnoseereignissen. Beide Bereiche zeigen jeweils bis zu 30 Einträge und übersetzen Beschriftungen sowie Meldungen vollständig ins Englische.
+
+### 📊 Live-Dashboard
+
+- **Fertige Agenten sichtbar hervorgehoben** - Sobald mindestens ein Agent fertig gemeldet ist, werden Zahl und Beschriftung grün dargestellt. Die Zahl erhält zusätzlich eine feine helle Kontur und einen warmen gelben Außen-Glow, die beide mit der Fenstergröße mitskalieren. Bei null kehren beide zu Grau zurück.
 
 ### 🎵 Live-Status
 
@@ -18,6 +39,10 @@
 ### 🌙 Mondphase
 
 - **Mondphase aus dem Wetterort** - Die Open-Meteo-Abfrage liefert zusätzlich die aktuelle tägliche Mondphase. Das Mondsymbol zeigt jetzt je nach Phase Sichel, Viertel, zunehmenden oder abnehmenden Mond, Vollmond oder Neumond.
+
+### 🖼️ Live-Fenster
+
+- **Proportionale freie Skalierung** - Das Hauptfenster kann über einen dezenten Griff unten rechts frei zwischen 75 und 1.000 Prozent vergrößert oder verkleinert werden. Während des Ziehens bleibt das Layout stabil und zeigt nur eine Vorschau; beim Loslassen wird die globale egui-Skalierung einmalig angewendet. Mond, KPI-Karte, Systemwerte, Medienzeile und Timeline bleiben zusammen. Die Einstellung bleibt gespeichert und lässt sich per Rechtsklick auf 100 Prozent zurücksetzen.
 - **Temperatur bleibt lesbar** - Die Temperatur wandert in den dunklen Bereich der Mondgrafik und bleibt bei Vollmond kontrastreich zentriert.
 - **Fail-safe** - Wenn die Phase noch nicht vom Wetterdienst vorliegt, verwendet die Anzeige eine lokale astronomische Näherung. Nachtwächter, Countdown und Energieaktion bleiben vollständig unabhängig.
 

@@ -31,6 +31,7 @@ const ID_WINDOW_OPACITY_PREFIX: &str = "window_opacity_";
 const ID_WINDOW_LEVEL_NORMAL: &str = "window_level_normal";
 const ID_WINDOW_LEVEL_TOP: &str = "window_level_top";
 const ID_WINDOW_LEVEL_BOTTOM: &str = "window_level_bottom";
+const LIVE_STATUS_STARTUP_DELAY: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy)]
 struct Wake;
@@ -48,6 +49,7 @@ struct App {
     power_guard_active: bool,
     power_guard_error: bool,
     power_guard_last_attempted: Option<bool>,
+    startup_live_status_at: Option<Instant>,
 }
 
 pub fn run() -> Result<()> {
@@ -80,9 +82,8 @@ pub fn run() -> Result<()> {
         .with_menu_on_left_click(false)
         .build()?;
     tray_history::start_session();
-    if window_settings::live_status_on_start() {
-        let _ = live_status::open();
-    }
+    let startup_live_status_at =
+        window_settings::live_status_on_start().then(|| Instant::now() + LIVE_STATUS_STARTUP_DELAY);
     let mut app = App {
         language,
         tray: Some(tray),
@@ -96,6 +97,7 @@ pub fn run() -> Result<()> {
         power_guard_active: false,
         power_guard_error: false,
         power_guard_last_attempted: None,
+        startup_live_status_at,
     };
     app.sync_power_guard();
     app.sync_expected_exit();
@@ -304,6 +306,11 @@ impl App {
     }
 
     fn perform(&mut self, action: &str, event_loop: &ActiveEventLoop) {
+        if action == ID_LIVE_STATUS {
+            // A manual open supersedes the delayed startup open. This prevents
+            // a second child process from racing the window the user just opened.
+            self.startup_live_status_at = None;
+        }
         let result = match action {
             ID_START => backend::start(false),
             ID_OBSERVE => backend::start(true),
@@ -444,6 +451,13 @@ impl App {
     }
 
     fn tick(&mut self, event_loop: &ActiveEventLoop) {
+        if self
+            .startup_live_status_at
+            .is_some_and(|scheduled| scheduled <= Instant::now())
+        {
+            self.startup_live_status_at = None;
+            let _ = live_status::open();
+        }
         self.apply_results();
         self.refresh_status();
         self.render();

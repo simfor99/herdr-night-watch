@@ -59,9 +59,9 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 
 ## Live status
 
-![Herdr Night Watch live status in German](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.19/Screenshot.2026-08-17.155415.png)
+![Herdr Night Watch live status in German](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.20/live-status-de.png)
 
-![Herdr Night Watch live status in English](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.19/Screenshot.2026-08-17.155405.png)
+![Herdr Night Watch live status in English](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.20/live-status-en.png)
 
 The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer turns it into a quick system monitor without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed. The small upper-right control hood opens the last 30 completion actions and cycles the window between normal, always-on-top, and always-in-background modes. Its glass surfaces use a subtle top reflection to keep the dashboard calm but tactile. The tray menu lets you choose window opacity from 100% down to 10%.
 
@@ -82,6 +82,8 @@ The moon also shows the current temperature and the real current lunar phase for
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.
 - **Open live status**: opens a freely movable status window that can be closed at any time. Left-clicking the tray icon opens it; right-clicking shows the menu.
 - **Reliable live window**: opening the live status again restores and focuses the existing window instead of creating a duplicate. Its last desktop position is stored locally and reused after the next start.
+- **Proportional live-window scaling**: drag the subtle handle in the lower-right corner to enlarge or shrink the complete live window freely. Text, moon, KPI cards, metrics, media pills, and timeline stay proportional. The selected scale is stored locally; right-click an empty area and choose **Reset to 100%** whenever you want to return to the default size.
+- **Finished-agent glow**: when Herdr reports completed work, the finished count gets a green value and label with a warm yellow outer glow and a crisp light contour. Both effects scale with the live window, so the pixel-style highlight stays visible at large sizes without turning into a blurred shadow.
 - **Open live window at startup**: optionally reopen the live status window automatically whenever the tray app starts. The default remains tray-only until you enable this option.
 - **Completion log**: the live window's upper-right log button opens a read-only view of the last 30 requested sleep and shutdown actions plus detected unclean tray exits. An unclean exit is recorded when the tray starts again without finding a clean session marker.
 - **Weather location**: hover the small weather control at the lower-right of the live window to search and select a city or postal code. The selected location is stored locally in the Windows user registry.

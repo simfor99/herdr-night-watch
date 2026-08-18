@@ -401,8 +401,9 @@ def record_completion(action: str, trigger: str, run_id: str) -> None:
             writer.writerows(rows)
         temporary.replace(path)
         log(f"COMPLETION HISTORY action={action} trigger={trigger} path={path}")
-    except OSError as error:
+    except (OSError, UnicodeError, csv.Error) as error:
         log(f"COMPLETION HISTORY ERROR {error}")
+        raise RuntimeError(f"Completion history could not be persisted: {error}") from error
 
 
 def record_cancellation(source: str, run_id: str) -> None:
@@ -764,6 +765,18 @@ def schedule_shutdown(state: dict[str, Any], reason: str = "agents_finished") ->
         warning_path.unlink(missing_ok=True)
         detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
         raise RuntimeError(f"Windows shutdown could not be scheduled: {detail}")
+    # Persist the request before the watcher enters the long warning wait. A
+    # Windows shutdown can terminate WSL before the watcher reaches the final
+    # bookkeeping branch, which would otherwise lose the only durable record.
+    try:
+        record_completion(warning["completion_action"], reason, state["run_id"])
+    except RuntimeError:
+        # Fail closed: never leave a scheduled shutdown behind without its
+        # durable completion record. The warning remains available if the
+        # Windows abort command itself also fails, so the next watcher pass
+        # can diagnose and retry the cancellation.
+        abort_shutdown_if_ours()
+        raise
     log(f"Windows shutdown scheduled in {warning_seconds} seconds reason={reason}")
 
 
@@ -863,6 +876,9 @@ def confirm_completion() -> int:
         warning_path.unlink(missing_ok=True)
         outcome = "sleep_confirmed" if action == "sleep" else "shutdown_confirmed"
         try:
+            # The power action may suspend or terminate Windows immediately.
+            # Write the durable request record before invoking that action.
+            record_completion(action, "confirmed", state["run_id"])
             if action == "sleep":
                 request_windows_sleep()
             else:
@@ -871,7 +887,6 @@ def confirm_completion() -> int:
             finish(state, f"{action}_failed", str(error))
             raise
         finish(state, outcome, "completion confirmed by the user")
-        record_completion(action, "confirmed", state["run_id"])
     return 0
 
 
@@ -1076,12 +1091,14 @@ def watch() -> int:
                 )
                 if action == "sleep" and not state.get("demo") and not state.get("dry_run"):
                     try:
+                        # Sleep can suspend the process before any following
+                        # Python statement runs, so record it first.
+                        record_completion(action, warning_reason, state["run_id"])
                         request_windows_sleep()
                     except RuntimeError as error:
                         finish(state, "sleep_failed", str(error))
                         raise
                     finish(state, "sleep_requested", completion_detail)
-                    record_completion(action, warning_reason, state["run_id"])
                     return 0
                 outcome = "demo_complete" if state.get("demo") else "shutdown_scheduled"
                 detail = (
@@ -1090,8 +1107,6 @@ def watch() -> int:
                     else completion_detail
                 )
                 finish(state, outcome, detail)
-                if not state.get("demo") and not state.get("dry_run"):
-                    record_completion(action, warning_reason, state["run_id"])
                 return 0
 
 

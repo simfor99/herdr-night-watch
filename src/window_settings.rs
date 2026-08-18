@@ -8,8 +8,15 @@ const LIVE_STATUS_START_VALUE: &str = "OpenLiveStatusOnStartup";
 const LIVE_STATUS_TASKBAR_VALUE: &str = "ShowLiveStatusInTaskbar";
 const LIVE_STATUS_POS_X_VALUE: &str = "LiveStatusPositionX";
 const LIVE_STATUS_POS_Y_VALUE: &str = "LiveStatusPositionY";
+const LIVE_STATUS_SCALE_VALUE: &str = "LiveStatusScale";
 
 pub const OPACITY_VALUES: [u8; 10] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
+pub const DEFAULT_LIVE_STATUS_SCALE: f32 = 1.0;
+pub const MIN_LIVE_STATUS_SCALE: f32 = 0.75;
+// This is a safety stop for corrupted settings or an accidental runaway
+// drag, not a normal user-facing size limit. Windows constrains the practical
+// size further through the available monitor work area.
+pub const MAX_LIVE_STATUS_SCALE: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowLevel {
@@ -118,4 +125,50 @@ pub fn set_live_status_position(position: [f32; 2]) -> anyhow::Result<()> {
     key.set_value(LIVE_STATUS_POS_X_VALUE, &(x as u32))?;
     key.set_value(LIVE_STATUS_POS_Y_VALUE, &(y as u32))?;
     Ok(())
+}
+
+pub fn live_status_scale() -> f32 {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .and_then(|key| key.get_value::<u32, _>(LIVE_STATUS_SCALE_VALUE))
+        .ok()
+        .map(|value| clamp_live_status_scale(value as f32 / 100.0))
+        .unwrap_or(DEFAULT_LIVE_STATUS_SCALE)
+}
+
+pub fn set_live_status_scale(scale: f32) -> anyhow::Result<()> {
+    let scale = clamp_live_status_scale(scale);
+    let stored = (scale * 100.0).round() as u32;
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
+    key.set_value(LIVE_STATUS_SCALE_VALUE, &stored)?;
+    Ok(())
+}
+
+pub fn reset_live_status_scale() -> anyhow::Result<()> {
+    set_live_status_scale(DEFAULT_LIVE_STATUS_SCALE)
+}
+
+pub fn clamp_live_status_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(MIN_LIVE_STATUS_SCALE, MAX_LIVE_STATUS_SCALE)
+    } else {
+        DEFAULT_LIVE_STATUS_SCALE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_status_scale_is_bounded() {
+        assert_eq!(clamp_live_status_scale(0.1), MIN_LIVE_STATUS_SCALE);
+        assert_eq!(clamp_live_status_scale(12.0), MAX_LIVE_STATUS_SCALE);
+        assert_eq!(clamp_live_status_scale(f32::NAN), DEFAULT_LIVE_STATUS_SCALE);
+    }
+
+    #[test]
+    fn live_status_scale_preserves_fractional_percent() {
+        assert!((clamp_live_status_scale(1.37) - 1.37).abs() < f32::EPSILON);
+    }
 }

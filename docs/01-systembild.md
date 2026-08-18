@@ -22,7 +22,7 @@ Die Rust-Anwendung in diesem Projekt ist dagegen ein Controller. Sie bietet die 
 | Lokale Einrichtung | [`src/configuration.rs`](../src/configuration.rs) und [`src/settings.rs`](../src/settings.rs) | WSL-Distro und Wächterpfad lokal speichern und im Setup-Fenster bearbeiten |
 | Warnfenster | [`src/notify.rs`](../src/notify.rs) | Windows-Dialog mit „Abbrechen“ in der echten Warnphase |
 | Fenster-Chrome | [`src/window_chrome.rs`](../src/window_chrome.rs) | Gemeinsame Windows-Schicht für Transparenz, Ebenen, Verlauf und Glasreflexion; Transparenz wird nur auf Fenster des eigenen Prozesses angewendet |
-| Live-Status | [`src/live_status.rs`](../src/live_status.rs) | Frei platzierbares, schließbares Fenster für Live-Arbeit und Nachtlaufzustand |
+| Live-Status | [`src/live_status.rs`](../src/live_status.rs) | Frei platzierbares, schließbares Fenster für Live-Arbeit und Nachtlaufzustand; proportional zwischen 75 und 1.000 Prozent skalierbar |
 | Wetteranzeige | [`src/weather.rs`](../src/weather.rs) und [`src/weather_location.rs`](../src/weather_location.rs) | Hintergrund-Temperaturabruf und Suchfenster für den lokalen Wetterort |
 | Autostart | [`src/autostart.rs`](../src/autostart.rs) | `HKCU\\...\\Run` für die Tray-App, nie für einen Nachtlauf |
 | Wächter | [`herdr-night-watch.py`](../watcher/herdr-night-watch.py) | Prüfung aller aktuellen Herdr-Agenten, Ruhezeit, Shutdown und Abbruch |
@@ -66,7 +66,7 @@ Die öffentliche Anwendung speichert zwei lokale Angaben unter dem Windows-Benut
 
 Der Wetterort wird zusätzlich als lokale Windows-Registry-Einstellung gespeichert. Standardmäßig ist Leipzig hinterlegt. Die Live-App fragt die Temperatur im Hintergrund über Open-Meteo ab und zeigt bei fehlender Verbindung keinen erfundenen Wert. Diese Anzeige ist vollständig vom Wächter getrennt und kann keine Energieaktion auslösen.
 
-Auch die Position des Live-Fensters wird lokal unter dem Windows-Benutzerkonto gespeichert. Beim erneuten Öffnen wird ein vorhandenes Fenster restauriert und nach vorn geholt; der Startpfad schützt zusätzlich mit einer benannten Windows-Sperre vor doppelten Live-Fenstern. Fehlschläge beim Öffnen werden unter `logs/ui-errors.log` protokolliert.
+Auch die Position und die proportionale Größe des Live-Fensters werden lokal unter dem Windows-Benutzerkonto gespeichert. Beim erneuten Öffnen wird ein vorhandenes, bereits gezeichnetes Fenster restauriert und nach vorn geholt; ein noch verstecktes Vorbereitungsfenster bleibt unsichtbar, bis der erste Glow-Frame fertig ist. Der Startpfad schützt zusätzlich mit einer benannten Windows-Sperre vor doppelten Live-Fenstern. Fehlschläge beim Öffnen werden unter `logs/ui-errors.log` protokolliert. Ein Rechtsklick auf freie Fläche setzt die Größe auf 100 Prozent zurück.
 
 ## Persistenter Zustand und Protokoll
 
@@ -79,7 +79,7 @@ Der Wächter legt seinen Zustand unter `~/.local/state/herdr-night-watch/` in de
 | `settings.json` | Bevorzugte Abschlussaktion und Warnfrist für den nächsten Nachtlauf: `sleep` oder `shutdown`, 10 bis 3.600 Sekunden |
 | `watch.lock` | Verhindert zwei gleichzeitige Wächterprozesse |
 | `watch.log` | Zeitstempel-Protokoll aller wichtigen Entscheidungen |
-| Windows-Installationsordner `logs\\completion-history.csv` und `logs\\tray-history.csv` | Getrennte Quellen für Energieaktionen und Tray-Ereignisse; der Viewer führt die letzten 30 Ereignisse zusammen |
+| Windows-Installationsordner `logs\\completion-history.csv` und `logs\\tray-history.csv` | Getrennte Quellen für Energieaktionen und Tray-Ereignisse; der Viewer zeigt beide Quellen in getrennten Bereichen mit jeweils bis zu 30 Einträgen |
 | Windows-Installationsordner `logs\\tray-session.json` | Temporärer Marker für eine laufende Tray-Sitzung; fehlt beim nächsten Start der saubere Abschluss, wird ein unplanmäßiges Ende im Abschlussprotokoll vermerkt |
 | Windows-Installationsordner `logs\\cancellation-history.csv` | Letzte 30 manuell oder vom Warnfenster abgebrochene Nachtläufe mit genauer Abbruchquelle |
 
@@ -91,7 +91,7 @@ Solange der Nachtlauf den Zustand `Watching` oder `ShutdownWarning` meldet, setz
 
 Für Neustarts vergleicht der Wächter nicht nur die WSL-Boot-ID, sondern zusätzlich die letzte Windows-Bootzeit. Ändert sich eine der beiden Marken, gilt der alte Lauf als veraltet: Warnung und aktiver Zustand werden zurückgesetzt und als `system_restart` protokolliert.
 
-Der Wächter prüft zusätzlich zwei unabhängige Internet-Endpunkte. Erst wenn beide fünf Minuten durchgehend nicht erreichbar sind, startet er dieselbe sichtbare Warnfrist wie bei fertig gemeldeten Agenten. Kommt die Verbindung während dieser Frist zurück, bricht er seine eigene Warnung ab und überwacht weiter. Jeder tatsächliche Abschluss wird als angeforderter Energiesparmodus oder Shutdown in `completion-history.csv` aufgezeichnet. Erkannte unplanmäßige Tray-Enden landen getrennt in `tray-history.csv`; der Log-Viewer führt beide Quellen zusammen und begrenzt die sichtbare Liste auf 30 Einträge.
+Der Wächter prüft zusätzlich zwei unabhängige Internet-Endpunkte. Erst wenn beide fünf Minuten durchgehend nicht erreichbar sind, startet er dieselbe sichtbare Warnfrist wie bei fertig gemeldeten Agenten. Kommt die Verbindung während dieser Frist zurück, bricht er seine eigene Warnung ab und überwacht weiter. Jeder tatsächliche Abschluss wird als angeforderter Energiesparmodus oder Shutdown in `completion-history.csv` aufgezeichnet. Erkannte unplanmäßige Tray-Enden landen getrennt in `tray-history.csv`; der Log-Viewer zeigt beide Quellen in getrennten Bereichen und begrenzt jeden Bereich auf 30 Einträge.
 
 Die Tray-App schreibt zusätzlich während ihrer Laufzeit einen temporären Sitzungsmarker. Beim normalen Beenden wird er entfernt. Findet ein späterer Start den Marker ohne `expected_exit`, ergänzt er `tray-history.csv` um „Tray-App unplanmäßig beendet“. Das beweist keinen Absturz im engeren Sinn: Es kann auch ein erzwungenes Beenden, ein Windows-Neustart oder ein Stromverlust gewesen sein. Erwartete Energieaktionen werden vorher markiert und erzeugen keinen falschen Absturz-Eintrag.
 
