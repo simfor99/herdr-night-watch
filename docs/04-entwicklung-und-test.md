@@ -29,7 +29,7 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - Energiesparmodus darf weder `shutdown.exe /s` noch `shutdown.exe /a` ausführen.
 - Nur eine positive Benutzerbestätigung der eigenen aktiven Warnung darf Energiesparmodus oder Herunterfahren vor Ablauf der Warnfrist auslösen.
 - Internet-Ausfall löst erst nach fünf Minuten und nur über dieselbe sichtbare Warnfrist aus; Rückkehr der Verbindung bricht diese Warnung ab.
-- `completion-history.csv` protokolliert die angeforderten Energieaktionen des WSL-Wächters. `tray-history.csv` protokolliert erkannte unplanmäßige Tray-Enden. Der Log-Viewer zeigt beide Dateien in getrennten Bereichen und höchstens 30 Einträge je Bereich.
+- `completion-history.csv` protokolliert die angeforderten Energieaktionen des WSL-Wächters. Der Datensatz wird vor einer bestätigten Schlaf- oder Shutdown-Aktion dauerhaft geschrieben; bei einem Schreibfehler wird die Aktion abgebrochen beziehungsweise ein bereits geplanter Shutdown nach Möglichkeit wieder aufgehoben. `tray-history.csv` protokolliert erkannte unplanmäßige Tray-Enden. Der Log-Viewer zeigt beide Dateien in getrennten Bereichen und höchstens 30 Einträge je Bereich.
 - `cancellation-history.csv` darf höchstens 30 Ereignisse enthalten und muss die konkrete Abbruchquelle speichern.
 - `--cancel` darf nur einen Shutdown abbrechen, für den eine gültige eigene Warnungsdatei existiert.
 - Die Tray-App und ihre Hilfsprozesse dürfen keine sichtbaren Konsolenfenster erzeugen.
@@ -86,6 +86,7 @@ Ein echter Windows-Shutdown wird nicht als automatischer Test ausgeführt. Die T
 |---|---|---|
 | Tray-Text, Menü oder Symbol | App starten, Menü und Tooltip ansehen | Kein zusätzliches Fenster, passende Menü-Sperren |
 | Live-Status | Mehrere Herdr-Agenten laufen lassen, Live-Status öffnen | Live-Zahl, großer Mond mit echter Mondphase und Hover-Hinweis sowie funktionierender Start- oder Stoppknopf sind sichtbar; die Temperatur bleibt in der dunklen Mondfläche lesbar; Abschluss-Schalter und Sekundenfeld liegen rechts neben „Herdr jetzt“, speichern nur außerhalb eines aktiven Laufes; bei Warnfrist zeigt das Fenster einen roten Countdown; die schmale Fußzeile zeigt CPU, GPU, belegten VRAM, RAM und einen verfügbaren Grafikkarten-Wattwert oder `—`; Fenster ist beweglich und schließbar |
+| Live-Status nach Neustart | Tray-App mit aktivierter Startoption nach Windows-Login starten; anschließend ein verstecktes Live-Fenster erneut öffnen | Der automatische Start wartet kurz auf den Windows-Desktop; ein vorhandenes verstecktes Fenster wird gefunden, wiederhergestellt und nicht durch eine zweite Mutex-Instanz ersetzt |
 | WSL-/PowerShell-Start | Beobachtungsmodus mit echter Herdr-Arbeit | Task läuft, Status hat `monitoring_scope=live_agents`, kein Shutdown; bei einem Boot-Rennen wartet der Wächter auf beide Boot-Marken |
 | Warnfenster | `Demo: Abschluss simulieren` | Ruhezeit, rotes Symbol und Dialog sichtbar; Windows bleibt an |
 | Stopp-Pfad | Demo oder Beobachtung starten, dann Stopp | Task beendet, Log enthält `CANCELLED` oder Abschluss |

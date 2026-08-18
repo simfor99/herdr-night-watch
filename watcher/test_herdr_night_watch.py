@@ -147,6 +147,63 @@ class CompletionActionTests(unittest.TestCase):
                 {"completion_action": "sleep", "warning_seconds": 120},
             )
 
+    def test_shutdown_schedule_persists_completion_before_warning_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            state = {
+                "run_id": "scheduled-run",
+                "warning_seconds": 300,
+                "completion_action": "shutdown",
+                "dry_run": False,
+            }
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, warning_path, root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "WINDOWS_INSTALL_LOG_DIR", root),
+                patch.object(WATCHER.shutil, "which", return_value="powershell.exe"),
+                patch.object(WATCHER.subprocess, "run", return_value=type("Result", (), {"returncode": 0})()),
+                patch.object(WATCHER, "log"),
+            ):
+                WATCHER.schedule_shutdown(state)
+
+            history = (root / "completion-history.csv").read_text(encoding="utf-8")
+            self.assertIn("Herunterfahren angefordert", history)
+            self.assertIn("scheduled-run", history)
+
+    def test_shutdown_schedule_aborts_when_completion_history_cannot_be_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            state = {
+                "run_id": "unlogged-run",
+                "warning_seconds": 300,
+                "completion_action": "shutdown",
+                "dry_run": False,
+            }
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, warning_path, root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "WINDOWS_INSTALL_LOG_DIR", root),
+                patch.object(WATCHER.shutil, "which", return_value="powershell.exe"),
+                patch.object(WATCHER.subprocess, "run", return_value=type("Result", (), {"returncode": 0})()),
+                patch.object(WATCHER, "record_completion", side_effect=RuntimeError("disk full")),
+                patch.object(WATCHER, "abort_shutdown_if_ours", return_value=True) as abort,
+                patch.object(WATCHER, "log"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "disk full"):
+                    WATCHER.schedule_shutdown(state)
+
+            abort.assert_called_once_with()
+
 
 class WarningResetTests(unittest.TestCase):
     def test_work_resuming_during_warning_requires_a_new_quiet_period(self) -> None:

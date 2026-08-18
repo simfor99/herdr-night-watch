@@ -21,8 +21,8 @@ use std::time::{Duration, Instant, SystemTime};
 use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GetLastError, HANDLE, HWND, LPARAM};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    SW_RESTORE, SetForegroundWindow, ShowWindow,
+    EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, SW_RESTORE,
+    SW_SHOW, SetForegroundWindow, ShowWindow,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -170,7 +170,7 @@ struct LiveWindowSearch {
 unsafe extern "system" fn find_live_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
         let found = &mut *(lparam as *mut Option<HWND>);
-        if found.is_some() || IsWindowVisible(hwnd) == 0 {
+        if found.is_some() {
             return 1;
         }
         let length = GetWindowTextLengthW(hwnd);
@@ -222,6 +222,7 @@ unsafe extern "system" fn find_live_window_for_pid_callback(hwnd: HWND, lparam: 
 
 fn activate_live_window(hwnd: HWND) {
     unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = ShowWindow(hwnd, SW_RESTORE);
         let _ = SetForegroundWindow(hwnd);
     }
