@@ -2094,25 +2094,32 @@ fn glowing_metric_text(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Co
     let font_id = egui::FontId::proportional(size);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font_id, color);
     let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
-    for (radius, color, alpha) in [
-        (3.0, (255, 215, 110), 12),
-        (2.0, (255, 225, 140), 24),
-        (1.0, (255, 255, 255), 42),
-    ] {
-        let halo = egui::Color32::from_rgba_unmultiplied(color.0, color.1, color.2, alpha);
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                ui.painter().text(
-                    rect.min + egui::vec2(dx as f32 * radius, dy as f32 * radius),
-                    egui::Align2::LEFT_TOP,
-                    text,
-                    egui::FontId::proportional(size),
-                    halo,
-                );
-            }
+    // The glow and its white contour are intentionally part of the visual
+    // scale: about three and one real pixels at 100 %, about nine and three at
+    // 300 %. Convert from monitor pixels to egui points, but leave the user
+    // zoom in the result so the effect grows with the dashboard.
+    let native_pixels_per_point = ui
+        .ctx()
+        .native_pixels_per_point()
+        .unwrap_or(1.0)
+        .max(f32::EPSILON);
+    for (radius_pixels, halo_color, alpha) in
+        [(3.0, (255, 215, 110), 38), (1.0, (255, 255, 255), 88)]
+    {
+        let points_per_pixel = 1.0 / native_pixels_per_point;
+        let radius = radius_pixels * points_per_pixel;
+        let halo =
+            egui::Color32::from_rgba_unmultiplied(halo_color.0, halo_color.1, halo_color.2, alpha);
+        let sample_count = if radius_pixels > 1.5 { 16 } else { 8 };
+        for sample in 0..sample_count {
+            let angle = std::f32::consts::TAU * sample as f32 / sample_count as f32;
+            ui.painter().text(
+                rect.min + egui::vec2(angle.cos() * radius, angle.sin() * radius),
+                egui::Align2::LEFT_TOP,
+                text,
+                egui::FontId::proportional(size),
+                halo,
+            );
         }
     }
     ui.painter().text(

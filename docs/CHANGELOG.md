@@ -11,7 +11,7 @@
 
 ### 📊 Live-Dashboard
 
-- **Fertige Agenten sichtbar hervorgehoben** - Sobald mindestens ein Agent fertig gemeldet ist, werden Zahl und Beschriftung grün dargestellt. Die Zahl erhält zusätzlich eine feine weiße 1-Pixel-Kontur und einen sehr dezenten Lichtsaum. Bei null kehren beide zu Grau zurück.
+- **Fertige Agenten sichtbar hervorgehoben** - Sobald mindestens ein Agent fertig gemeldet ist, werden Zahl und Beschriftung grün dargestellt. Die Zahl erhält zusätzlich eine feine helle Kontur und einen warmen gelben Außen-Glow, die beide mit der Fenstergröße mitskalieren. Bei null kehren beide zu Grau zurück.
 
 ### 🎵 Live-Status
 
