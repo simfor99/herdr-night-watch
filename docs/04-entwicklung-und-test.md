@@ -40,7 +40,11 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - Die Systemtelemetrie im Live-Fenster ist reine Anzeige. Fehler oder fehlende Werte dürfen den Wächter und seine Energieentscheidung nicht beeinflussen.
 - Das visuelle Fenster-Chrome liegt zentral in `src/window_chrome.rs`; insbesondere darf die Transparenzsuche nie ein gleichnamiges Fenster eines anderen Prozesses verändern.
 - `WS_EX_LAYERED` darf nur bei einer echten Transparenz unter 100 Prozent gesetzt werden. Bei voller Deckkraft muss der Layered-Stil entfernt bleiben, sonst bleibt das Glow-Fenster weiß.
-- Der Tray darf ein Live-Fenster erst nach dem ersten gezeichneten Frame nach vorn holen. Ein verstecktes oder 4x4-Vorbereitungsfenster darf nicht mit `ShowWindow` sichtbar gemacht werden.
+- Der Tray darf ein 4x4-Vorbereitungsfenster nie mit `ShowWindow` sichtbar machen.
+- Das monitorgroße, transparente `tray_icon_app`-Hilfsfenster des Trays zählt niemals als Live-Fenster. Ein Klick auf das Mondsymbol muss das echte `--live-status`-Fenster finden oder neu starten.
+- Ein bereits vorhandenes Live-Fenster darf auch dann eingeblendet werden, wenn es nach einem Neustart noch versteckt oder noch ohne Titel ist; Hilfsfenster bleiben ausgeschlossen.
+- Endet die Tray-App, muss das von ihr gestartete Live-Fenster mitgehen. Das Fenster darf nicht als Waisenprozess weiterlaufen.
+- Ein Doppelklick auf die EXE startet den Tray und öffnet das Live-Fenster. Eine zweite EXE-Instanz startet keinen zweiten Tray, sondern holt das vorhandene Live-Fenster.
 
 ## Build und Auslieferung
 
@@ -88,7 +92,11 @@ Ein echter Windows-Shutdown wird nicht als automatischer Test ausgeführt. Die T
 |---|---|---|
 | Tray-Text, Menü oder Symbol | App starten, Menü und Tooltip ansehen | Kein zusätzliches Fenster, passende Menü-Sperren |
 | Live-Status | Mehrere Herdr-Agenten laufen lassen, Live-Status öffnen | Live-Zahl, großer Mond mit echter Mondphase und Hover-Hinweis sowie funktionierender Start- oder Stoppknopf sind sichtbar; die Temperatur bleibt in der dunklen Mondfläche lesbar; Abschluss-Schalter und Sekundenfeld liegen rechts neben „Herdr jetzt“, speichern nur außerhalb eines aktiven Laufes; bei Warnfrist zeigt das Fenster einen roten Countdown; die schmale Fußzeile zeigt CPU, GPU, belegten VRAM, RAM und einen verfügbaren Grafikkarten-Wattwert oder `—`; Fenster ist beweglich und schließbar |
-| Live-Status nach Neustart | Tray-App mit aktivierter Startoption nach Windows-Login starten; anschließend ein verstecktes Live-Fenster erneut öffnen | Der automatische Start wartet kurz auf den Windows-Desktop; ein vorhandenes Fenster wird erst nach dem ersten gezeichneten Frame restauriert und nicht durch eine zweite Mutex-Instanz ersetzt |
+| Live-Status vom Tray | App nur als Tray starten, danach Einfach- und Doppelklick auf den Mond | Es erscheint das echte Live-Fenster mit Titel; das transparente Tray-Hilfsfenster bleibt unsichtbar und wird nicht eingeblendet |
+| Tray beenden | Live-Fenster öffnen, danach die Tray-App beenden | Das Live-Fenster schließt sich mit; kein `--live-status`-Prozess bleibt zurück |
+| Live-Status nach Neustart | Tray-App mit aktivierter Startoption nach Windows-Login starten; anschließend ein verstecktes Live-Fenster erneut öffnen | Ein vorhandenes Fenster wird restauriert und nicht durch eine zweite Mutex-Instanz ersetzt |
+| EXE ohne laufenden Tray | Installierte EXE per Doppelklick starten | Tray erscheint und das Live-Fenster öffnet sich sichtbar |
+| EXE bei laufendem Tray | EXE erneut doppelklicken | Es entsteht kein zweiter Tray; das vorhandene Live-Fenster kommt nach vorn |
 | WSL-/PowerShell-Start | Beobachtungsmodus mit echter Herdr-Arbeit | Task läuft, Status hat `monitoring_scope=live_agents`, kein Shutdown; bei einem Boot-Rennen wartet der Wächter auf beide Boot-Marken |
 | Warnfenster | `Demo: Abschluss simulieren` | Ruhezeit, rotes Symbol und Dialog sichtbar; Windows bleibt an |
 | Stopp-Pfad | Demo oder Beobachtung starten, dann Stopp | Task beendet, Log enthält `CANCELLED` oder Abschluss |

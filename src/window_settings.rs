@@ -88,7 +88,7 @@ pub fn live_status_on_start() -> bool {
         .open_subkey(KEY)
         .and_then(|key| key.get_value::<u32, _>(LIVE_STATUS_START_VALUE))
         .map(|value| value != 0)
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 pub fn set_live_status_on_start(enabled: bool) -> anyhow::Result<()> {

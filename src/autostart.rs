@@ -16,7 +16,7 @@ pub fn set_enabled(on: bool) -> Result<()> {
     let current_user = RegKey::predef(HKEY_CURRENT_USER);
     if on {
         let exe = std::env::current_exe().context("Programmdatei konnte nicht bestimmt werden")?;
-        let command = format!("\"{}\"", exe.display());
+        let command = format!("\"{}\" --autostart", exe.display());
         let (key, _) = current_user
             .create_subkey(RUN_KEY)
             .context("Autostart konnte nicht eingerichtet werden")?;

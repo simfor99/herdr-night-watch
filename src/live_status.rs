@@ -15,14 +15,22 @@ use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+    Mutex,
+    mpsc::{self, Receiver, Sender},
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GetLastError, HANDLE, HWND, LPARAM, RECT};
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
+    TerminateProcess,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+    BringWindowToTop, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SW_RESTORE,
+    SW_SHOW, SetForegroundWindow, ShowWindow, WM_CLOSE,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -53,38 +61,54 @@ const DESIGN_HEIGHT: f32 = 190.0;
 const RESIZE_GRIP_SIZE: f32 = 16.0;
 const LIVE_WINDOW_MIN_READY_WIDTH: i32 = 80;
 const LIVE_WINDOW_MIN_READY_HEIGHT: i32 = 40;
+const STILL_ACTIVE: u32 = 259;
+const OPEN_SPAWN_DEBOUNCE: Duration = Duration::from_millis(750);
+const LIVE_WINDOW_CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
+const OWNER_PID_PREFIX: &str = "--owner-pid=";
+
+struct OpenAttempt {
+    started_at: Instant,
+    child_pid: Option<u32>,
+}
+
+static OPEN_ATTEMPT: Mutex<Option<OpenAttempt>> = Mutex::new(None);
 const MOON_SLOT_WIDTH: f32 = 77.0;
 const MOON_ICON_DIAMETER: f32 = 59.5;
 const MOON_RIGHT_INSET: f32 = 34.0;
 const KPI_PANEL_WIDTH: f32 = 264.0;
 
 pub fn open() -> Result<()> {
-    if let Some(hwnd) = find_live_window() {
-        if live_window_is_ready(hwnd) {
-            apply_taskbar_visibility(hwnd);
-            activate_live_window(hwnd);
-            return Ok(());
-        }
-        thread::spawn(|| {
-            wait_for_existing_ready_live_window();
-        });
+    if let Some(hwnd) = find_existing_live_window() {
+        apply_taskbar_visibility(hwnd);
+        activate_live_window(hwnd);
+        return Ok(());
+    }
+
+    if !begin_open_spawn() {
         return Ok(());
     }
 
     let executable =
         std::env::current_exe().context("Programmdatei konnte nicht bestimmt werden")?;
-    let child = spawn_live_status_process(&executable)?;
+    let child = match spawn_live_status_process(&executable) {
+        Ok(child) => child,
+        Err(error) => {
+            finish_open_spawn();
+            return Err(error);
+        }
+    };
+    remember_open_child(child.id());
 
     thread::spawn(move || {
         let mut child = child;
         for attempt in 1..=LIVE_WINDOW_START_ATTEMPTS {
+            remember_open_child(child.id());
             let started_at = Instant::now();
             loop {
-                if let Some(hwnd) = find_live_window_for_pid(child.id())
-                    && live_window_is_ready(hwnd)
-                {
+                if let Some(hwnd) = find_live_window_for_pid(child.id()) {
                     apply_taskbar_visibility(hwnd);
                     activate_live_window(hwnd);
+                    finish_open_spawn();
                     return;
                 }
                 match child.try_wait() {
@@ -94,6 +118,7 @@ pub fn open() -> Result<()> {
                         );
                         if attempt == LIVE_WINDOW_START_ATTEMPTS {
                             record_open_failure(&detail);
+                            finish_open_spawn();
                             return;
                         }
                         record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
@@ -105,6 +130,7 @@ pub fn open() -> Result<()> {
                         let detail = "Live-Status-Prozess läuft, aber nach 30 Sekunden wurde kein Fenster gefunden";
                         if attempt == LIVE_WINDOW_START_ATTEMPTS {
                             record_open_failure(detail);
+                            finish_open_spawn();
                             return;
                         }
                         record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
@@ -119,6 +145,7 @@ pub fn open() -> Result<()> {
                         );
                         if attempt == LIVE_WINDOW_START_ATTEMPTS {
                             record_open_failure(&detail);
+                            finish_open_spawn();
                             return;
                         }
                         record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
@@ -134,133 +161,295 @@ pub fn open() -> Result<()> {
                     record_open_failure(&format!(
                         "Live-Status-Prozess konnte beim Wiederholungsversuch nicht gestartet werden: {error}"
                     ));
+                    finish_open_spawn();
                     return;
                 }
             };
         }
+        finish_open_spawn();
     });
     Ok(())
+}
+
+pub fn close() {
+    let mut pids = Vec::new();
+    if let Some(hwnd) = find_existing_live_window() {
+        if let Some(pid) = window_pid(hwnd) {
+            pids.push(pid);
+        }
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+    }
+    if let Ok(gate) = OPEN_ATTEMPT.lock()
+        && let Some(pid) = gate.as_ref().and_then(|attempt| attempt.child_pid)
+    {
+        pids.push(pid);
+    }
+    pids.retain(|pid| *pid != 0 && *pid != current_pid());
+    pids.sort_unstable();
+    pids.dedup();
+    let started_at = Instant::now();
+    while started_at.elapsed() < LIVE_WINDOW_CLOSE_TIMEOUT {
+        pids.retain(|pid| process_is_running(*pid));
+        if pids.is_empty() && find_existing_live_window().is_none() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    for pid in pids {
+        terminate_pid(pid);
+    }
+    if let Some(hwnd) = find_existing_live_window()
+        && let Some(pid) = window_pid(hwnd)
+    {
+        terminate_pid(pid);
+    }
 }
 
 fn spawn_live_status_process(executable: &Path) -> Result<Child> {
     Command::new(executable)
         .creation_flags(CREATE_NO_WINDOW)
         .arg("--live-status")
+        .arg(format!("{OWNER_PID_PREFIX}{}", std::process::id()))
         .spawn()
         .context("Live-Status-Fenster konnte nicht gestartet werden")
 }
 
+fn parse_owner_pid<I, S>(arguments: I) -> Option<u32>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    arguments.into_iter().find_map(|argument| {
+        argument
+            .as_ref()
+            .strip_prefix(OWNER_PID_PREFIX)
+            .and_then(|value| value.parse().ok())
+            .filter(|pid| *pid != 0)
+    })
+}
+
 fn find_live_window() -> Option<HWND> {
-    let mut found = None;
-    unsafe {
-        let _ = EnumWindows(
-            Some(find_live_window_callback),
-            &mut found as *mut _ as LPARAM,
-        );
-    }
-    found
+    pick_live_window(None, None)
+}
+
+fn find_existing_live_window() -> Option<HWND> {
+    // The tray process owns a monitor-sized transparent `tray_icon_app`
+    // helper. That HWND must never be treated as the Live-Status window.
+    pick_live_window(None, Some(current_pid()))
 }
 
 fn find_live_window_for_pid(pid: u32) -> Option<HWND> {
-    let mut search = LiveWindowSearch {
-        target_pid: pid,
-        found: None,
+    pick_live_window(Some(pid), None)
+}
+
+fn pick_live_window(required_pid: Option<u32>, exclude_pid: Option<u32>) -> Option<HWND> {
+    let mut search = LiveWindowQuery {
+        required_pid,
+        exclude_pid,
+        pick: LiveWindowPick::default(),
     };
     unsafe {
         let _ = EnumWindows(
-            Some(find_live_window_for_pid_callback),
+            Some(find_live_window_callback),
             &mut search as *mut _ as LPARAM,
         );
     }
-    search.found
+    search.pick.hwnd
 }
 
-struct LiveWindowSearch {
-    target_pid: u32,
-    found: Option<HWND>,
+struct LiveWindowQuery {
+    required_pid: Option<u32>,
+    exclude_pid: Option<u32>,
+    pick: LiveWindowPick,
+}
+
+#[derive(Default)]
+struct LiveWindowPick {
+    hwnd: Option<HWND>,
+    score: i32,
+    area: i64,
 }
 
 unsafe extern "system" fn find_live_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
-        let found = &mut *(lparam as *mut Option<HWND>);
-        if found.is_some() {
-            return 1;
-        }
-        let length = GetWindowTextLengthW(hwnd);
-        if length <= 0 {
-            return 1;
-        }
-        let mut title = vec![0u16; length as usize + 1];
-        let copied = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
-        let title = String::from_utf16_lossy(&title[..copied as usize]);
-        if is_live_window_title(&title) && live_window_is_candidate(hwnd) {
-            *found = Some(hwnd);
-            return 0;
-        }
-    }
-    1
-}
-
-unsafe extern "system" fn find_live_window_for_pid_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    unsafe {
-        let search = &mut *(lparam as *mut LiveWindowSearch);
-        if search.found.is_some() {
-            return 1;
-        }
-        // eframe/winit creates a 4x4 event-target window before the actual
-        // Live-Status window is shown. Ignore that dummy. The real window may
-        // still be hidden until the first Glow frame is painted; wait for that
-        // instead of forcing ShowWindow on an unpainted HWND.
-        let length = GetWindowTextLengthW(hwnd);
-        if length <= 0 {
-            return 1;
-        }
-        let mut title = vec![0u16; length as usize + 1];
-        let copied = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
-        let title = String::from_utf16_lossy(&title[..copied as usize]);
-        if !is_live_window_title(&title) || !live_window_is_candidate(hwnd) {
-            return 1;
-        }
-        let mut window_pid = 0;
-        GetWindowThreadProcessId(hwnd, &mut window_pid);
-        if window_pid == search.target_pid {
-            search.found = Some(hwnd);
-            return 0;
+        let search = &mut *(lparam as *mut LiveWindowQuery);
+        if let Some((score, area)) =
+            score_live_window(hwnd, search.required_pid, search.exclude_pid)
+            && (score > search.pick.score
+                || (score == search.pick.score && area > search.pick.area))
+        {
+            search.pick.hwnd = Some(hwnd);
+            search.pick.score = score;
+            search.pick.area = area;
         }
     }
     1
 }
 
 fn activate_live_window(hwnd: HWND) {
+    if !is_activatable_live_hwnd(hwnd) {
+        return;
+    }
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = ShowWindow(hwnd, SW_RESTORE);
-        let _ = SetForegroundWindow(hwnd);
-    }
-}
-
-fn wait_for_existing_ready_live_window() {
-    let started_at = Instant::now();
-    loop {
-        if let Some(hwnd) = find_live_window()
-            && live_window_is_ready(hwnd)
-        {
-            apply_taskbar_visibility(hwnd);
-            activate_live_window(hwnd);
-            return;
+        if window_settings::WindowLevel::current() != window_settings::WindowLevel::AlwaysOnBottom {
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
         }
-        if started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT {
-            record_open_failure(
-                "Live-Status-Fenster wurde gefunden, blieb aber nach 30 Sekunden ungezeichnet",
-            );
-            return;
-        }
-        thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
     }
 }
 
 fn is_live_window_title(title: &str) -> bool {
     title == "Herdr-Nachtwächter - Live-Status" || title == "Herdr Night Watch - Live Status"
+}
+
+fn window_title(hwnd: HWND) -> String {
+    unsafe {
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return String::new();
+        }
+        let mut title = vec![0u16; length as usize + 1];
+        let copied = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        String::from_utf16_lossy(&title[..copied as usize])
+    }
+}
+
+fn score_live_window(
+    hwnd: HWND,
+    required_pid: Option<u32>,
+    exclude_pid: Option<u32>,
+) -> Option<(i32, i64)> {
+    let mut window_pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut window_pid);
+    }
+    if required_pid.is_none() && !process_image_is_this_app(window_pid) {
+        return None;
+    }
+    let (visible, minimized, width, height) = live_window_metrics(hwnd);
+    score_live_window_facts(
+        &LiveWindowFacts {
+            title: window_title(hwnd),
+            class: window_class(hwnd),
+            visible,
+            minimized,
+            width,
+            height,
+            pid: window_pid,
+        },
+        required_pid,
+        exclude_pid,
+    )
+}
+
+struct LiveWindowFacts {
+    title: String,
+    class: String,
+    visible: bool,
+    minimized: bool,
+    width: i32,
+    height: i32,
+    pid: u32,
+}
+
+fn score_live_window_facts(
+    facts: &LiveWindowFacts,
+    required_pid: Option<u32>,
+    exclude_pid: Option<u32>,
+) -> Option<(i32, i64)> {
+    if is_helper_window_class(&facts.class) {
+        return None;
+    }
+    if let Some(required_pid) = required_pid
+        && facts.pid != required_pid
+    {
+        return None;
+    }
+    if let Some(exclude_pid) = exclude_pid
+        && facts.pid == exclude_pid
+    {
+        return None;
+    }
+    if !facts.title.is_empty() && !is_live_window_title(&facts.title) {
+        return None;
+    }
+    if is_dummy_event_target_window(facts.visible, facts.minimized, facts.width, facts.height) {
+        return None;
+    }
+    if facts.title.is_empty()
+        && !untitled_window_can_be_live(facts.visible, facts.minimized, facts.width, facts.height)
+    {
+        return None;
+    }
+    if !facts.title.is_empty()
+        && !is_live_window_candidate(facts.visible, facts.minimized, facts.width, facts.height)
+    {
+        return None;
+    }
+    let score = if facts.title.is_empty() { 1 } else { 2 };
+    Some((score, i64::from(facts.width) * i64::from(facts.height)))
+}
+
+fn window_class(hwnd: HWND) -> String {
+    unsafe {
+        let mut class_name = [0u16; 256];
+        let copied = GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32);
+        if copied <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&class_name[..copied as usize])
+    }
+}
+
+fn is_helper_window_class(class: &str) -> bool {
+    matches!(
+        class,
+        "tray_icon_app" | "Winit Thread Event Target" | "MSCTFIME UI" | "IME"
+    )
+}
+
+fn current_pid() -> u32 {
+    unsafe { GetCurrentProcessId() }
+}
+
+fn process_image_is_this_app(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let current = std::env::current_exe().ok();
+    let Some(other) = process_image_path(pid) else {
+        return false;
+    };
+    let Some(current) = current else {
+        return other
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("Herdr-Nachtwaechter"));
+    };
+    current.file_name() == other.file_name()
+}
+
+fn process_image_path(pid: u32) -> Option<std::path::PathBuf> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut buffer = [0u16; 512];
+        let mut length = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length);
+        let _ = CloseHandle(handle);
+        if ok == 0 || length == 0 {
+            return None;
+        }
+        Some(std::path::PathBuf::from(String::from_utf16_lossy(
+            &buffer[..length as usize],
+        )))
+    }
 }
 
 fn live_window_metrics(hwnd: HWND) -> (bool, bool, i32, i32) {
@@ -282,28 +471,129 @@ fn live_window_metrics(hwnd: HWND) -> (bool, bool, i32, i32) {
     }
 }
 
-fn live_window_is_candidate(hwnd: HWND) -> bool {
+fn is_activatable_live_hwnd(hwnd: HWND) -> bool {
+    if is_helper_window_class(&window_class(hwnd)) {
+        return false;
+    }
     let (visible, minimized, width, height) = live_window_metrics(hwnd);
-    is_live_window_candidate(visible, minimized, width, height)
+    is_showable_live_window(visible, minimized, width, height)
 }
 
-fn live_window_is_ready(hwnd: HWND) -> bool {
-    let (visible, minimized, width, height) = live_window_metrics(hwnd);
-    is_ready_live_window(visible, minimized, width, height)
+fn begin_open_spawn() -> bool {
+    let Ok(mut gate) = OPEN_ATTEMPT.lock() else {
+        return true;
+    };
+    if let Some(existing) = gate.as_ref() {
+        if existing.child_pid.is_some_and(process_is_running) {
+            return false;
+        }
+        if existing.started_at.elapsed() < OPEN_SPAWN_DEBOUNCE {
+            return false;
+        }
+    }
+    *gate = Some(OpenAttempt {
+        started_at: Instant::now(),
+        child_pid: None,
+    });
+    true
+}
+
+fn remember_open_child(pid: u32) {
+    if let Ok(mut gate) = OPEN_ATTEMPT.lock()
+        && let Some(existing) = gate.as_mut()
+    {
+        existing.child_pid = Some(pid);
+    }
+}
+
+fn finish_open_spawn() {
+    if let Ok(mut gate) = OPEN_ATTEMPT.lock() {
+        *gate = None;
+    }
+}
+
+fn process_is_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        let _ = CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE
+    }
+}
+
+fn window_pid(hwnd: HWND) -> Option<u32> {
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    (pid != 0).then_some(pid)
+}
+
+fn terminate_pid(pid: u32) {
+    if pid == 0 || pid == current_pid() {
+        return;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            return;
+        }
+        let _ = TerminateProcess(handle, 0);
+        let _ = CloseHandle(handle);
+    }
+}
+
+fn is_dummy_event_target_window(_visible: bool, minimized: bool, width: i32, height: i32) -> bool {
+    !minimized
+        && width > 0
+        && height > 0
+        && width < LIVE_WINDOW_MIN_READY_WIDTH
+        && height < LIVE_WINDOW_MIN_READY_HEIGHT
 }
 
 fn is_live_window_candidate(visible: bool, minimized: bool, width: i32, height: i32) -> bool {
     if minimized {
         return true;
     }
-    // The 4x4 event-target window can be visible while the real live window
-    // is still hidden. Never treat that dummy as the live window.
-    if visible && width < LIVE_WINDOW_MIN_READY_WIDTH && height < LIVE_WINDOW_MIN_READY_HEIGHT {
-        return false;
-    }
-    true
+    // The 4x4 event-target window can be visible or hidden. Never treat that
+    // dummy as the live window, even after a reboot when the real window is
+    // already full size but still hidden and untitled.
+    !is_dummy_event_target_window(visible, minimized, width, height)
 }
 
+fn untitled_window_can_be_live(visible: bool, minimized: bool, width: i32, height: i32) -> bool {
+    let _ = visible;
+    if minimized {
+        return true;
+    }
+    !is_dummy_event_target_window(visible, minimized, width, height)
+        && width >= LIVE_WINDOW_MIN_READY_WIDTH
+        && height >= LIVE_WINDOW_MIN_READY_HEIGHT
+}
+
+fn is_showable_live_window(visible: bool, minimized: bool, width: i32, height: i32) -> bool {
+    if is_dummy_event_target_window(visible, minimized, width, height) {
+        return false;
+    }
+    if minimized {
+        return true;
+    }
+    // A real HWND can report 0x0 while it is still hidden. Showing it is the
+    // opener's job; dummy and helper windows are rejected before this check.
+    if width <= 0 || height <= 0 {
+        return true;
+    }
+    width >= LIVE_WINDOW_MIN_READY_WIDTH && height >= LIVE_WINDOW_MIN_READY_HEIGHT
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn is_ready_live_window(visible: bool, minimized: bool, width: i32, height: i32) -> bool {
     if minimized {
         return true;
@@ -351,9 +641,7 @@ pub fn run() -> Result<()> {
     let instance_mutex = match acquire_live_instance()? {
         Some(handle) => handle,
         None => {
-            if let Some(hwnd) = find_live_window()
-                && live_window_is_ready(hwnd)
-            {
+            if let Some(hwnd) = find_live_window() {
                 apply_taskbar_visibility(hwnd);
                 activate_live_window(hwnd);
             }
@@ -431,7 +719,10 @@ fn run_window() -> Result<()> {
         Box::new(move |creation_context| {
             creation_context.egui_ctx.set_zoom_factor(scale);
             configure_visuals(&creation_context.egui_ctx);
-            Ok(Box::new(LiveStatusApp::new(scale)))
+            Ok(Box::new(LiveStatusApp::new(
+                scale,
+                parse_owner_pid(std::env::args()),
+            )))
         }),
     )
     .map_err(|error| anyhow::anyhow!("Live-Status-Fenster konnte nicht ausgeführt werden: {error}"))
@@ -481,10 +772,11 @@ struct LiveStatusApp {
     context_menu_pos: Option<egui::Pos2>,
     scale: f32,
     last_saved_position: Option<[f32; 2]>,
+    owner_pid: Option<u32>,
 }
 
 impl LiveStatusApp {
-    fn new(scale: f32) -> Self {
+    fn new(scale: f32, owner_pid: Option<u32>) -> Self {
         let (status_tx, status_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         let (metrics_tx, metrics_rx) = mpsc::channel();
@@ -538,6 +830,7 @@ impl LiveStatusApp {
             context_menu_pos: None,
             scale,
             last_saved_position: window_settings::live_status_position(),
+            owner_pid,
         }
     }
 
@@ -736,6 +1029,12 @@ struct Toast {
 
 impl eframe::App for LiveStatusApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        if let Some(owner_pid) = self.owner_pid
+            && !process_is_running(owner_pid)
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         let current_language = Language::current();
         if current_language != self.language {
             self.language = current_language;
@@ -2911,15 +3210,90 @@ mod tests {
     }
 
     #[test]
-    fn dummy_event_target_window_is_not_the_live_window() {
-        assert!(!is_live_window_candidate(true, false, 4, 4));
-        assert!(!is_ready_live_window(true, false, 4, 4));
+    fn owner_pid_is_read_from_spawn_argument() {
+        assert_eq!(
+            parse_owner_pid(["--live-status", "--owner-pid=3648"]),
+            Some(3648)
+        );
+        assert_eq!(parse_owner_pid(["--live-status"]), None);
+        assert_eq!(parse_owner_pid(["--owner-pid=0"]), None);
+        assert_eq!(parse_owner_pid(["--owner-pid=abc"]), None);
     }
 
     #[test]
-    fn hidden_real_window_is_a_candidate_but_not_ready() {
+    fn dummy_event_target_window_is_not_the_live_window() {
+        assert!(is_dummy_event_target_window(true, false, 4, 4));
+        assert!(is_dummy_event_target_window(false, false, 4, 4));
+        assert!(!is_live_window_candidate(true, false, 4, 4));
+        assert!(!is_live_window_candidate(false, false, 4, 4));
+        assert!(!is_ready_live_window(true, false, 4, 4));
+        assert!(!is_showable_live_window(true, false, 4, 4));
+    }
+
+    #[test]
+    fn tray_helper_window_is_never_the_live_window() {
+        let tray_helper = LiveWindowFacts {
+            title: String::new(),
+            class: "tray_icon_app".into(),
+            visible: true,
+            minimized: false,
+            width: 1920,
+            height: 1025,
+            pid: 3648,
+        };
+        assert!(is_helper_window_class(&tray_helper.class));
+        assert!(score_live_window_facts(&tray_helper, None, Some(3648)).is_none());
+        assert!(score_live_window_facts(&tray_helper, None, None).is_none());
+    }
+
+    #[test]
+    fn winit_and_ime_helpers_are_never_the_live_window() {
+        for class in ["Winit Thread Event Target", "MSCTFIME UI", "IME"] {
+            let helper = LiveWindowFacts {
+                title: String::new(),
+                class: class.into(),
+                visible: true,
+                minimized: false,
+                width: 4,
+                height: 4,
+                pid: 10,
+            };
+            assert!(score_live_window_facts(&helper, Some(10), None).is_none());
+        }
+    }
+
+    #[test]
+    fn titled_live_window_beats_same_process_helpers() {
+        let live = LiveWindowFacts {
+            title: "Herdr-Nachtwächter - Live-Status".into(),
+            class: "Window Class".into(),
+            visible: false,
+            minimized: false,
+            width: 393,
+            height: 190,
+            pid: 99,
+        };
+        assert_eq!(
+            score_live_window_facts(&live, None, Some(3648)),
+            Some((2, 393 * 190))
+        );
+        assert!(score_live_window_facts(&live, None, Some(99)).is_none());
+    }
+
+    #[test]
+    fn hidden_zero_size_titled_window_can_be_shown() {
+        assert!(is_live_window_candidate(false, false, 0, 0));
+        assert!(is_showable_live_window(false, false, 0, 0));
+        assert!(!untitled_window_can_be_live(false, false, 0, 0));
+    }
+
+    #[test]
+    fn hidden_real_window_is_a_candidate_and_can_be_shown() {
         assert!(is_live_window_candidate(false, false, 393, 190));
         assert!(!is_ready_live_window(false, false, 393, 190));
+        assert!(is_showable_live_window(false, false, 393, 190));
+        assert!(untitled_window_can_be_live(false, false, 1920, 1025));
+        assert!(!untitled_window_can_be_live(true, false, 4, 4));
     }
 
     #[test]

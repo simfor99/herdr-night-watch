@@ -8,6 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -31,7 +33,8 @@ const ID_WINDOW_OPACITY_PREFIX: &str = "window_opacity_";
 const ID_WINDOW_LEVEL_NORMAL: &str = "window_level_normal";
 const ID_WINDOW_LEVEL_TOP: &str = "window_level_top";
 const ID_WINDOW_LEVEL_BOTTOM: &str = "window_level_bottom";
-const LIVE_STATUS_STARTUP_DELAY: Duration = Duration::from_secs(8);
+const TRAY_INSTANCE_MUTEX: &str = "Local\\HerdrNachtwaechter.Tray";
+const SECOND_INSTANCE_HANDOFF: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy)]
 struct Wake;
@@ -49,10 +52,17 @@ struct App {
     power_guard_active: bool,
     power_guard_error: bool,
     power_guard_last_attempted: Option<bool>,
-    startup_live_status_at: Option<Instant>,
 }
 
 pub fn run() -> Result<()> {
+    let instance_mutex = match acquire_tray_instance()? {
+        Some(handle) => handle,
+        None => {
+            let _ = live_status::open();
+            thread::sleep(SECOND_INSTANCE_HANDOFF);
+            return Ok(());
+        }
+    };
     let event_loop: EventLoop<Wake> = EventLoop::with_user_event().build()?;
     let proxy: EventLoopProxy<Wake> = event_loop.create_proxy();
     let (result_tx, result_rx) = mpsc::channel();
@@ -82,8 +92,12 @@ pub fn run() -> Result<()> {
         .with_menu_on_left_click(false)
         .build()?;
     tray_history::start_session();
-    let startup_live_status_at =
-        window_settings::live_status_on_start().then(|| Instant::now() + LIVE_STATUS_STARTUP_DELAY);
+    if should_open_live_on_launch(
+        launched_by_windows_logon(std::env::args()),
+        window_settings::live_status_on_start(),
+    ) {
+        let _ = live_status::open();
+    }
     let mut app = App {
         language,
         tray: Some(tray),
@@ -97,17 +111,53 @@ pub fn run() -> Result<()> {
         power_guard_active: false,
         power_guard_error: false,
         power_guard_last_attempted: None,
-        startup_live_status_at,
     };
     app.sync_power_guard();
     app.sync_expected_exit();
     let result = event_loop.run_app(&mut app);
+    live_status::close();
     let _ = power_guard::set_prevent_sleep(false);
     if result.is_ok() {
         tray_history::finish_session();
     }
+    unsafe {
+        let _ = CloseHandle(instance_mutex);
+    }
     result?;
     Ok(())
+}
+
+fn launched_by_windows_logon<I, S>(arguments: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    arguments
+        .into_iter()
+        .any(|argument| argument.as_ref() == "--autostart")
+}
+
+fn should_open_live_on_launch(from_windows_logon: bool, setting_enabled: bool) -> bool {
+    !from_windows_logon || setting_enabled
+}
+
+fn acquire_tray_instance() -> Result<Option<HANDLE>> {
+    let name: Vec<u16> = TRAY_INSTANCE_MUTEX
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(anyhow::anyhow!("Tray-Sperre konnte nicht erstellt werden"));
+    }
+    if unsafe { GetLastError() } == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        Ok(None)
+    } else {
+        Ok(Some(handle))
+    }
 }
 
 impl App {
@@ -306,11 +356,6 @@ impl App {
     }
 
     fn perform(&mut self, action: &str, event_loop: &ActiveEventLoop) {
-        if action == ID_LIVE_STATUS {
-            // A manual open supersedes the delayed startup open. This prevents
-            // a second child process from racing the window the user just opened.
-            self.startup_live_status_at = None;
-        }
         let result = match action {
             ID_START => backend::start(false),
             ID_OBSERVE => backend::start(true),
@@ -349,6 +394,7 @@ impl App {
                     // running night watch behind when its only warning surface exits.
                     let _ = backend::stop("tray_app_quit");
                 }
+                live_status::close();
                 tray_history::finish_session();
                 event_loop.exit();
                 return;
@@ -451,25 +497,22 @@ impl App {
     }
 
     fn tick(&mut self, event_loop: &ActiveEventLoop) {
-        if self
-            .startup_live_status_at
-            .is_some_and(|scheduled| scheduled <= Instant::now())
-        {
-            self.startup_live_status_at = None;
-            let _ = live_status::open();
-        }
         self.apply_results();
         self.refresh_status();
         self.render();
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if matches!(
+            let open_live_status = matches!(
                 event,
                 TrayIconEvent::Click {
                     button: MouseButton::Left,
                     button_state: MouseButtonState::Up,
                     ..
+                } | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
                 }
-            ) {
+            );
+            if open_live_status {
                 self.perform(ID_LIVE_STATUS, event_loop);
             }
         }
@@ -855,4 +898,26 @@ fn icon_for(status: &backend::WatchStatus) -> Result<Icon> {
         pixel[2] = blue;
     }
     Ok(Icon::from_rgba(rgba, width, height)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{launched_by_windows_logon, should_open_live_on_launch};
+
+    #[test]
+    fn double_clicked_exe_opens_the_live_window() {
+        assert!(!launched_by_windows_logon(["Herdr-Nachtwaechter.exe"]));
+        assert!(should_open_live_on_launch(false, false));
+        assert!(should_open_live_on_launch(false, true));
+    }
+
+    #[test]
+    fn windows_logon_honors_the_saved_setting() {
+        assert!(launched_by_windows_logon([
+            "Herdr-Nachtwaechter.exe",
+            "--autostart"
+        ]));
+        assert!(should_open_live_on_launch(true, true));
+        assert!(!should_open_live_on_launch(true, false));
+    }
 }

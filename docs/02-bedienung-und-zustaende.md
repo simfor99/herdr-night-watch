@@ -22,11 +22,11 @@ Das Menü sperrt Start, Beobachtung, Demo und Stopp passend zum aktiven Zustand.
 | `Stopp und Shutdown abbrechen` | Löscht aktiven Lauf, stoppt den Task und versucht `shutdown.exe /a`. | Es betrifft nur eine noch gültige, vom Wächter erstellte Warnung. |
 | `Demo: Abschluss simulieren` | Simuliert Ruhezeit und Warnung in wenigen Sekunden. | `demo=true` und `dry_run=true`; kein Herdr-Check und kein echter Shutdown. |
 | `Live-Status öffnen` | Öffnet ein kleines bewegliches Statusfenster mit einem klickbaren Mond, Abschluss-Schalter, Sekundenfeld und Temperaturanzeige. | Linksklick auf das Tray-Symbol öffnet dasselbe Fenster, Rechtsklick zeigt dieses Menü. Klick auf den grauen Mond startet, Klick auf einen farbigen Mond stoppt über denselben sicheren Pfad wie das Tray-Menü. Der Schalter wählt links mit Stecker Energiesparmodus und rechts mit Power-Symbol Herunterfahren. Das Feld legt die Warnfrist von 10 bis 3.600 Sekunden für den nächsten Nachtlauf fest. Nach einem Klick erscheint drei Sekunden ein Toast; das X schließt nur das Fenster. |
-| `Live-Fenster beim Start öffnen` | Speichert, ob die Tray-App beim Start zusätzlich das Live-Fenster öffnen soll. | Der Standard ist Tray-only. Die Einstellung startet keinen Nachtlauf und verändert keine Wächterentscheidung. |
+| `Live-Fenster beim Start öffnen` | Speichert, ob die Tray-App nach einem Windows-Login zusätzlich das Live-Fenster öffnen soll. Ein Doppelklick auf die EXE öffnet das Fenster immer, auch wenn diese Option aus ist. | Der Standard ist an. Die Einstellung startet keinen Nachtlauf und verändert keine Wächterentscheidung. |
 | `Protokoll öffnen` | Öffnet `watch.log` im Editor. | Dient nur der Rohdiagnose. Das obere Protokoll-Symbol im Live-Fenster öffnet stattdessen das gestaltete Abschlussprotokoll mit getrennten Bereichen für Energieaktionen und Tray-/Diagnoseereignisse. Beide Bereiche zeigen jeweils bis zu 30 Einträge. |
 | `Wetterort ändern` | Wird über das kleine Wettersymbol unten rechts im Live-Fenster geöffnet. Sucht Städte oder Postleitzahlen und speichert den ausgewählten Treffer lokal. | Die Temperatur ist rein informativ. Netzwerkfehler führen zu `—` oder zum letzten Wert und können den Nachtwächter nie beeinflussen. |
 | `Mit Windows starten` | Registriert die Tray-App für den Benutzer-Login. | Scharfstellt niemals automatisch einen Nachtlauf. |
-| `Tray-App beenden` | Beendet die Bedienoberfläche. | Ein aktiver Nachtlauf wird vorher sicher abgebrochen, damit keine sichtbare Warnmöglichkeit verloren geht. |
+| `Tray-App beenden` | Beendet die Bedienoberfläche und schließt das zugehörige Live-Fenster. | Ein aktiver Nachtlauf wird vorher sicher abgebrochen, damit keine sichtbare Warnmöglichkeit verloren geht. |
 
 ## Zustandsautomat
 

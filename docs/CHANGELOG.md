@@ -3,6 +3,38 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-19] - Live-Fenster beim EXE-Start v0.1.21
+
+### 🪟 Bedienung
+
+- **Doppelklick öffnet den Monitor** - Startet man die EXE und der Tray läuft noch nicht, geht das Live-Fenster direkt mit auf. Läuft der Tray schon, holt ein weiterer Doppelklick nur das Fenster nach vorn.
+- **Klick trifft das echte Fenster** - Ein Einfach- oder Doppelklick auf den Mond startet oder holt das Live-Fenster. Das unsichtbare Tray-Hilfsfenster wird nicht mehr mit dem Live-Fenster verwechselt.
+- **Kein Fenster ohne Mond** - Beendet man die Tray-App, schließt sich das Live-Fenster mit.
+
+## [2026-08-19] - Live-Fenster geht mit dem Tray
+
+### 🪟 Bedienung
+
+- **Kein Fenster ohne Mond** - Beendet man die Tray-App, schließt sich das Live-Fenster mit. Es bleibt nicht mehr allein auf dem Schirm stehen.
+
+## [2026-08-19] - Mondklick öffnet das Live-Fenster
+
+### 🪟 Bedienung
+
+- **Klick trifft das echte Fenster** - Ein Einfach- oder Doppelklick auf den Mond startet oder holt das Live-Fenster. Das unsichtbare Tray-Hilfsfenster wird nicht mehr mit dem Live-Fenster verwechselt.
+
+## [2026-08-19] - EXE trägt den Mond
+
+### 🪟 Bedienung
+
+- **Eigenes Dateisymbol** - Die Windows-EXE zeigt denselben Material-Mond wie das Tray, nicht mehr das Standard-Rust-Icon.
+
+## [2026-08-19] - Verstecktes Live-Fenster nach Neustart
+
+### 🪟 Bedienung
+
+- **Fenster kommt wieder** - Nach einem Windows-Neustart wird ein schon großes, aber verstecktes Live-Fenster eingeblendet. Das 4-mal-4-Pixel-Dummy von eframe zählt nicht mehr als Live-Fenster.
+
 ## [2026-08-18] - Skalierungsvorschau bleibt lesbar
 
 ### 🪟 Bedienung
