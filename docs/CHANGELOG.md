@@ -3,6 +3,12 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-19] - Fertig-Halo bleibt knackig
+
+### 🪟 Bedienung
+
+- **Alter Halo, dünner Saum** - Fertige Agenten behalten den warmen gelben Schein um die Zahl. Der helle Rand um die Ziffer bleibt auch im Zoom nur ein Bildschirmpixel dick.
+
 ## [2026-08-19] - Temperatur bleibt auf dem Halbmond lesbar
 
 ### 🪟 Bedienung

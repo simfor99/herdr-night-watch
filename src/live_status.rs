@@ -2562,45 +2562,50 @@ fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32, hi
     });
 }
 
-fn glowing_metric_text(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32) {
-    let font_id = egui::FontId::proportional(size);
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font_id, color);
-    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
-    // The glow and its white contour are intentionally part of the visual
-    // scale: about three and one real pixels at 100 %, about nine and three at
-    // 300 %. Convert from monitor pixels to egui points, but leave the user
-    // zoom in the result so the effect grows with the dashboard.
-    let native_pixels_per_point = ui
-        .ctx()
-        .native_pixels_per_point()
-        .unwrap_or(1.0)
-        .max(f32::EPSILON);
-    for (radius_pixels, halo_color, alpha) in
-        [(3.0, (255, 215, 110), 38), (1.0, (255, 255, 255), 88)]
-    {
-        let points_per_pixel = 1.0 / native_pixels_per_point;
-        let radius = radius_pixels * points_per_pixel;
-        let halo =
-            egui::Color32::from_rgba_unmultiplied(halo_color.0, halo_color.1, halo_color.2, alpha);
-        let sample_count = if radius_pixels > 1.5 { 16 } else { 8 };
-        for sample in 0..sample_count {
-            let angle = std::f32::consts::TAU * sample as f32 / sample_count as f32;
-            ui.painter().text(
-                rect.min + egui::vec2(angle.cos() * radius, angle.sin() * radius),
-                egui::Align2::LEFT_TOP,
-                text,
-                egui::FontId::proportional(size),
-                halo,
-            );
-        }
+fn paint_text_halo(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    width: f32,
+) {
+    for (dx, dy) in outline_offsets(width) {
+        painter.text(
+            origin + egui::vec2(dx, dy),
+            egui::Align2::LEFT_TOP,
+            text,
+            font.clone(),
+            color,
+        );
     }
-    ui.painter().text(
+}
+
+fn glowing_metric_text(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32) {
+    let font = egui::FontId::proportional(size);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), color);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    let painter = ui.painter();
+    let pixels_per_point = painter.pixels_per_point();
+    paint_text_halo(
+        painter,
         rect.min,
-        egui::Align2::LEFT_TOP,
         text,
-        egui::FontId::proportional(size),
-        color,
+        font.clone(),
+        egui::Color32::from_rgba_unmultiplied(255, 215, 110, 38),
+        3.0 / pixels_per_point.max(f32::EPSILON),
     );
+    paint_text_halo(
+        painter,
+        rect.min,
+        text,
+        font.clone(),
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 88),
+        outline_width_in_points(pixels_per_point),
+    );
+    painter.text(rect.min, egui::Align2::LEFT_TOP, text, font, color);
 }
 
 fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Language) -> f32 {
@@ -3230,6 +3235,12 @@ fn configure_visuals(context: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finished_halo_rim_stays_one_screen_pixel() {
+        assert!((outline_width_in_points(1.0) - 1.0).abs() < f32::EPSILON);
+        assert!((outline_width_in_points(3.0) - (1.0 / 3.0)).abs() < 0.001);
+    }
 
     #[test]
     fn moon_temperature_stays_whole_and_outlined() {
