@@ -140,6 +140,18 @@ fn watcher_path() -> String {
     configuration::load().watcher_path
 }
 
+fn logs_dir_for_wsl() -> Option<String> {
+    let directory = std::env::current_exe().ok()?.parent()?.join("logs");
+    let display = directory.to_string_lossy().replace('\\', "/");
+    let mut chars = display.chars();
+    let drive = chars.next()?;
+    if chars.next() != Some(':') || !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    let rest = display.get(3..).unwrap_or_default().trim_start_matches('/');
+    Some(format!("/mnt/{}/{rest}", drive.to_ascii_lowercase()))
+}
+
 fn wsl() -> Command {
     let mut command = Command::new("wsl.exe");
     command
@@ -147,6 +159,9 @@ fn wsl() -> Command {
         .arg("-d")
         .arg(configuration::load().distro)
         .arg("--exec");
+    if let Some(logs) = logs_dir_for_wsl() {
+        command.env("HERDR_NIGHT_WATCH_LOG_DIR", logs);
+    }
     command
 }
 

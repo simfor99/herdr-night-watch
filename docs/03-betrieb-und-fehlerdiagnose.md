@@ -79,7 +79,7 @@ Beim raschen Stoppen und erneuten Starten kann die alte WSL-Instanz noch wenige 
 | `FINISHED outcome=refused` | Fail-closed: keine eindeutige Grundlage für Shutdown |
 | `Shutdown warning cancelled` | Neue Herdr-Arbeit hat den Countdown abgebrochen; der Nachtlauf beobachtet weiter |
 | `Internet connection unavailable` | Fünfminütige Toleranzzeit für einen Verbindungs-Ausfall hat begonnen |
-| `COMPLETION HISTORY` | Abschluss wurde in `logs\\completion-history.csv` eingetragen |
+| `COMPLETION HISTORY` | Abschluss wurde in `logs\\completion-history.csv` neben der installierten EXE eingetragen. Fehlt der Eintrag, zuerst prüfen, ob der Wächter noch nach `C:\\Users\\Public\\HerdrNachtwaechter\\logs` geschrieben hat. |
 | `CANCELLATION HISTORY` | Abbruchquelle wurde in `logs\\cancellation-history.csv` eingetragen |
 
 ## Wiederherstellung nach einer Installation

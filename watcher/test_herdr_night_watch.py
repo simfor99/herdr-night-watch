@@ -716,6 +716,20 @@ class CompletionHistoryTests(unittest.TestCase):
             self.assertIn("live_window_moon", history)
             self.assertIn("run-test", history)
 
+    def test_windows_path_to_wsl_maps_user_profile(self) -> None:
+        self.assertEqual(
+            WATCHER.windows_path_to_wsl(r"C:\Users\Simon"),
+            Path("/mnt/c/Users/Simon"),
+        )
+        self.assertIsNone(WATCHER.windows_path_to_wsl("not-a-windows-path"))
+
+    def test_install_log_dir_prefers_env_then_installed_app(self) -> None:
+        with patch.dict("os.environ", {"HERDR_NIGHT_WATCH_LOG_DIR": "/tmp/night-watch-logs"}):
+            self.assertEqual(
+                WATCHER.default_windows_install_log_dir(),
+                Path("/tmp/night-watch-logs"),
+            )
+
 
 class DiagnosticLogTests(unittest.TestCase):
     def test_diagnostics_are_machine_readable_and_bounded(self) -> None:

@@ -3,6 +3,12 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-19] - Abschlussprotokoll zeigt den echten Shutdown
+
+### 🪟 Bedienung
+
+- **Gestern erscheint wieder** - Der Wächter schreibt Energieaktionen in denselben Ordner, den das Abschlussprotokoll liest. Ein Herunterfahren landet nicht mehr unsichtbar unter Public.
+
 ## [2026-08-19] - Fertig-Halo bleibt knackig
 
 ### 🪟 Bedienung

@@ -45,12 +45,39 @@ CONNECTIVITY_URLS = (
 )
 COMPLETION_HISTORY_LIMIT = 30
 DIAGNOSTIC_HISTORY_LIMIT = 500
-WINDOWS_INSTALL_LOG_DIR = Path(
-    os.environ.get(
-        "HERDR_NIGHT_WATCH_LOG_DIR",
-        "/mnt/c/Users/Public/HerdrNachtwaechter/logs",
-    )
-)
+def windows_path_to_wsl(path: str) -> Path | None:
+    cleaned = path.strip().strip('"')
+    if len(cleaned) < 3 or cleaned[1] != ":" or not cleaned[0].isalpha():
+        return None
+    rest = cleaned[3:].replace("\\", "/").lstrip("/")
+    return Path(f"/mnt/{cleaned[0].lower()}/{rest}")
+
+
+def default_windows_install_log_dir() -> Path:
+    env = os.environ.get("HERDR_NIGHT_WATCH_LOG_DIR")
+    if env:
+        return Path(env)
+    users = Path("/mnt/c/Users")
+    preferred = (os.environ.get("USER") or os.environ.get("USERNAME") or "").casefold()
+    discovered: list[Path] = []
+    if users.is_dir():
+        try:
+            children = list(users.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            apps = child / "Apps" / "HerdrNachtwaechter"
+            if apps.is_dir():
+                discovered.append(apps / "logs")
+    if discovered:
+        for candidate in discovered:
+            if preferred and candidate.parts and candidate.parts[-4].casefold() == preferred:
+                return candidate
+        return discovered[0]
+    return Path("/mnt/c/Users/Public/HerdrNachtwaechter/logs")
+
+
+WINDOWS_INSTALL_LOG_DIR = default_windows_install_log_dir()
 LIVE_MONITORING_SCOPE = "live_agents"
 DEFAULT_COMPLETION_ACTION = "shutdown"
 COMPLETION_ACTIONS = {"sleep", "shutdown"}
