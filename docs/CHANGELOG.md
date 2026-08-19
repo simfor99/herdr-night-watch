@@ -3,6 +3,12 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-19] - Temperatur bleibt auf dem Halbmond lesbar
+
+### 🪟 Bedienung
+
+- **Zahl mit Rand** - Die Temperatur sitzt mittig im Mond. Nur auf der hellen Sichel liegt ein ein Pixel breiter Rand in der Hintergrundfarbe, kein gestapelter Schatten mehr.
+
 ## [2026-08-19] - Live-Fenster beim EXE-Start v0.1.21
 
 ### 🪟 Bedienung

@@ -2340,9 +2340,11 @@ fn moon_icon(
             painter,
             rect,
             center,
+            radius,
             dark_side,
             separation,
             illumination,
+            gradient_color_at(gradient_rect, center),
             temperature_c,
         );
     }
@@ -2395,80 +2397,110 @@ fn paint_moon_shadow(
     ));
 }
 
+fn moon_temperature_label(temperature_c: f64) -> String {
+    format!("{temperature_c:.0}°C")
+}
+
+fn outline_width_in_points(pixels_per_point: f32) -> f32 {
+    1.0 / pixels_per_point.max(f32::EPSILON)
+}
+
+fn outline_offsets(width: f32) -> [(f32, f32); 16] {
+    let mut offsets = [(0.0, 0.0); 16];
+    for (step, offset) in offsets.iter_mut().enumerate() {
+        let angle = std::f32::consts::TAU * step as f32 / 16.0;
+        *offset = (width * angle.cos(), width * angle.sin());
+    }
+    offsets
+}
+
+fn lit_sickle_clip_rect(
+    moon_rect: egui::Rect,
+    center: egui::Pos2,
+    radius: f32,
+    dark_side: f32,
+    separation: f32,
+    illumination: f32,
+) -> Option<egui::Rect> {
+    if illumination <= 0.12 {
+        return None;
+    }
+    if illumination >= 0.88 {
+        return Some(moon_rect);
+    }
+    let split_x = center.x + dark_side * (separation - radius);
+    if dark_side > 0.0 {
+        Some(egui::Rect::from_min_max(
+            moon_rect.min,
+            egui::pos2(split_x, moon_rect.bottom()),
+        ))
+    } else {
+        Some(egui::Rect::from_min_max(
+            egui::pos2(split_x, moon_rect.top()),
+            moon_rect.max,
+        ))
+    }
+}
+
+fn paint_outlined_label(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    text: &str,
+    font: egui::FontId,
+    fill: egui::Color32,
+    outline: egui::Color32,
+) {
+    let width = outline_width_in_points(painter.pixels_per_point());
+    for (dx, dy) in outline_offsets(width) {
+        painter.text(
+            center + egui::vec2(dx, dy),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font.clone(),
+            outline,
+        );
+    }
+    painter.text(center, egui::Align2::CENTER_CENTER, text, font, fill);
+}
+
 fn paint_moon_temperature(
     painter: &egui::Painter,
     moon_rect: egui::Rect,
     center: egui::Pos2,
+    radius: f32,
     dark_side: f32,
     separation: f32,
     illumination: f32,
+    background: egui::Color32,
     temperature_c: f64,
 ) {
-    let position = egui::Align2::CENTER_CENTER;
-    let radius = moon_rect.width() * 0.5;
-    let text = format!("{temperature_c:.0}°C");
-    let dark_text = egui::Color32::from_rgb(24, 31, 47);
-    let light_text = egui::Color32::from_rgb(247, 241, 229);
-
-    if illumination <= 0.12 {
-        painter.text(
+    let text = moon_temperature_label(temperature_c);
+    let font = egui::FontId::proportional(15.0);
+    let fill = egui::Color32::from_rgb(247, 241, 229);
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        &text,
+        font.clone(),
+        fill,
+    );
+    if let Some(lit_rect) = lit_sickle_clip_rect(
+        moon_rect,
+        center,
+        radius,
+        dark_side,
+        separation,
+        illumination,
+    ) {
+        paint_outlined_label(
+            &painter.with_clip_rect(lit_rect),
             center,
-            position,
-            text,
-            egui::FontId::proportional(15.0),
-            light_text,
+            &text,
+            font,
+            fill,
+            background,
         );
-        return;
     }
-
-    if illumination >= 0.88 {
-        painter.text(
-            center,
-            position,
-            text,
-            egui::FontId::proportional(15.0),
-            dark_text,
-        );
-        return;
-    }
-
-    // For crescents and gibbous moons, keep the complete label in the dark
-    // overlap region. Its centre on the moon's horizontal axis is half-way
-    // between the two disc centres, which keeps all glyphs on the dark side.
-    let near_half_moon = (0.34..=0.88).contains(&illumination);
-    if !near_half_moon {
-        let dark_center = egui::pos2(center.x + dark_side * separation * 0.5, center.y);
-        painter.text(
-            dark_center,
-            position,
-            text,
-            egui::FontId::proportional(15.0),
-            light_text,
-        );
-        return;
-    }
-
-    // For a gibbous/half-moon view keep the label centred and colour each
-    // side independently at the actual terminator, not at an arbitrary
-    // midpoint between the two circle centres.
-    let split_x = center.x + dark_side * (separation - radius);
-    let left_clip =
-        egui::Rect::from_min_max(moon_rect.min, egui::pos2(split_x, moon_rect.bottom()));
-    let right_clip = egui::Rect::from_min_max(egui::pos2(split_x, moon_rect.top()), moon_rect.max);
-    let lit_is_left = dark_side > 0.0;
-    let lit_painter = if lit_is_left {
-        painter.with_clip_rect(left_clip)
-    } else {
-        painter.with_clip_rect(right_clip)
-    };
-    let dark_painter = if lit_is_left {
-        painter.with_clip_rect(right_clip)
-    } else {
-        painter.with_clip_rect(left_clip)
-    };
-    let font = egui::FontId::proportional(13.0);
-    lit_painter.text(center, position, text.clone(), font.clone(), dark_text);
-    dark_painter.text(center, position, text, font, light_text);
 }
 
 fn moon_disc_separation(illumination: f32) -> f32 {
@@ -3198,6 +3230,36 @@ fn configure_visuals(context: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moon_temperature_stays_whole_and_outlined() {
+        assert_eq!(moon_temperature_label(17.4), "17°C");
+        assert!((outline_width_in_points(1.0) - 1.0).abs() < f32::EPSILON);
+        assert!((outline_width_in_points(2.0) - 0.5).abs() < f32::EPSILON);
+        let offsets = outline_offsets(1.0);
+        assert_eq!(offsets.len(), 16);
+        for (dx, dy) in offsets {
+            let length = (dx * dx + dy * dy).sqrt();
+            assert!((length - 1.0).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn temperature_outline_covers_only_the_lit_sickle() {
+        let moon = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let center = moon.center();
+        assert_eq!(
+            lit_sickle_clip_rect(moon, center, 50.0, 1.0, 50.0, 0.05),
+            None
+        );
+        assert_eq!(
+            lit_sickle_clip_rect(moon, center, 50.0, 1.0, 50.0, 0.95),
+            Some(moon)
+        );
+        let half = lit_sickle_clip_rect(moon, center, 50.0, 1.0, 50.0, 0.5).unwrap();
+        assert!(half.right() <= center.x + 0.5);
+        assert!(half.left() <= moon.left());
+    }
 
     #[test]
     fn live_window_titles_are_recognized() {
