@@ -3,6 +3,25 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-20] - Neustart setzt den Nachtlauf wirklich zurück
+
+### 🛡️ Sicherheit
+
+- **Kein roter Mond nach dem Boot** - Ein abgeschlossener Lauf wird nach einer
+  neuen WSL-/Windows-Bootmarke aus dem aktuellen Zustand entfernt. Die
+  Abschlusschronik bleibt erhalten, aber der nächste Start beginnt wieder im
+  normalen Zustand.
+
+### 🪟 Bedienung
+
+- **Live-Fenster bleibt offen** - Wenn eine zweite EXE-Instanz den Status öffnet,
+  gehört das Fenster jetzt dem bereits laufenden Tray-Prozess. Die kurzlebige
+  Zweitinstanz kann daher nicht mehr das sichtbare Fenster nach wenigen
+  Millisekunden mit sich schließen.
+- **Autostart repariert Altinstallationen** - Der Tray ergänzt beim Start den
+  `--autostart`-Marker in einem älteren Windows-Run-Eintrag, damit die
+  Einstellung für „Live-Fenster beim Start öffnen“ zuverlässig greift.
+
 ## [2026-08-19] - Abschlussprotokoll zeigt den echten Shutdown
 
 ### 🪟 Bedienung

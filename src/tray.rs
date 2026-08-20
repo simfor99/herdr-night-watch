@@ -58,11 +58,15 @@ pub fn run() -> Result<()> {
     let instance_mutex = match acquire_tray_instance()? {
         Some(handle) => handle,
         None => {
-            let _ = live_status::open();
+            let _ = live_status::open_from_secondary_instance();
             thread::sleep(SECOND_INSTANCE_HANDOFF);
             return Ok(());
         }
     };
+    // Older installations may contain a bare EXE path in the Run key. Keep
+    // the startup marker aligned with the current executable before the tray
+    // decides how to handle the live window.
+    let _ = autostart::normalize_if_enabled();
     let event_loop: EventLoop<Wake> = EventLoop::with_user_event().build()?;
     let proxy: EventLoopProxy<Wake> = event_loop.create_proxy();
     let (result_tx, result_rx) = mpsc::channel();

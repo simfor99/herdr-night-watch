@@ -229,33 +229,62 @@ def reset_stale_run_after_restart(
         current_boot_id = runtime_boot_id(force=force)
     if not current_boot_id:
         return False
+    completed_run_id: str | None = None
     with completion_lock():
         state = load_json(state_path)
-        if not state or state.get("outcome"):
+        if not state:
             return False
         previous_boot_id = state.get("boot_id")
-        reset_reason: str | None = None
-        if previous_boot_id and previous_boot_id != current_boot_id:
-            reset_reason = "boot_id_changed"
-        elif not previous_boot_id:
-            # Runs created by watcher schema 3 predate persisted boot markers.
-            # Only clear them when their armed time is demonstrably before the
-            # current Windows boot. This keeps a normal watcher restart on the
-            # same machine from cancelling a still-valid legacy run.
-            armed_at = parse_time(state.get("armed_at"))
+        if state.get("outcome"):
+            # Completion history is already persisted separately. Once the
+            # machine has booted again, the previous finished run must no
+            # longer be exposed as the current night-watch state.
+            completed_at = parse_time(state.get("finished_at")) or parse_time(
+                state.get("armed_at")
+            )
             current_windows_boot = windows_boot_time_from_marker(current_boot_id)
-            if armed_at and current_windows_boot and armed_at < current_windows_boot:
-                reset_reason = "legacy_state_after_reboot"
-        if not reset_reason:
-            return False
+            completed_before_current_boot = bool(
+                completed_at
+                and current_windows_boot
+                and completed_at < current_windows_boot
+            )
+            if (previous_boot_id and previous_boot_id != current_boot_id) or (
+                not previous_boot_id and completed_before_current_boot
+            ):
+                completed_run_id = str(state.get("run_id", "unknown"))
+                state_path.unlink(missing_ok=True)
+                warning_path.unlink(missing_ok=True)
+            else:
+                return False
+        if completed_run_id is None:
+            reset_reason: str | None = None
+            if previous_boot_id and previous_boot_id != current_boot_id:
+                reset_reason = "boot_id_changed"
+            elif not previous_boot_id:
+                # Runs created by watcher schema 3 predate persisted boot markers.
+                # Only clear them when their armed time is demonstrably before the
+                # current Windows boot. This keeps a normal watcher restart on the
+                # same machine from cancelling a still-valid legacy run.
+                armed_at = parse_time(state.get("armed_at"))
+                current_windows_boot = windows_boot_time_from_marker(current_boot_id)
+                if armed_at and current_windows_boot and armed_at < current_windows_boot:
+                    reset_reason = "legacy_state_after_reboot"
+            if not reset_reason:
+                return False
 
-        run_id = str(state.get("run_id", "unknown"))
-        state["outcome"] = "reset_after_restart"
-        state["finished_at"] = iso_now()
-        state["detail"] = "night watch reset after WSL/Windows restart"
-        state["reset_reason"] = reset_reason
-        write_json(state_path, state)
-        warning_path.unlink(missing_ok=True)
+            run_id = str(state.get("run_id", "unknown"))
+            state["outcome"] = "reset_after_restart"
+            state["finished_at"] = iso_now()
+            state["detail"] = "night watch reset after WSL/Windows restart"
+            state["reset_reason"] = reset_reason
+            write_json(state_path, state)
+            warning_path.unlink(missing_ok=True)
+    if completed_run_id is not None:
+        log(
+            f"RESET completed run={completed_run_id} after WSL/Windows restart; "
+            "current night watch state cleared"
+        )
+        return True
     try:
         record_cancellation("system_restart", run_id)
     except (OSError, UnicodeError, csv.Error) as error:

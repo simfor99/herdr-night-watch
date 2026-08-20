@@ -31,3 +31,13 @@ pub fn set_enabled(on: bool) -> Result<()> {
     }
     Ok(())
 }
+
+/// Repair an older Run entry that still points at the app without the
+/// `--autostart` marker. The marker is how the tray distinguishes a Windows
+/// logon launch from a manual launch.
+pub fn normalize_if_enabled() -> Result<()> {
+    if enabled() {
+        set_enabled(true)?;
+    }
+    Ok(())
+}

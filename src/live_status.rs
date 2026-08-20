@@ -41,6 +41,8 @@ const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_WINDOW_START_ATTEMPTS: usize = 2;
 const LIVE_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
+const PRIMARY_TRAY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const PRIMARY_TRAY_DISCOVERY_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_INSTANCE_MUTEX: &str = "Local\\HerdrNachtwaechter.LiveStatus";
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
 const ACCENT_STRONG: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
@@ -78,6 +80,21 @@ const MOON_RIGHT_INSET: f32 = 34.0;
 const KPI_PANEL_WIDTH: f32 = 264.0;
 
 pub fn open() -> Result<()> {
+    open_with_owner(Some(current_pid()))
+}
+
+/// Open the live window from a secondary tray invocation while keeping the
+/// long-lived tray process as its owner. A second tray process only exists to
+/// hand the request to the primary instance and exits shortly afterwards.
+pub fn open_from_secondary_instance() -> Result<()> {
+    // During Windows logon the primary tray process can exist before its
+    // helper window is registered. Wait briefly so the live window is owned
+    // by the long-lived tray process instead of the short-lived secondary
+    // invocation.
+    open_with_owner(find_primary_tray_pid_with_retry())
+}
+
+fn open_with_owner(owner_pid: Option<u32>) -> Result<()> {
     if let Some(hwnd) = find_existing_live_window() {
         apply_taskbar_visibility(hwnd);
         activate_live_window(hwnd);
@@ -90,7 +107,7 @@ pub fn open() -> Result<()> {
 
     let executable =
         std::env::current_exe().context("Programmdatei konnte nicht bestimmt werden")?;
-    let child = match spawn_live_status_process(&executable) {
+    let child = match spawn_live_status_process(&executable, owner_pid) {
         Ok(child) => child,
         Err(error) => {
             finish_open_spawn();
@@ -155,7 +172,7 @@ pub fn open() -> Result<()> {
                 thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
             }
             thread::sleep(LIVE_WINDOW_RETRY_DELAY);
-            child = match spawn_live_status_process(&executable) {
+            child = match spawn_live_status_process(&executable, owner_pid) {
                 Ok(child) => child,
                 Err(error) => {
                     record_open_failure(&format!(
@@ -207,13 +224,72 @@ pub fn close() {
     }
 }
 
-fn spawn_live_status_process(executable: &Path) -> Result<Child> {
-    Command::new(executable)
+fn spawn_live_status_process(executable: &Path, owner_pid: Option<u32>) -> Result<Child> {
+    let mut command = Command::new(executable);
+    command
         .creation_flags(CREATE_NO_WINDOW)
-        .arg("--live-status")
-        .arg(format!("{OWNER_PID_PREFIX}{}", std::process::id()))
+        .arg("--live-status");
+    if let Some(owner_pid) = owner_pid {
+        command.arg(format!("{OWNER_PID_PREFIX}{owner_pid}"));
+    }
+    command
         .spawn()
         .context("Live-Status-Fenster konnte nicht gestartet werden")
+}
+
+fn find_primary_tray_pid() -> Option<u32> {
+    let mut search = TrayWindowQuery { pid: None };
+    unsafe {
+        let _ = EnumWindows(
+            Some(find_primary_tray_window_callback),
+            &mut search as *mut _ as LPARAM,
+        );
+    }
+    search.pid
+}
+
+fn find_primary_tray_pid_with_retry() -> Option<u32> {
+    retry_primary_tray_pid(
+        find_primary_tray_pid,
+        PRIMARY_TRAY_DISCOVERY_TIMEOUT,
+        PRIMARY_TRAY_DISCOVERY_INTERVAL,
+    )
+}
+
+fn retry_primary_tray_pid<F>(mut find_pid: F, timeout: Duration, interval: Duration) -> Option<u32>
+where
+    F: FnMut() -> Option<u32>,
+{
+    let started_at = Instant::now();
+    loop {
+        if let Some(pid) = find_pid() {
+            return Some(pid);
+        }
+        if started_at.elapsed() >= timeout {
+            return None;
+        }
+        thread::sleep(interval);
+    }
+}
+
+struct TrayWindowQuery {
+    pid: Option<u32>,
+}
+
+unsafe extern "system" fn find_primary_tray_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    unsafe {
+        let search = &mut *(lparam as *mut TrayWindowQuery);
+        if window_class(hwnd) != "tray_icon_app" {
+            return 1;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != 0 && pid != current_pid() && process_image_is_this_app(pid) {
+            search.pid = Some(pid);
+            return 0;
+        }
+    }
+    1
 }
 
 fn parse_owner_pid<I, S>(arguments: I) -> Option<u32>
@@ -3291,6 +3367,21 @@ mod tests {
         assert_eq!(parse_owner_pid(["--live-status"]), None);
         assert_eq!(parse_owner_pid(["--owner-pid=0"]), None);
         assert_eq!(parse_owner_pid(["--owner-pid=abc"]), None);
+    }
+
+    #[test]
+    fn secondary_open_retries_until_primary_tray_is_registered() {
+        let mut attempts = 0;
+        let pid = retry_primary_tray_pid(
+            || {
+                attempts += 1;
+                (attempts >= 3).then_some(3648)
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        );
+        assert_eq!(pid, Some(3648));
+        assert_eq!(attempts, 3);
     }
 
     #[test]
