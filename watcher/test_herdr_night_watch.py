@@ -390,6 +390,10 @@ class RestartResetTests(unittest.TestCase):
                 WATCHER.windows_boot_id(), "2026-08-20T04:21:17.5000000Z"
             )
         self.assertEqual(run.call_count, 2)
+        first_query = run.call_args_list[0].args[0][-1]
+        fallback_query = run.call_args_list[1].args[0][-1]
+        self.assertIn("Get-CimInstance Win32_OperatingSystem", first_query)
+        self.assertIn("Get-WmiObject Win32_OperatingSystem", fallback_query)
         record_diagnostic.assert_called_once_with(
             "WINDOWS_BOOT_MARKER_FALLBACK", method="legacy_wmi"
         )
