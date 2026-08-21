@@ -851,6 +851,12 @@ struct LiveStatusApp {
     owner_pid: Option<u32>,
 }
 
+impl Drop for LiveStatusApp {
+    fn drop(&mut self) {
+        let _ = self.media_command_tx.send(MediaCommand::Shutdown);
+    }
+}
+
 impl LiveStatusApp {
     fn new(scale: f32, owner_pid: Option<u32>) -> Self {
         let (status_tx, status_rx) = mpsc::channel();
@@ -2840,7 +2846,8 @@ fn media_info_row(
     let track_width = (track_right - track_left).max(1.0);
     let duration = media.end_100ns.saturating_sub(media.start_100ns);
     let progress = if media.seek_enabled && duration > 0 {
-        ((media.position_100ns - media.start_100ns) as f32 / duration as f32).clamp(0.0, 1.0)
+        ((media.current_position_100ns() - media.start_100ns) as f32 / duration as f32)
+            .clamp(0.0, 1.0)
     } else {
         0.0
     };
