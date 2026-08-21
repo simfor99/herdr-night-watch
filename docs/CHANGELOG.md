@@ -3,6 +3,21 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-21] - Medienanzeige ohne Dauerlast v0.1.23
+
+### 🎵 Live-Status
+
+- **Spotify bleibt leichtfüßig** - Der Nachtwächter reagiert auf Änderungen der
+  Windows-Mediensitzung, statt den Medienmanager im Dreiviertelsekundentakt
+  neu anzufragen. Das entlastet insbesondere Spotify und den Windows-
+  Sitzungs-Manager bei offenem Live-Fenster.
+- **Timeline bleibt flüssig und klickbar** - Die Anzeige rechnet den
+  sichtbaren Fortschritt lokal fort und holt Windows-Informationen nur bei
+  echten Änderungen sowie in einem sparsamen Sicherheitsintervall nach.
+- **Verbindung bleibt robust** - Temporäre Windows-Fehler halten die zuletzt
+  bekannte Medienanzeige fest und werden zeitnah erneut versucht. Beim
+  Schließen des Live-Fensters werden die Medien-Ereignisse sauber abgemeldet.
+
 ## [2026-08-20] - Neustart setzt den Nachtlauf wirklich zurück
 
 ### 🛡️ Sicherheit
