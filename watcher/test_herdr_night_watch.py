@@ -375,6 +375,29 @@ class RestartResetTests(unittest.TestCase):
                 "wsl:wsl-boot|windows:2026-08-15T05:00:00Z",
             )
 
+    def test_windows_boot_id_falls_back_when_cim_is_temporarily_unavailable(self) -> None:
+        wmi_failure = WATCHER.subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="WMI unavailable"
+        )
+        legacy_wmi_fallback = WATCHER.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="2026-08-20T04:21:17.5000000Z\n", stderr=""
+        )
+        with (
+            patch.object(WATCHER.subprocess, "run", side_effect=[wmi_failure, legacy_wmi_fallback]) as run,
+            patch.object(WATCHER, "record_diagnostic") as record_diagnostic,
+        ):
+            self.assertEqual(
+                WATCHER.windows_boot_id(), "2026-08-20T04:21:17.5000000Z"
+            )
+        self.assertEqual(run.call_count, 2)
+        first_query = run.call_args_list[0].args[0][-1]
+        fallback_query = run.call_args_list[1].args[0][-1]
+        self.assertIn("Get-CimInstance Win32_OperatingSystem", first_query)
+        self.assertIn("Get-WmiObject Win32_OperatingSystem", fallback_query)
+        record_diagnostic.assert_called_once_with(
+            "WINDOWS_BOOT_MARKER_FALLBACK", method="legacy_wmi"
+        )
+
     def test_runtime_boot_id_requires_both_boot_markers(self) -> None:
         with (
             patch.object(WATCHER, "wsl_boot_id", return_value="wsl-boot"),

@@ -141,24 +141,41 @@ def wsl_boot_id() -> str | None:
 
 def windows_boot_id() -> str | None:
     """Return Windows' last boot time when this watcher runs inside WSL."""
-    try:
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    value = result.stdout.strip()
-    return value if result.returncode == 0 and value else None
+    queries = (
+        (
+            "cim",
+            "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')",
+        ),
+        (
+            "legacy_wmi",
+            "$os=Get-WmiObject Win32_OperatingSystem; "
+            "[System.Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime).ToUniversalTime().ToString('o')",
+        ),
+    )
+    for index, (method, query) in enumerate(queries):
+        try:
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    query,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        value = result.stdout.strip()
+        if result.returncode == 0 and value:
+            if index > 0:
+                record_diagnostic("WINDOWS_BOOT_MARKER_FALLBACK", method=method)
+            return value
+    record_diagnostic("WINDOWS_BOOT_MARKER_UNAVAILABLE")
+    return None
 
 
 def runtime_boot_id(force: bool = False) -> str | None:
