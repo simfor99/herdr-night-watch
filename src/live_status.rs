@@ -852,18 +852,21 @@ impl WorkArea {
         x >= self.left && x < self.right && y >= self.top && y < self.bottom
     }
 
-    fn distance_squared(&self, x: i32, y: i32) -> i64 {
+    fn distance_squared(&self, x: i32, y: i32) -> i128 {
+        // Compute deltas and squares in i128: extreme saved coordinates
+        // (for example a corrupted registry value saturating to i32::MIN)
+        // overflow i32 arithmetic before the distance is even compared.
         let dx = if x < self.left {
-            (self.left - x) as i64
+            i128::from(self.left) - i128::from(x)
         } else if x >= self.right {
-            (x - self.right + 1) as i64
+            i128::from(x) - i128::from(self.right) + 1
         } else {
             0
         };
         let dy = if y < self.top {
-            (self.top - y) as i64
+            i128::from(self.top) - i128::from(y)
         } else if y >= self.bottom {
-            (y - self.bottom + 1) as i64
+            i128::from(y) - i128::from(self.bottom) + 1
         } else {
             0
         };
@@ -3612,6 +3615,30 @@ mod tests {
         assert_eq!(
             clamp_live_position(Some([f32::NAN, 10.0]), [393.0, 190.0], &areas),
             None
+        );
+    }
+
+    #[test]
+    fn extreme_coordinates_pick_the_nearest_area_without_overflow() {
+        let areas = [
+            WorkArea {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1392,
+            },
+            WorkArea {
+                left: -2560,
+                top: 0,
+                right: 0,
+                bottom: 1392,
+            },
+        ];
+        // f32::MIN saturates to i32::MIN on the cast; the left monitor stays
+        // the nearest one and the arithmetic must not overflow.
+        assert_eq!(
+            clamp_live_position(Some([f32::MIN, 20.0]), [393.0, 190.0], &areas),
+            Some([-2560.0, 20.0])
         );
     }
 
