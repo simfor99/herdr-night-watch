@@ -187,7 +187,12 @@ fn open_with_owner(owner_pid: Option<u32>) -> Result<()> {
             }
             thread::sleep(LIVE_WINDOW_RETRY_DELAY);
             child = match spawn_live_status_process(&executable, owner_pid) {
-                Ok(child) => child,
+                Ok(child) => {
+                    // Register the replacement immediately so a concurrent
+                    // close() cannot miss it before the loop restarts.
+                    remember_open_child(child.id());
+                    child
+                }
                 Err(error) => {
                     record_open_failure(&format!(
                         "Live-Status-Prozess konnte beim Wiederholungsversuch nicht gestartet werden: {error}"
@@ -620,30 +625,34 @@ fn stale_live_child_pid() -> Option<u32> {
 }
 
 fn process_image_is_current_exe(pid: u32) -> bool {
-    let Ok(expected) = std::env::current_exe() else {
-        return false;
-    };
-    let expected = expected.to_string_lossy().to_lowercase();
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
             return false;
         }
-        let mut buffer = [0u16; 1024];
-        let mut length = buffer.len() as u32;
-        let ok = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_WIN32,
-            buffer.as_mut_ptr(),
-            &mut length,
-        );
+        let matches = process_handle_is_current_exe(handle);
         let _ = CloseHandle(handle);
-        if ok == 0 {
-            return false;
-        }
-        let image = String::from_utf16_lossy(&buffer[..length as usize]);
-        image.to_lowercase() == expected
+        matches
     }
+}
+
+/// Validate the image path on one already-opened process handle so the check
+/// and a later termination cannot drift apart across a recycled PID.
+fn process_handle_is_current_exe(handle: HANDLE) -> bool {
+    let Ok(expected) = std::env::current_exe() else {
+        return false;
+    };
+    let expected = expected.to_string_lossy().to_lowercase();
+    let mut buffer = [0u16; 1024];
+    let mut length = buffer.len() as u32;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut length)
+    };
+    if ok == 0 {
+        return false;
+    }
+    let image = String::from_utf16_lossy(&buffer[..length as usize]);
+    image.to_lowercase() == expected
 }
 
 fn finish_open_spawn() {
@@ -681,11 +690,19 @@ fn terminate_pid(pid: u32) {
         return;
     }
     unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        let handle = OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        );
         if handle.is_null() {
             return;
         }
-        let _ = TerminateProcess(handle, 0);
+        // Terminate only the exact process that was opened: a recycled PID
+        // running a different image is never killed.
+        if process_handle_is_current_exe(handle) {
+            let _ = TerminateProcess(handle, 0);
+        }
         let _ = CloseHandle(handle);
     }
 }
@@ -874,16 +891,16 @@ fn clamp_live_position(
     }
     let x = sx.round() as i32;
     let y = sy.round() as i32;
-    if areas.iter().any(|area| area.contains(x, y)) {
-        return saved;
-    }
     let width = window_size[0].round().max(1.0) as i32;
     let height = window_size[1].round().max(1.0) as i32;
-    let nearest = areas
+    // Clamp even when the origin itself sits inside an area: a large window
+    // can still stick out over the monitor edge from an inside origin.
+    let area = areas
         .iter()
-        .min_by_key(|area| area.distance_squared(x, y))
+        .find(|area| area.contains(x, y))
+        .or_else(|| areas.iter().min_by_key(|area| area.distance_squared(x, y)))
         .expect("areas is not empty");
-    let [cx, cy] = nearest.clamp_position(x, y, width, height);
+    let [cx, cy] = area.clamp_position(x, y, width, height);
     Some([cx as f32, cy as f32])
 }
 
@@ -3558,6 +3575,23 @@ mod tests {
         }];
         assert_eq!(
             clamp_live_position(Some([900.0, 150.0]), [393.0, 190.0], &areas),
+            Some([0.0, 10.0])
+        );
+    }
+
+    #[test]
+    fn origin_inside_an_area_still_clamps_an_oversized_window() {
+        let areas = [WorkArea {
+            left: 0,
+            top: 0,
+            right: 300,
+            bottom: 200,
+        }];
+        // The origin is inside the area, but a 393 px wide window would stick
+        // out over the right edge, so the window is pulled back inside on
+        // both axes.
+        assert_eq!(
+            clamp_live_position(Some([150.0, 41.0]), [393.0, 190.0], &areas),
             Some([0.0, 10.0])
         );
     }

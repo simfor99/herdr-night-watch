@@ -18,7 +18,7 @@
 - **Fenster bleibt im Bild** - Die gespeicherte Fensterposition wird beim
   Öffnen geprüft. Fehlt der Monitor, auf dem das Fenster zuletzt lag, wandert
   es auf den nächsten vorhandenen Bildschirm und merkt sich den neuen Platz.
-- **Kein Waisenfenster beim Beenden** - Beendet du die Tray-App, nimmt sie das
+- **Kein Waisenfenster beim Beenden** - Beendest du die Tray-App, nimmt sie das
   Live-Fenster jetzt auch dann mit, wenn das Öffnen längst abgeschlossen war.
 
 ## [2026-08-21] - Medienanzeige ohne Dauerlast v0.1.23

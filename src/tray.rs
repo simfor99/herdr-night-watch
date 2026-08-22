@@ -3,6 +3,7 @@ use crate::{
     tray_history, weather_location, window_settings,
 };
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,6 +41,13 @@ const SECOND_INSTANCE_HANDOFF: Duration = Duration::from_millis(400);
 // and hung first children that then blocked the instance mutex. When Windows
 // logon started the tray, give the desktop a moment before the first open.
 const LOGON_LIVE_OPEN_DELAY: Duration = Duration::from_secs(15);
+// Set by the quit path so the delayed logon opener cannot reopen the live
+// window after the tray already closed it.
+static LOGON_OPEN_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+fn logon_open_cancellation_flag() -> &'static AtomicBool {
+    &LOGON_OPEN_CANCELLED
+}
 
 #[derive(Clone, Copy)]
 struct Wake;
@@ -104,9 +112,15 @@ pub fn run() -> Result<()> {
     let launched_for_logon = launched_by_windows_logon(std::env::args());
     if should_open_live_on_launch(launched_for_logon, window_settings::live_status_on_start()) {
         if let Some(delay) = live_open_delay(launched_for_logon) {
+            let cancelled = logon_open_cancellation_flag();
             thread::spawn(move || {
                 thread::sleep(delay);
-                let _ = live_status::open();
+                // A tray quit during the delay must not reopen the live child
+                // after close() already ran. The child's owner check is the
+                // second line of defense; this flag closes the main window.
+                if !cancelled.load(Ordering::SeqCst) {
+                    let _ = live_status::open();
+                }
             });
         } else {
             let _ = live_status::open();
@@ -412,6 +426,7 @@ impl App {
                     // running night watch behind when its only warning surface exits.
                     let _ = backend::stop("tray_app_quit");
                 }
+                LOGON_OPEN_CANCELLED.store(true, Ordering::SeqCst);
                 live_status::close();
                 tray_history::finish_session();
                 event_loop.exit();
