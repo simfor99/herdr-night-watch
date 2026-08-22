@@ -254,11 +254,7 @@ fn load_entries() -> Result<(Vec<LogEntry>, Vec<LogEntry>)> {
         .cloned()
         .collect::<Vec<_>>();
     let mut tray_entries = load_entries_from(&paths[1])?;
-    tray_entries.extend(
-        completion_entries
-            .into_iter()
-            .filter(|entry| is_tray_entry(entry)),
-    );
+    tray_entries.extend(completion_entries.into_iter().filter(is_tray_entry));
     for entries in [&mut energy_entries, &mut tray_entries] {
         entries.sort_unstable_by(|left, right| right.timestamp.cmp(&left.timestamp));
         entries.truncate(30);
