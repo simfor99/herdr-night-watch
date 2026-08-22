@@ -3,6 +3,7 @@ use crate::{
     tray_history, weather_location, window_settings,
 };
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +36,18 @@ const ID_WINDOW_LEVEL_TOP: &str = "window_level_top";
 const ID_WINDOW_LEVEL_BOTTOM: &str = "window_level_bottom";
 const TRAY_INSTANCE_MUTEX: &str = "Local\\HerdrNachtwaechter.Tray";
 const SECOND_INSTANCE_HANDOFF: Duration = Duration::from_millis(400);
+// After a fresh boot the graphics driver and the desktop compositor are still
+// waking up. Opening the live window immediately produced white flash windows
+// and hung first children that then blocked the instance mutex. When Windows
+// logon started the tray, give the desktop a moment before the first open.
+const LOGON_LIVE_OPEN_DELAY: Duration = Duration::from_secs(15);
+// Set by the quit path so the delayed logon opener cannot reopen the live
+// window after the tray already closed it.
+static LOGON_OPEN_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+fn logon_open_cancellation_flag() -> &'static AtomicBool {
+    &LOGON_OPEN_CANCELLED
+}
 
 #[derive(Clone, Copy)]
 struct Wake;
@@ -96,11 +109,22 @@ pub fn run() -> Result<()> {
         .with_menu_on_left_click(false)
         .build()?;
     tray_history::start_session();
-    if should_open_live_on_launch(
-        launched_by_windows_logon(std::env::args()),
-        window_settings::live_status_on_start(),
-    ) {
-        let _ = live_status::open();
+    let launched_for_logon = launched_by_windows_logon(std::env::args());
+    if should_open_live_on_launch(launched_for_logon, window_settings::live_status_on_start()) {
+        if let Some(delay) = live_open_delay(launched_for_logon) {
+            let cancelled = logon_open_cancellation_flag();
+            thread::spawn(move || {
+                thread::sleep(delay);
+                // A tray quit during the delay must not reopen the live child
+                // after close() already ran. The child's owner check is the
+                // second line of defense; this flag closes the main window.
+                if !cancelled.load(Ordering::SeqCst) {
+                    let _ = live_status::open();
+                }
+            });
+        } else {
+            let _ = live_status::open();
+        }
     }
     let mut app = App {
         language,
@@ -143,6 +167,10 @@ where
 
 fn should_open_live_on_launch(from_windows_logon: bool, setting_enabled: bool) -> bool {
     !from_windows_logon || setting_enabled
+}
+
+fn live_open_delay(from_windows_logon: bool) -> Option<Duration> {
+    from_windows_logon.then_some(LOGON_LIVE_OPEN_DELAY)
 }
 
 fn acquire_tray_instance() -> Result<Option<HANDLE>> {
@@ -398,6 +426,7 @@ impl App {
                     // running night watch behind when its only warning surface exits.
                     let _ = backend::stop("tray_app_quit");
                 }
+                LOGON_OPEN_CANCELLED.store(true, Ordering::SeqCst);
                 live_status::close();
                 tray_history::finish_session();
                 event_loop.exit();
@@ -906,7 +935,20 @@ fn icon_for(status: &backend::WatchStatus) -> Result<Icon> {
 
 #[cfg(test)]
 mod tests {
-    use super::{launched_by_windows_logon, should_open_live_on_launch};
+    use super::{
+        LOGON_LIVE_OPEN_DELAY, launched_by_windows_logon, live_open_delay,
+        should_open_live_on_launch,
+    };
+
+    #[test]
+    fn logon_launch_defers_the_first_live_open() {
+        assert_eq!(live_open_delay(true), Some(LOGON_LIVE_OPEN_DELAY));
+    }
+
+    #[test]
+    fn manual_launch_opens_the_live_window_immediately() {
+        assert_eq!(live_open_delay(false), None);
+    }
 
     #[test]
     fn double_clicked_exe_opens_the_live_window() {
