@@ -3,6 +3,24 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-22] - Live-Fenster übersteht den Morgen nach dem Shutdown v0.1.24
+
+### 🪟 Live-Status
+
+- **Kein weißes Blitzen nach dem Boot** - Öffnet der Nachtwächter das
+  Live-Fenster direkt bei der Windows-Anmeldung, wartet er jetzt kurz, bis
+  Grafiktreiber und Bildschirme wach sind. Das beendet die kurzen weißen
+  Fenster, die nach einem Nachtwächter-Shutdown sofort wieder verschwanden.
+- **Verklemmter Erstversuch wird beseitigt** - Blieb der erste Fensterprozess
+  nach dem Boot ohne sichtbares Fenster hängen, blockierte er dauerhaft jede
+  weitere Öffnung. Der Tray erkennt so einen Altprozess jetzt, räumt ihn weg
+  und startet einen frischen Versuch.
+- **Fenster bleibt im Bild** - Die gespeicherte Fensterposition wird beim
+  Öffnen geprüft. Fehlt der Monitor, auf dem das Fenster zuletzt lag, wandert
+  es auf den nächsten vorhandenen Bildschirm und merkt sich den neuen Platz.
+- **Kein Waisenfenster beim Beenden** - Beendet du die Tray-App, nimmt sie das
+  Live-Fenster jetzt auch dann mit, wenn das Öffnen längst abgeschlossen war.
+
 ## [2026-08-21] - Medienanzeige ohne Dauerlast v0.1.23
 
 ### 🎵 Live-Status

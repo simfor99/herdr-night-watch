@@ -22,8 +22,11 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GetLastError, HANDLE, HWND, LPARAM, RECT};
+use windows_sys::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess,
+    CreateMutexW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
     TerminateProcess,
 };
@@ -66,6 +69,7 @@ const LIVE_WINDOW_MIN_READY_HEIGHT: i32 = 40;
 const STILL_ACTIVE: u32 = 259;
 const OPEN_SPAWN_DEBOUNCE: Duration = Duration::from_millis(750);
 const LIVE_WINDOW_CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
+const LIVE_INSTANCE_RELEASE_DELAY: Duration = Duration::from_millis(300);
 const OWNER_PID_PREFIX: &str = "--owner-pid=";
 
 struct OpenAttempt {
@@ -74,6 +78,9 @@ struct OpenAttempt {
 }
 
 static OPEN_ATTEMPT: Mutex<Option<OpenAttempt>> = Mutex::new(None);
+// The pid of the most recently spawned live child, kept beyond the open
+// attempt so later opens and a tray quit can still clean it up.
+static LAST_LIVE_CHILD_PID: Mutex<Option<u32>> = Mutex::new(None);
 const MOON_SLOT_WIDTH: f32 = 77.0;
 const MOON_ICON_DIAMETER: f32 = 59.5;
 const MOON_RIGHT_INSET: f32 = 34.0;
@@ -103,6 +110,13 @@ fn open_with_owner(owner_pid: Option<u32>) -> Result<()> {
 
     if !begin_open_spawn() {
         return Ok(());
+    }
+
+    if let Some(stale_pid) = stale_live_child_pid() {
+        terminate_pid(stale_pid);
+        // Give Windows a moment to release the instance mutex of the
+        // terminated child before the replacement claims it.
+        thread::sleep(LIVE_INSTANCE_RELEASE_DELAY);
     }
 
     let executable =
@@ -201,6 +215,13 @@ pub fn close() {
     if let Ok(gate) = OPEN_ATTEMPT.lock()
         && let Some(pid) = gate.as_ref().and_then(|attempt| attempt.child_pid)
     {
+        pids.push(pid);
+    }
+    if let Ok(last) = LAST_LIVE_CHILD_PID.lock()
+        && let Some(pid) = *last
+    {
+        // Even after the open attempt finished, the spawned child belongs to
+        // this tray and must not outlive the quit.
         pids.push(pid);
     }
     pids.retain(|pid| *pid != 0 && *pid != current_pid());
@@ -575,10 +596,53 @@ fn begin_open_spawn() -> bool {
 }
 
 fn remember_open_child(pid: u32) {
+    if let Ok(mut last) = LAST_LIVE_CHILD_PID.lock() {
+        *last = Some(pid);
+    }
     if let Ok(mut gate) = OPEN_ATTEMPT.lock()
         && let Some(existing) = gate.as_mut()
     {
         existing.child_pid = Some(pid);
+    }
+}
+
+/// A hung live child without a window keeps owning the instance mutex, so
+/// every later open attempt exits immediately with code 0. After a reboot the
+/// graphics driver can hang exactly that first child in surface creation.
+/// When there is no live window and no open attempt running, the last known
+/// child is stale and terminating it frees the mutex for a fresh attempt.
+fn stale_live_child_pid() -> Option<u32> {
+    let pid = (*LAST_LIVE_CHILD_PID.lock().ok()?)?;
+    if pid == 0 || pid == current_pid() || !process_is_running(pid) {
+        return None;
+    }
+    process_image_is_current_exe(pid).then_some(pid)
+}
+
+fn process_image_is_current_exe(pid: u32) -> bool {
+    let Ok(expected) = std::env::current_exe() else {
+        return false;
+    };
+    let expected = expected.to_string_lossy().to_lowercase();
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut buffer = [0u16; 1024];
+        let mut length = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            buffer.as_mut_ptr(),
+            &mut length,
+        );
+        let _ = CloseHandle(handle);
+        if ok == 0 {
+            return false;
+        }
+        let image = String::from_utf16_lossy(&buffer[..length as usize]);
+        image.to_lowercase() == expected
     }
 }
 
@@ -756,6 +820,113 @@ fn acquire_live_instance() -> Result<Option<HANDLE>> {
     }
 }
 
+/// Visible working area of one monitor in desktop coordinates. Coordinates
+/// can be negative when a monitor is placed left of or above the primary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkArea {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl WorkArea {
+    fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+
+    fn distance_squared(&self, x: i32, y: i32) -> i64 {
+        let dx = if x < self.left {
+            (self.left - x) as i64
+        } else if x >= self.right {
+            (x - self.right + 1) as i64
+        } else {
+            0
+        };
+        let dy = if y < self.top {
+            (self.top - y) as i64
+        } else if y >= self.bottom {
+            (y - self.bottom + 1) as i64
+        } else {
+            0
+        };
+        dx * dx + dy * dy
+    }
+
+    fn clamp_position(&self, x: i32, y: i32, width: i32, height: i32) -> [i32; 2] {
+        let max_x = (self.right - width).max(self.left);
+        let max_y = (self.bottom - height).max(self.top);
+        [x.clamp(self.left, max_x), y.clamp(self.top, max_y)]
+    }
+}
+
+/// Keep the saved live window position on a monitor that currently exists.
+/// After a reboot a secondary monitor can still be asleep or unplugged while
+/// its saved position would place the window off screen and invisible.
+fn clamp_live_position(
+    saved: Option<[f32; 2]>,
+    window_size: [f32; 2],
+    areas: &[WorkArea],
+) -> Option<[f32; 2]> {
+    let [sx, sy] = saved?;
+    if !sx.is_finite() || !sy.is_finite() || areas.is_empty() {
+        return None;
+    }
+    let x = sx.round() as i32;
+    let y = sy.round() as i32;
+    if areas.iter().any(|area| area.contains(x, y)) {
+        return saved;
+    }
+    let width = window_size[0].round().max(1.0) as i32;
+    let height = window_size[1].round().max(1.0) as i32;
+    let nearest = areas
+        .iter()
+        .min_by_key(|area| area.distance_squared(x, y))
+        .expect("areas is not empty");
+    let [cx, cy] = nearest.clamp_position(x, y, width, height);
+    Some([cx as f32, cy as f32])
+}
+
+struct MonitorAreaCollector {
+    areas: Vec<WorkArea>,
+}
+
+unsafe extern "system" fn monitor_area_callback(
+    monitor: HMONITOR,
+    _: HDC,
+    _: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    unsafe {
+        let collector = &mut *(lparam as *mut MonitorAreaCollector);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) != 0 {
+            let work = info.rcWork;
+            collector.areas.push(WorkArea {
+                left: work.left,
+                top: work.top,
+                right: work.right,
+                bottom: work.bottom,
+            });
+        }
+    }
+    1
+}
+
+fn monitor_work_areas() -> Vec<WorkArea> {
+    let mut collector = MonitorAreaCollector { areas: Vec::new() };
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(monitor_area_callback),
+            &mut collector as *mut MonitorAreaCollector as LPARAM,
+        );
+    }
+    collector.areas
+}
+
 fn run_window() -> Result<()> {
     let scale = window_settings::live_status_scale();
     let mut viewport = egui::ViewportBuilder::default()
@@ -777,8 +948,20 @@ fn run_window() -> Result<()> {
             Language::German => "Herdr-Nachtwächter - Live-Status",
             Language::English => "Herdr Night Watch - Live Status",
         });
-    if let Some(position) = window_settings::live_status_position() {
+    let saved_position = window_settings::live_status_position();
+    let clamped_position = clamp_live_position(
+        saved_position,
+        [DESIGN_WIDTH * scale, DESIGN_HEIGHT * scale],
+        &monitor_work_areas(),
+    );
+    if let Some(position) = clamped_position {
         viewport = viewport.with_position(position);
+        if saved_position != Some(position) {
+            // Self-healing: the saved position pointed at a monitor that is
+            // not attached right now. Persist the corrected spot so the next
+            // start opens visibly without repeating the clamp.
+            let _ = window_settings::set_live_status_position(position);
+        }
     }
     let options = eframe::NativeOptions {
         viewport,
@@ -2545,6 +2728,7 @@ fn paint_outlined_label(
     painter.text(center, egui::Align2::CENTER_CENTER, text, font, fill);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_moon_temperature(
     painter: &egui::Painter,
     moon_rect: egui::Rect,
@@ -3110,6 +3294,7 @@ enum MetricIcon {
     Power,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn system_metric_badge(
     ui: &mut egui::Ui,
     width: f32,
@@ -3318,6 +3503,83 @@ fn configure_visuals(context: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_position_on_an_attached_monitor_stays_untouched() {
+        let areas = [
+            WorkArea {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1392,
+            },
+            WorkArea {
+                left: -2560,
+                top: 0,
+                right: 0,
+                bottom: 1392,
+            },
+        ];
+        assert_eq!(
+            clamp_live_position(Some([-595.0, 41.0]), [393.0, 190.0], &areas),
+            Some([-595.0, 41.0])
+        );
+    }
+
+    #[test]
+    fn position_of_a_missing_monitor_clamps_to_nearest_work_area() {
+        let areas = [
+            WorkArea {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1392,
+            },
+            WorkArea {
+                left: -2560,
+                top: 0,
+                right: 0,
+                bottom: 1392,
+            },
+        ];
+        assert_eq!(
+            clamp_live_position(Some([-3000.0, 41.0]), [393.0, 190.0], &areas),
+            Some([-2560.0, 41.0])
+        );
+    }
+
+    #[test]
+    fn clamped_position_keeps_the_window_inside_the_work_area() {
+        let areas = [WorkArea {
+            left: 0,
+            top: 0,
+            right: 300,
+            bottom: 200,
+        }];
+        assert_eq!(
+            clamp_live_position(Some([900.0, 150.0]), [393.0, 190.0], &areas),
+            Some([0.0, 10.0])
+        );
+    }
+
+    #[test]
+    fn missing_areas_or_missing_save_use_default_placement() {
+        let areas = [WorkArea {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1392,
+        }];
+        assert_eq!(
+            clamp_live_position(Some([10.0, 10.0]), [393.0, 190.0], &[]),
+            None
+        );
+        assert_eq!(clamp_live_position(None, [393.0, 190.0], &areas), None);
+        assert_eq!(
+            clamp_live_position(Some([f32::NAN, 10.0]), [393.0, 190.0], &areas),
+            None
+        );
+    }
 
     #[test]
     fn finished_halo_rim_stays_one_screen_pixel() {
