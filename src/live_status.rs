@@ -103,6 +103,12 @@ enum ExistingWindowDisposition {
     Replace(Option<u32>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DuplicateInstanceDisposition {
+    Activate(HWND),
+    Retry,
+}
+
 static OPEN_ATTEMPT: Mutex<Option<OpenAttempt>> = Mutex::new(None);
 static NEXT_OPEN_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 // The pid of the most recently spawned live child, kept beyond the open
@@ -139,6 +145,16 @@ fn existing_window_disposition(
         ExistingWindowDisposition::WaitForActiveAttempt
     } else {
         ExistingWindowDisposition::Replace(window_pid)
+    }
+}
+
+fn duplicate_instance_disposition(
+    hwnd: Option<HWND>,
+    is_ready: impl FnOnce(HWND) -> bool,
+) -> DuplicateInstanceDisposition {
+    match hwnd {
+        Some(hwnd) if is_ready(hwnd) => DuplicateInstanceDisposition::Activate(hwnd),
+        _ => DuplicateInstanceDisposition::Retry,
     }
 }
 
@@ -228,18 +244,18 @@ fn open_with_owner(owner_pid: Option<u32>) -> Result<()> {
                     return;
                 }
                 LiveWatchOutcome::NoWindowTimeout => {
-                    let detail = "Live-Status-Prozess läuft, aber nach 30 Sekunden wurde kein Fenster gefunden";
+                    let detail = no_window_timeout_detail();
                     if !live_window_attempt_can_retry(attempt) {
-                        record_open_failure(detail);
+                        record_open_failure(&detail);
                         finish_open_spawn(open_attempt_id);
                         return;
                     }
                     record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
                 }
                 LiveWatchOutcome::UnpaintedTimeout => {
-                    let detail = "Live-Status-Fenster wurde gefunden, blieb aber nach 30 Sekunden ungezeichnet";
+                    let detail = unpainted_timeout_detail();
                     if !live_window_attempt_can_retry(attempt) {
-                        record_open_failure(detail);
+                        record_open_failure(&detail);
                         finish_open_spawn(open_attempt_id);
                         return;
                     }
@@ -270,6 +286,20 @@ fn open_with_owner(owner_pid: Option<u32>) -> Result<()> {
         finish_open_spawn(open_attempt_id);
     });
     Ok(())
+}
+
+fn no_window_timeout_detail() -> String {
+    format!(
+        "Live-Status-Prozess läuft, aber nach {} Sekunden wurde kein Fenster gefunden",
+        LIVE_WINDOW_START_TIMEOUT.as_secs()
+    )
+}
+
+fn unpainted_timeout_detail() -> String {
+    format!(
+        "Live-Status-Fenster wurde gefunden, blieb aber nach {} Sekunden ungezeichnet",
+        LIVE_WINDOW_VISIBLE_TIMEOUT.as_secs()
+    )
 }
 
 enum LiveWatchOutcome {
@@ -1002,20 +1032,11 @@ fn live_window_is_ready_now(hwnd: HWND) -> bool {
     is_ready_live_window(visible, minimized, width, height)
 }
 
-/// The update callback runs once per painted frame. The first run paints the
-/// initial frame while the window is still hidden; from the second run on
-/// that frame is guaranteed presented and the viewport can be shown without
-/// ever surfacing an unpainted, white surface.
-fn should_reveal_now(frames_seen: u32) -> bool {
-    frames_seen >= 2
-}
-
-fn advance_presented_frame_count(frames_seen: u32, will_discard: bool) -> u32 {
-    if will_discard {
-        frames_seen
-    } else {
-        frames_seen.saturating_add(1)
-    }
+/// `cumulative_frame_nr` advances only after egui finished all layout passes
+/// for a frame. A larger value therefore proves that the hidden viewport has
+/// a complete frame ready, even when an earlier pass requested a discard.
+fn has_completed_frame_since(first_frame_nr: u64, completed_frame_nr: u64) -> bool {
+    completed_frame_nr > first_frame_nr
 }
 
 /// A missing timestamp means the work has never run and is therefore due
@@ -1071,16 +1092,21 @@ pub fn run() -> Result<()> {
     let instance_mutex = match acquire_live_instance()? {
         Some(handle) => handle,
         None => {
-            if let Some(hwnd) = find_live_window() {
+            let hwnd = find_live_window();
+            if let Some(hwnd) = hwnd {
                 apply_taskbar_visibility(hwnd);
-                // Only activate a window that already drew a frame; a still
-                // hidden one belongs to a running open attempt in this or the
-                // tray process and must not be forced visible.
-                if live_window_is_ready_now(hwnd) {
+            }
+            match duplicate_instance_disposition(hwnd, live_window_is_ready_now) {
+                DuplicateInstanceDisposition::Activate(hwnd) => {
                     activate_live_window(hwnd);
+                    return Ok(());
+                }
+                DuplicateInstanceDisposition::Retry => {
+                    return Err(anyhow::anyhow!(
+                        "Eine andere Live-Status-Instanz hält die Sperre, hat aber kein fertig gezeichnetes Fenster"
+                    ));
                 }
             }
-            return Ok(());
         }
     };
 
@@ -1351,7 +1377,7 @@ struct LiveStatusApp {
     last_saved_position: Option<[f32; 2]>,
     owner_pid: Option<u32>,
     reveal_pending: bool,
-    frames_seen: u32,
+    first_frame_nr: Option<u64>,
 }
 
 impl Drop for LiveStatusApp {
@@ -1417,24 +1443,20 @@ impl LiveStatusApp {
             last_saved_position: window_settings::live_status_position(),
             owner_pid,
             reveal_pending: true,
-            frames_seen: 0,
+            first_frame_nr: None,
         }
     }
 
-    /// Reveal the viewport only after egui presented one frame. Discarded
-    /// layout passes do not reach the screen and therefore do not advance the
-    /// counter. On the second presented pass the first frame is guaranteed to
-    /// be visible without surfacing an unpainted, white viewport.
+    /// Reveal the viewport only after egui completed one whole frame. The
+    /// frame number advances after all sizing passes finish, so a later
+    /// `request_discard` in the same UI callback cannot be counted early.
     fn reveal_after_first_frame(&mut self, ctx: &egui::Context) {
         if !self.reveal_pending {
             return;
         }
-        let will_discard = ctx.will_discard();
-        self.frames_seen = advance_presented_frame_count(self.frames_seen, will_discard);
-        if will_discard {
-            return;
-        }
-        if should_reveal_now(self.frames_seen) {
+        let completed_frame_nr = ctx.cumulative_frame_nr();
+        let first_frame_nr = *self.first_frame_nr.get_or_insert(completed_frame_nr);
+        if has_completed_frame_since(first_frame_nr, completed_frame_nr) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             self.reveal_pending = false;
         } else {
@@ -3872,6 +3894,26 @@ mod tests {
         )
     }
 
+    fn fixture_output_confirms_exact_test(output: &str, fixture: &str) -> bool {
+        output.contains("running 1 test") && output.contains(&format!("test {fixture} ... ok"))
+    }
+
+    fn assert_fixture_output(output: std::process::Output, fixture: &str) {
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "fixture {fixture} failed: {transcript}"
+        );
+        assert!(
+            fixture_output_confirms_exact_test(&transcript, fixture),
+            "fixture {fixture} did not run exactly once: {transcript}"
+        );
+    }
+
     #[test]
     fn saved_position_on_an_attached_monitor_stays_untouched() {
         let areas = [
@@ -4098,19 +4140,16 @@ mod tests {
             return;
         }
         let attempt_id = begin_open_spawn().unwrap();
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "live_status::tests::secondary_process_observes_active_open_attempt_fixture",
-            ])
+        let fixture = "live_status::tests::secondary_process_observes_active_open_attempt_fixture";
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", fixture])
             .env("HERDR_LIVE_STATUS_FIXTURE", "1")
             .creation_flags(CREATE_NO_WINDOW)
-            .status()
+            .output()
             .unwrap();
         finish_open_spawn(attempt_id);
 
-        assert!(status.success());
+        assert_fixture_output(output, fixture);
     }
 
     #[test]
@@ -4163,24 +4202,65 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_instance_without_ready_window_requests_retry() {
+        let hwnd = 41usize as HWND;
+        assert_eq!(
+            duplicate_instance_disposition(None, |_| false),
+            DuplicateInstanceDisposition::Retry
+        );
+        assert_eq!(
+            duplicate_instance_disposition(Some(hwnd), |_| false),
+            DuplicateInstanceDisposition::Retry
+        );
+        assert_eq!(
+            duplicate_instance_disposition(Some(hwnd), |_| true),
+            DuplicateInstanceDisposition::Activate(hwnd)
+        );
+    }
+
+    #[test]
+    fn timeout_details_follow_their_controlling_constants() {
+        assert!(
+            no_window_timeout_detail().contains(&LIVE_WINDOW_START_TIMEOUT.as_secs().to_string())
+        );
+        assert!(
+            unpainted_timeout_detail().contains(&LIVE_WINDOW_VISIBLE_TIMEOUT.as_secs().to_string())
+        );
+    }
+
+    #[test]
+    fn fixture_output_must_name_one_executed_test() {
+        let expected = "live_status::tests::example_fixture";
+        assert!(fixture_output_confirms_exact_test(
+            "running 1 test\ntest live_status::tests::example_fixture ... ok",
+            expected
+        ));
+        assert!(!fixture_output_confirms_exact_test(
+            "running 0 tests\ntest result: ok",
+            expected
+        ));
+        assert!(!fixture_output_confirms_exact_test(
+            "running 1 test\ntest live_status::tests::different_fixture ... ok",
+            expected
+        ));
+    }
+
+    #[test]
     fn open_attempt_gate_is_shared_across_processes() {
         let _serialized = LIVE_OPEN_ATTEMPT_TEST_LOCK.lock().unwrap();
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "live_status::tests::shared_open_attempt_gate_parent_fixture",
-            ])
+        let fixture = "live_status::tests::shared_open_attempt_gate_parent_fixture";
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", fixture])
             .env("HERDR_LIVE_STATUS_FIXTURE", "1")
             .env(
                 LIVE_OPEN_ATTEMPT_MUTEX_ENV,
                 test_open_attempt_mutex_name("shared"),
             )
             .creation_flags(CREATE_NO_WINDOW)
-            .status()
+            .output()
             .unwrap();
 
-        assert!(status.success());
+        assert_fixture_output(output, fixture);
     }
 
     #[test]
@@ -4191,7 +4271,7 @@ mod tests {
             "live_status::tests::stale_open_attempt_parent_fixture",
             "live_status::tests::terminate_and_reap_child_fixture",
         ] {
-            let status = Command::new(std::env::current_exe().unwrap())
+            let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--ignored", "--exact", fixture])
                 .env_remove("HERDR_LIVE_STATUS_FIXTURE")
                 .env(
@@ -4199,31 +4279,28 @@ mod tests {
                     test_open_attempt_mutex_name("inert"),
                 )
                 .creation_flags(CREATE_NO_WINDOW)
-                .status()
+                .output()
                 .unwrap();
-            assert!(status.success(), "fixture {fixture} must stay inert");
+            assert_fixture_output(output, fixture);
         }
     }
 
     #[test]
     fn stale_attempt_cannot_clear_or_overwrite_a_newer_attempt() {
         let _serialized = LIVE_OPEN_ATTEMPT_TEST_LOCK.lock().unwrap();
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "live_status::tests::stale_open_attempt_parent_fixture",
-            ])
+        let fixture = "live_status::tests::stale_open_attempt_parent_fixture";
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", fixture])
             .env("HERDR_LIVE_STATUS_FIXTURE", "1")
             .env(
                 LIVE_OPEN_ATTEMPT_MUTEX_ENV,
                 test_open_attempt_mutex_name("stale"),
             )
             .creation_flags(CREATE_NO_WINDOW)
-            .status()
+            .output()
             .unwrap();
 
-        assert!(status.success());
+        assert_fixture_output(output, fixture);
     }
 
     #[test]
@@ -4310,21 +4387,27 @@ mod tests {
     }
 
     #[test]
-    fn reveal_waits_for_one_presented_frame() {
-        // The first update pass paints the initial frame while hidden; only
-        // the second pass may show the viewport.
-        assert!(!should_reveal_now(0));
-        assert!(!should_reveal_now(1));
-        assert!(should_reveal_now(2));
-        assert!(should_reveal_now(3));
-    }
+    fn discarded_pass_does_not_complete_a_frame_early() {
+        let ctx = egui::Context::default();
+        let first_frame_nr = ctx.cumulative_frame_nr();
+        let mut passes_seen = 0;
 
-    #[test]
-    fn discarded_pass_does_not_advance_presented_frame_count() {
-        assert_eq!(advance_presented_frame_count(0, true), 0);
-        assert_eq!(advance_presented_frame_count(1, true), 1);
-        assert_eq!(advance_presented_frame_count(0, false), 1);
-        assert_eq!(advance_presented_frame_count(1, false), 2);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            passes_seen += 1;
+            if ui.ctx().current_pass_index() == 0 {
+                ui.ctx().request_discard("test sizing pass");
+            }
+            assert!(!has_completed_frame_since(
+                first_frame_nr,
+                ui.ctx().cumulative_frame_nr()
+            ));
+        });
+
+        assert_eq!(passes_seen, 2);
+        assert!(has_completed_frame_since(
+            first_frame_nr,
+            ctx.cumulative_frame_nr()
+        ));
     }
 
     #[test]
