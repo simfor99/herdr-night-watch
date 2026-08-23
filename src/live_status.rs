@@ -17,6 +17,7 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{
     Mutex,
+    atomic::{AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender},
 };
 use std::thread;
@@ -42,8 +43,19 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // seconds caused the tray opener to kill a healthy process during startup.
 const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const LIVE_WINDOW_START_ATTEMPTS: usize = 2;
+const LIVE_WINDOW_START_ATTEMPTS: usize = 3;
 const LIVE_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
+// The viewport starts hidden and is only revealed after egui presented its
+// first frame. Until then an existing HWND does not count as drawn, so the
+// watchdog waits for visibility instead of bare window existence.
+const LIVE_WINDOW_VISIBLE_TIMEOUT: Duration = Duration::from_secs(30);
+// After the window became visible a cold-boot GPU failure can still kill the
+// process a few frames later. Guard that phase too; a clean exit code 0 there
+// is the user closing the window on purpose and must not trigger a reopen.
+const LIVE_WINDOW_POST_OPEN_GUARD: Duration = Duration::from_secs(60);
+// A retry after an unpainted hang or a post-open death waits longer than the
+// regular spawn retry: the graphics driver needs time to finish waking up.
+const LIVE_WINDOW_GUARD_RETRY_DELAY: Duration = Duration::from_secs(10);
 const PRIMARY_TRAY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_TRAY_DISCOVERY_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_INSTANCE_MUTEX: &str = "Local\\HerdrNachtwaechter.LiveStatus";
@@ -71,13 +83,34 @@ const OPEN_SPAWN_DEBOUNCE: Duration = Duration::from_millis(750);
 const LIVE_WINDOW_CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
 const LIVE_INSTANCE_RELEASE_DELAY: Duration = Duration::from_millis(300);
 const OWNER_PID_PREFIX: &str = "--owner-pid=";
+const LIVE_OPEN_ATTEMPT_MUTEX: &str = "Local\\HerdrNachtwaechter.LiveOpenAttempt";
+const LIVE_STATUS_OPEN_FAILURE_EVENT: &str = "live_status_open_failed";
+const LIVE_STATUS_PANIC_EVENT: &str = "live_status_panic";
+#[cfg(test)]
+const LIVE_OPEN_ATTEMPT_MUTEX_ENV: &str = "HERDR_LIVE_OPEN_ATTEMPT_MUTEX";
 
 struct OpenAttempt {
+    id: u64,
     started_at: Instant,
     child_pid: Option<u32>,
+    process_gate: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingWindowDisposition {
+    Activate,
+    WaitForActiveAttempt,
+    Replace(Option<u32>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DuplicateInstanceDisposition {
+    Activate(HWND),
+    Retry,
 }
 
 static OPEN_ATTEMPT: Mutex<Option<OpenAttempt>> = Mutex::new(None);
+static NEXT_OPEN_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 // The pid of the most recently spawned live child, kept beyond the open
 // attempt so later opens and a tray quit can still clean it up.
 static LAST_LIVE_CHILD_PID: Mutex<Option<u32>> = Mutex::new(None);
@@ -101,18 +134,53 @@ pub fn open_from_secondary_instance() -> Result<()> {
     open_with_owner(find_primary_tray_pid_with_retry())
 }
 
+fn existing_window_disposition(
+    ready: bool,
+    window_pid: Option<u32>,
+    active_child_pid: Option<u32>,
+) -> ExistingWindowDisposition {
+    if ready {
+        ExistingWindowDisposition::Activate
+    } else if window_pid.is_some() && window_pid == active_child_pid {
+        ExistingWindowDisposition::WaitForActiveAttempt
+    } else {
+        ExistingWindowDisposition::Replace(window_pid)
+    }
+}
+
+fn duplicate_instance_disposition(
+    hwnd: Option<HWND>,
+    is_ready: impl FnOnce(HWND) -> bool,
+) -> DuplicateInstanceDisposition {
+    match hwnd {
+        Some(hwnd) if is_ready(hwnd) => DuplicateInstanceDisposition::Activate(hwnd),
+        _ => DuplicateInstanceDisposition::Retry,
+    }
+}
+
 fn open_with_owner(owner_pid: Option<u32>) -> Result<()> {
+    let mut stale_window_pid = None;
     if let Some(hwnd) = find_existing_live_window() {
         apply_taskbar_visibility(hwnd);
-        activate_live_window(hwnd);
-        return Ok(());
+        match existing_window_disposition(
+            live_window_is_ready_now(hwnd),
+            window_pid(hwnd),
+            active_open_child_pid(),
+        ) {
+            ExistingWindowDisposition::Activate => {
+                activate_live_window(hwnd);
+                return Ok(());
+            }
+            ExistingWindowDisposition::WaitForActiveAttempt => return Ok(()),
+            ExistingWindowDisposition::Replace(pid) => stale_window_pid = pid,
+        }
     }
 
-    if !begin_open_spawn() {
+    let Some(open_attempt_id) = begin_open_spawn() else {
         return Ok(());
-    }
+    };
 
-    if let Some(stale_pid) = stale_live_child_pid() {
+    if let Some(stale_pid) = stale_window_pid.or_else(stale_live_child_pid) {
         terminate_pid(stale_pid);
         // Give Windows a moment to release the instance mutex of the
         // terminated child before the replacement claims it.
@@ -121,90 +189,224 @@ fn open_with_owner(owner_pid: Option<u32>) -> Result<()> {
 
     let executable =
         std::env::current_exe().context("Programmdatei konnte nicht bestimmt werden")?;
-    let child = match spawn_live_status_process(&executable, owner_pid) {
+    let mut child = match spawn_live_status_process(&executable, owner_pid) {
         Ok(child) => child,
         Err(error) => {
-            finish_open_spawn();
+            finish_open_spawn(open_attempt_id);
             return Err(error);
         }
     };
-    remember_open_child(child.id());
+    if !remember_open_child(open_attempt_id, child.id()) {
+        terminate_and_reap_child(&mut child);
+        return Ok(());
+    }
 
     thread::spawn(move || {
         let mut child = child;
         for attempt in 1..=LIVE_WINDOW_START_ATTEMPTS {
-            remember_open_child(child.id());
-            let started_at = Instant::now();
-            loop {
-                if let Some(hwnd) = find_live_window_for_pid(child.id()) {
-                    apply_taskbar_visibility(hwnd);
+            if !remember_open_child(open_attempt_id, child.id()) {
+                terminate_and_reap_child(&mut child);
+                return;
+            }
+            let mut retry_delay = LIVE_WINDOW_RETRY_DELAY;
+            match await_live_window_ready(&mut child) {
+                LiveWatchOutcome::Ready(hwnd) => {
+                    // Reveal ran inside the child after its first painted
+                    // frame; activating an unpainted HWND here would
+                    // reintroduce the white flash window.
                     activate_live_window(hwnd);
-                    finish_open_spawn();
+                    match guard_live_window_after_ready(&mut child) {
+                        GuardOutcome::Done => {
+                            finish_open_spawn(open_attempt_id);
+                            return;
+                        }
+                        GuardOutcome::Retry(detail) => {
+                            if !live_window_attempt_can_retry(attempt) {
+                                record_open_failure(&detail);
+                                finish_open_spawn(open_attempt_id);
+                                return;
+                            }
+                            record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
+                            retry_delay = LIVE_WINDOW_GUARD_RETRY_DELAY;
+                        }
+                    }
+                }
+                LiveWatchOutcome::ChildExited(detail) => {
+                    if !live_window_attempt_can_retry(attempt) {
+                        record_open_failure(&detail);
+                        finish_open_spawn(open_attempt_id);
+                        return;
+                    }
+                    record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
+                }
+                LiveWatchOutcome::ChildExitedCleanly => {
+                    finish_open_spawn(open_attempt_id);
                     return;
                 }
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let detail = format!(
-                            "Live-Status-Prozess wurde beendet, bevor ein Fenster sichtbar wurde ({status})"
-                        );
-                        if attempt == LIVE_WINDOW_START_ATTEMPTS {
-                            record_open_failure(&detail);
-                            finish_open_spawn();
-                            return;
-                        }
-                        record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
-                        break;
+                LiveWatchOutcome::NoWindowTimeout => {
+                    let detail = no_window_timeout_detail();
+                    if !live_window_attempt_can_retry(attempt) {
+                        record_open_failure(&detail);
+                        finish_open_spawn(open_attempt_id);
+                        return;
                     }
-                    Ok(None) if started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let detail = "Live-Status-Prozess läuft, aber nach 30 Sekunden wurde kein Fenster gefunden";
-                        if attempt == LIVE_WINDOW_START_ATTEMPTS {
-                            record_open_failure(detail);
-                            finish_open_spawn();
-                            return;
-                        }
-                        record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let detail = format!(
-                            "Live-Status-Fenster wurde nicht sichtbar; Prozessstatus konnte nicht geprüft werden: {error}"
-                        );
-                        if attempt == LIVE_WINDOW_START_ATTEMPTS {
-                            record_open_failure(&detail);
-                            finish_open_spawn();
-                            return;
-                        }
-                        record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
-                        break;
-                    }
+                    record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
                 }
-                thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
+                LiveWatchOutcome::UnpaintedTimeout => {
+                    let detail = unpainted_timeout_detail();
+                    if !live_window_attempt_can_retry(attempt) {
+                        record_open_failure(&detail);
+                        finish_open_spawn(open_attempt_id);
+                        return;
+                    }
+                    record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
+                    retry_delay = LIVE_WINDOW_GUARD_RETRY_DELAY;
+                }
             }
-            thread::sleep(LIVE_WINDOW_RETRY_DELAY);
+            thread::sleep(retry_delay);
             child = match spawn_live_status_process(&executable, owner_pid) {
-                Ok(child) => {
+                Ok(mut child) => {
                     // Register the replacement immediately so a concurrent
                     // close() cannot miss it before the loop restarts.
-                    remember_open_child(child.id());
+                    if !remember_open_child(open_attempt_id, child.id()) {
+                        terminate_and_reap_child(&mut child);
+                        return;
+                    }
                     child
                 }
                 Err(error) => {
                     record_open_failure(&format!(
                         "Live-Status-Prozess konnte beim Wiederholungsversuch nicht gestartet werden: {error}"
                     ));
-                    finish_open_spawn();
+                    finish_open_spawn(open_attempt_id);
                     return;
                 }
             };
         }
-        finish_open_spawn();
+        finish_open_spawn(open_attempt_id);
     });
     Ok(())
+}
+
+fn no_window_timeout_detail() -> String {
+    format!(
+        "Live-Status-Prozess läuft, aber nach {} Sekunden wurde kein Fenster gefunden",
+        LIVE_WINDOW_START_TIMEOUT.as_secs()
+    )
+}
+
+fn unpainted_timeout_detail() -> String {
+    format!(
+        "Live-Status-Fenster wurde gefunden, blieb aber nach {} Sekunden ungezeichnet",
+        LIVE_WINDOW_VISIBLE_TIMEOUT.as_secs()
+    )
+}
+
+enum LiveWatchOutcome {
+    /// The window exists and reported itself drawn (visible or minimized).
+    Ready(HWND),
+    /// The process exited before any window became visible; carries the
+    /// already formatted log detail.
+    ChildExited(String),
+    /// The process stopped cleanly before presentation, for example because
+    /// the user closed it immediately. This must not trigger a retry.
+    ChildExitedCleanly,
+    /// The process lives but never created a window in time.
+    NoWindowTimeout,
+    /// A window exists but never became visible in time.
+    UnpaintedTimeout,
+}
+
+fn live_window_attempt_can_retry(attempt: usize) -> bool {
+    attempt < LIVE_WINDOW_START_ATTEMPTS
+}
+
+/// Phase one and two of the watchdog: wait until the child presents a live
+/// window (not merely creates its HWND), the child exits, or a timeout hits.
+/// A cold boot can leave the graphics stack unable to paint for a while, so
+/// existence alone must not count as success.
+fn await_live_window_ready(child: &mut Child) -> LiveWatchOutcome {
+    let started_at = Instant::now();
+    let mut found_at: Option<Instant> = None;
+    let mut hwnd: Option<HWND> = None;
+    loop {
+        if hwnd.is_none()
+            && let Some(found) = find_live_window_for_pid(child.id())
+        {
+            apply_taskbar_visibility(found);
+            hwnd = Some(found);
+            found_at = Some(Instant::now());
+        }
+        if let Some(hwnd) = hwnd
+            && live_window_is_ready_now(hwnd)
+        {
+            return LiveWatchOutcome::Ready(hwnd);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                return LiveWatchOutcome::ChildExitedCleanly;
+            }
+            Ok(Some(status)) => {
+                return LiveWatchOutcome::ChildExited(format!(
+                    "Live-Status-Prozess wurde beendet, bevor ein Fenster sichtbar wurde ({status})"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                terminate_and_reap_child(child);
+                return LiveWatchOutcome::ChildExited(format!(
+                    "Live-Status-Fenster wurde nicht sichtbar; Prozessstatus konnte nicht geprüft werden: {error}"
+                ));
+            }
+        }
+        if hwnd.is_none() && started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT {
+            terminate_and_reap_child(child);
+            return LiveWatchOutcome::NoWindowTimeout;
+        }
+        if found_at.is_some_and(|found| found.elapsed() >= LIVE_WINDOW_VISIBLE_TIMEOUT) {
+            terminate_and_reap_child(child);
+            return LiveWatchOutcome::UnpaintedTimeout;
+        }
+        thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
+    }
+}
+
+enum GuardOutcome {
+    /// The window stays open (or the user closed it cleanly); nothing to do.
+    Done,
+    /// The child died shortly after opening; carries the log detail.
+    Retry(String),
+}
+
+/// Phase three of the watchdog: after the window presented itself, a cold-boot
+/// GPU failure can still kill the process a few frames later. A clean exit
+/// code 0 means the user closed the window on purpose and must not reopen it.
+fn guard_live_window_after_ready(child: &mut Child) -> GuardOutcome {
+    let started_at = Instant::now();
+    while started_at.elapsed() < LIVE_WINDOW_POST_OPEN_GUARD {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return GuardOutcome::Done,
+            Ok(Some(status)) => {
+                return GuardOutcome::Retry(format!(
+                    "Live-Status-Prozess endete kurz nach dem Öffnen ({status})"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                terminate_and_reap_child(child);
+                return GuardOutcome::Retry(format!(
+                    "Prozessstatus des Live-Status-Fensters konnte nach dem Öffnen nicht geprüft werden: {error}"
+                ));
+            }
+        }
+        thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
+    }
+    GuardOutcome::Done
+}
+
+fn terminate_and_reap_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub fn close() {
@@ -581,34 +783,92 @@ fn is_activatable_live_hwnd(hwnd: HWND) -> bool {
     is_showable_live_window(visible, minimized, width, height)
 }
 
-fn begin_open_spawn() -> bool {
+fn begin_open_spawn() -> Option<u64> {
     let Ok(mut gate) = OPEN_ATTEMPT.lock() else {
-        return true;
+        record_open_failure("Live-Status-Öffnungssperre konnte nicht gelesen werden");
+        return None;
     };
     if let Some(existing) = gate.as_ref() {
         if existing.child_pid.is_some_and(process_is_running) {
-            return false;
+            return None;
         }
         if existing.started_at.elapsed() < OPEN_SPAWN_DEBOUNCE {
-            return false;
+            return None;
         }
     }
+    if let Some(stale) = gate.take() {
+        unsafe {
+            let _ = CloseHandle(stale.process_gate as HANDLE);
+        }
+    }
+    let process_gate = match acquire_open_attempt_process_gate() {
+        Ok(Some(handle)) => handle,
+        Ok(None) => return None,
+        Err(error) => {
+            record_open_failure(&error.to_string());
+            return None;
+        }
+    };
+    let id = NEXT_OPEN_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
     *gate = Some(OpenAttempt {
+        id,
         started_at: Instant::now(),
         child_pid: None,
+        process_gate,
     });
-    true
+    Some(id)
 }
 
-fn remember_open_child(pid: u32) {
-    if let Ok(mut last) = LAST_LIVE_CHILD_PID.lock() {
-        *last = Some(pid);
+/// Hold a named kernel object for the complete open attempt. Unlike the local
+/// `OPEN_ATTEMPT` state, this also lets a secondary EXE see that another tray
+/// process is still monitoring a hidden first frame.
+fn acquire_open_attempt_process_gate() -> Result<Option<usize>> {
+    #[cfg(test)]
+    let mutex_name = std::env::var(LIVE_OPEN_ATTEMPT_MUTEX_ENV)
+        .unwrap_or_else(|_| LIVE_OPEN_ATTEMPT_MUTEX.to_owned());
+    #[cfg(not(test))]
+    let mutex_name = LIVE_OPEN_ATTEMPT_MUTEX;
+    let name: Vec<u16> = mutex_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(anyhow::anyhow!(
+            "Prozessübergreifende Live-Status-Öffnungssperre konnte nicht erstellt werden"
+        ));
     }
+    if unsafe { GetLastError() } == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        Ok(None)
+    } else {
+        Ok(Some(handle as usize))
+    }
+}
+
+fn active_open_child_pid() -> Option<u32> {
+    let pid = OPEN_ATTEMPT
+        .lock()
+        .ok()?
+        .as_ref()
+        .and_then(|attempt| attempt.child_pid)?;
+    process_is_running(pid).then_some(pid)
+}
+
+fn remember_open_child(attempt_id: u64, pid: u32) -> bool {
     if let Ok(mut gate) = OPEN_ATTEMPT.lock()
         && let Some(existing) = gate.as_mut()
+        && existing.id == attempt_id
     {
         existing.child_pid = Some(pid);
+        if let Ok(mut last) = LAST_LIVE_CHILD_PID.lock() {
+            *last = Some(pid);
+        }
+        return true;
     }
+    false
 }
 
 /// A hung live child without a window keeps owning the instance mutex, so
@@ -655,9 +915,16 @@ fn process_handle_is_current_exe(handle: HANDLE) -> bool {
     image.to_lowercase() == expected
 }
 
-fn finish_open_spawn() {
-    if let Ok(mut gate) = OPEN_ATTEMPT.lock() {
-        *gate = None;
+fn finish_open_spawn(attempt_id: u64) {
+    if let Ok(mut gate) = OPEN_ATTEMPT.lock()
+        && gate
+            .as_ref()
+            .is_some_and(|attempt| attempt.id == attempt_id)
+        && let Some(attempt) = gate.take()
+    {
+        unsafe {
+            let _ = CloseHandle(attempt.process_gate as HANDLE);
+        }
     }
 }
 
@@ -750,12 +1017,33 @@ fn is_showable_live_window(visible: bool, minimized: bool, width: i32, height: i
     width >= LIVE_WINDOW_MIN_READY_WIDTH && height >= LIVE_WINDOW_MIN_READY_HEIGHT
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_ready_live_window(visible: bool, minimized: bool, width: i32, height: i32) -> bool {
     if minimized {
         return true;
     }
     visible && width >= LIVE_WINDOW_MIN_READY_WIDTH && height >= LIVE_WINDOW_MIN_READY_HEIGHT
+}
+
+/// Whether a concrete live window already presented itself. The viewport
+/// starts hidden and reveals after its first painted frame, so visibility is
+/// the reliable "first frame done" signal for the tray-side watchdog.
+fn live_window_is_ready_now(hwnd: HWND) -> bool {
+    let (visible, minimized, width, height) = live_window_metrics(hwnd);
+    is_ready_live_window(visible, minimized, width, height)
+}
+
+/// `cumulative_frame_nr` advances only after egui finished all layout passes
+/// for a frame. A larger value therefore proves that the hidden viewport has
+/// a complete frame ready, even when an earlier pass requested a discard.
+fn has_completed_frame_since(first_frame_nr: u64, completed_frame_nr: u64) -> bool {
+    completed_frame_nr > first_frame_nr
+}
+
+/// A missing timestamp means the work has never run and is therefore due
+/// immediately. This avoids manufacturing a timestamp before Windows boot,
+/// which can underflow `Instant` during the first minutes after a restart.
+fn refresh_is_due(last: Option<Instant>, interval: Duration, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= interval)
 }
 
 fn apply_taskbar_visibility(hwnd: HWND) {
@@ -772,6 +1060,10 @@ pub fn apply_taskbar_setting() -> Result<()> {
 }
 
 fn record_open_failure(detail: &str) {
+    record_ui_error(LIVE_STATUS_OPEN_FAILURE_EVENT, detail);
+}
+
+fn record_ui_error(event: &str, detail: &str) {
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
@@ -788,21 +1080,33 @@ fn record_open_failure(detail: &str) {
     };
     let _ = writeln!(
         file,
-        "{:?};live_status_open_failed;{}",
+        "{:?};{};{}",
         SystemTime::now(),
+        event,
         detail.replace(['\r', '\n', ';'], " ")
     );
 }
 
 pub fn run() -> Result<()> {
+    install_panic_logger();
     let instance_mutex = match acquire_live_instance()? {
         Some(handle) => handle,
         None => {
-            if let Some(hwnd) = find_live_window() {
+            let hwnd = find_live_window();
+            if let Some(hwnd) = hwnd {
                 apply_taskbar_visibility(hwnd);
-                activate_live_window(hwnd);
             }
-            return Ok(());
+            match duplicate_instance_disposition(hwnd, live_window_is_ready_now) {
+                DuplicateInstanceDisposition::Activate(hwnd) => {
+                    activate_live_window(hwnd);
+                    return Ok(());
+                }
+                DuplicateInstanceDisposition::Retry => {
+                    return Err(anyhow::anyhow!(
+                        "Eine andere Live-Status-Instanz hält die Sperre, hat aber kein fertig gezeichnetes Fenster"
+                    ));
+                }
+            }
         }
     };
 
@@ -814,6 +1118,21 @@ pub fn run() -> Result<()> {
         let _ = CloseHandle(instance_mutex);
     }
     result
+}
+
+/// A panicking live child dies with exit code 101 and, without this hook,
+/// leaves no trace: the watchdog may already have reported success and the
+/// Windows subsystem hides stderr. Write the panic into the shared error log
+/// so the next cold boot finally names the real culprit.
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        record_ui_error(
+            LIVE_STATUS_PANIC_EVENT,
+            &format!("Live-Status-Panik: {info}"),
+        );
+        default_hook(info);
+    }));
 }
 
 fn acquire_live_instance() -> Result<Option<HANDLE>> {
@@ -950,6 +1269,11 @@ fn monitor_work_areas() -> Vec<WorkArea> {
 fn run_window() -> Result<()> {
     let scale = window_settings::live_status_scale();
     let mut viewport = egui::ViewportBuilder::default()
+        // Start hidden and let the app reveal itself after its first painted
+        // frame: during a cold boot the GPU driver may not be ready yet, and
+        // a viewport shown before its first paint is the white flash window.
+        // Visibility thereby becomes the watchdog's "first frame done" signal.
+        .with_visible(false)
         .with_inner_size([DESIGN_WIDTH * scale, DESIGN_HEIGHT * scale])
         .with_min_inner_size([
             DESIGN_WIDTH * window_settings::MIN_LIVE_STATUS_SCALE,
@@ -1021,7 +1345,7 @@ struct LiveStatusApp {
     status_tx: Sender<Result<WatchStatus, String>>,
     action_rx: Receiver<Result<NightAction, String>>,
     action_tx: Sender<Result<NightAction, String>>,
-    last_refresh: Instant,
+    last_refresh: Option<Instant>,
     checking: bool,
     action_in_progress: bool,
     pending_action: Option<NightAction>,
@@ -1039,8 +1363,8 @@ struct LiveStatusApp {
     weather_location: WeatherLocation,
     weather_reading: Option<WeatherReading>,
     weather_checking: bool,
-    last_weather_fetch: Instant,
-    last_weather_location_check: Instant,
+    last_weather_fetch: Option<Instant>,
+    last_weather_location_check: Option<Instant>,
     opacity: Option<u8>,
     window_level: window_settings::WindowLevel,
     taskbar_visible: Option<bool>,
@@ -1052,6 +1376,8 @@ struct LiveStatusApp {
     scale: f32,
     last_saved_position: Option<[f32; 2]>,
     owner_pid: Option<u32>,
+    reveal_pending: bool,
+    first_frame_nr: Option<u64>,
 }
 
 impl Drop for LiveStatusApp {
@@ -1085,7 +1411,7 @@ impl LiveStatusApp {
             status_tx,
             action_rx,
             action_tx,
-            last_refresh: Instant::now() - Duration::from_secs(10),
+            last_refresh: None,
             checking: false,
             action_in_progress: false,
             pending_action: None,
@@ -1103,8 +1429,8 @@ impl LiveStatusApp {
             weather_location: weather::current_location(),
             weather_reading: None,
             weather_checking: false,
-            last_weather_fetch: Instant::now() - Duration::from_secs(601),
-            last_weather_location_check: Instant::now() - Duration::from_secs(6),
+            last_weather_fetch: None,
+            last_weather_location_check: None,
             opacity: None,
             window_level: window_settings::WindowLevel::current(),
             taskbar_visible: None,
@@ -1116,15 +1442,38 @@ impl LiveStatusApp {
             scale,
             last_saved_position: window_settings::live_status_position(),
             owner_pid,
+            reveal_pending: true,
+            first_frame_nr: None,
+        }
+    }
+
+    /// Reveal the viewport only after egui completed one whole frame. The
+    /// frame number advances after all sizing passes finish, so a later
+    /// `request_discard` in the same UI callback cannot be counted early.
+    fn reveal_after_first_frame(&mut self, ctx: &egui::Context) {
+        if !self.reveal_pending {
+            return;
+        }
+        let completed_frame_nr = ctx.cumulative_frame_nr();
+        let first_frame_nr = *self.first_frame_nr.get_or_insert(completed_frame_nr);
+        if has_completed_frame_since(first_frame_nr, completed_frame_nr) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            self.reveal_pending = false;
+        } else {
+            // The reveal decision runs in the next update pass, so make sure
+            // one is scheduled instead of waiting for external input.
+            ctx.request_repaint();
         }
     }
 
     fn refresh(&mut self) {
-        if self.checking || self.last_refresh.elapsed() < Duration::from_secs(3) {
+        if self.checking
+            || !refresh_is_due(self.last_refresh, Duration::from_secs(3), Instant::now())
+        {
             return;
         }
         self.checking = true;
-        self.last_refresh = Instant::now();
+        self.last_refresh = Some(Instant::now());
         let sender = self.status_tx.clone();
         thread::spawn(move || {
             let _ = sender.send(backend::status().map_err(|error| error.to_string()));
@@ -1144,20 +1493,30 @@ impl LiveStatusApp {
     }
 
     fn refresh_weather(&mut self) {
-        if self.last_weather_location_check.elapsed() >= Duration::from_secs(5) {
-            self.last_weather_location_check = Instant::now();
+        if refresh_is_due(
+            self.last_weather_location_check,
+            Duration::from_secs(5),
+            Instant::now(),
+        ) {
+            self.last_weather_location_check = Some(Instant::now());
             let location = weather::current_location();
             if location != self.weather_location {
                 self.weather_location = location;
                 self.weather_reading = None;
-                self.last_weather_fetch = Instant::now() - Duration::from_secs(601);
+                self.last_weather_fetch = None;
             }
         }
-        if self.weather_checking || self.last_weather_fetch.elapsed() < Duration::from_secs(600) {
+        if self.weather_checking
+            || !refresh_is_due(
+                self.last_weather_fetch,
+                Duration::from_secs(600),
+                Instant::now(),
+            )
+        {
             return;
         }
         self.weather_checking = true;
-        self.last_weather_fetch = Instant::now();
+        self.last_weather_fetch = Some(Instant::now());
         let sender = self.weather_tx.clone();
         let location = self.weather_location.clone();
         thread::spawn(move || {
@@ -1265,7 +1624,7 @@ impl LiveStatusApp {
                         color,
                         expires_at: Instant::now() + Duration::from_secs(3),
                     });
-                    self.last_refresh = Instant::now() - Duration::from_secs(10);
+                    self.last_refresh = None;
                 }
                 Err(error) => self.error = Some(error),
             }
@@ -1320,6 +1679,7 @@ impl eframe::App for LiveStatusApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+        self.reveal_after_first_frame(ui.ctx());
         let current_language = Language::current();
         if current_language != self.language {
             self.language = current_language;
@@ -3524,6 +3884,36 @@ fn configure_visuals(context: &egui::Context) {
 mod tests {
     use super::*;
 
+    static LIVE_OPEN_ATTEMPT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_open_attempt_mutex_name(case: &str) -> String {
+        format!(
+            "Local\\HerdrNachtwaechter.LiveOpenAttempt.Test.{}.{}",
+            std::process::id(),
+            case
+        )
+    }
+
+    fn fixture_output_confirms_exact_test(output: &str, fixture: &str) -> bool {
+        output.contains("running 1 test") && output.contains(&format!("test {fixture} ... ok"))
+    }
+
+    fn assert_fixture_output(output: std::process::Output, fixture: &str) {
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "fixture {fixture} failed: {transcript}"
+        );
+        assert!(
+            fixture_output_confirms_exact_test(&transcript, fixture),
+            "fixture {fixture} did not run exactly once: {transcript}"
+        );
+    }
+
     #[test]
     fn saved_position_on_an_attached_monitor_stays_untouched() {
         let areas = [
@@ -3715,6 +4105,205 @@ mod tests {
     }
 
     #[test]
+    fn existing_unready_window_is_recovered_unless_this_process_watches_it() {
+        assert_eq!(
+            existing_window_disposition(true, Some(41), None),
+            ExistingWindowDisposition::Activate
+        );
+        assert_eq!(
+            existing_window_disposition(false, Some(41), Some(41)),
+            ExistingWindowDisposition::WaitForActiveAttempt
+        );
+        assert_eq!(
+            existing_window_disposition(false, Some(41), Some(99)),
+            ExistingWindowDisposition::Replace(Some(41))
+        );
+        assert_eq!(
+            existing_window_disposition(false, None, None),
+            ExistingWindowDisposition::Replace(None)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn secondary_process_observes_active_open_attempt_fixture() {
+        if std::env::var_os("HERDR_LIVE_STATUS_FIXTURE").is_none() {
+            return;
+        }
+        assert!(begin_open_spawn().is_none());
+    }
+
+    #[test]
+    #[ignore]
+    fn shared_open_attempt_gate_parent_fixture() {
+        if std::env::var_os("HERDR_LIVE_STATUS_FIXTURE").is_none() {
+            return;
+        }
+        let attempt_id = begin_open_spawn().unwrap();
+        let fixture = "live_status::tests::secondary_process_observes_active_open_attempt_fixture";
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", fixture])
+            .env("HERDR_LIVE_STATUS_FIXTURE", "1")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        finish_open_spawn(attempt_id);
+
+        assert_fixture_output(output, fixture);
+    }
+
+    #[test]
+    #[ignore]
+    fn stale_open_attempt_parent_fixture() {
+        if std::env::var_os("HERDR_LIVE_STATUS_FIXTURE").is_none() {
+            return;
+        }
+        let first_attempt = begin_open_spawn().unwrap();
+        let newer_attempt = first_attempt + 1;
+        {
+            let mut gate = OPEN_ATTEMPT.lock().unwrap();
+            gate.as_mut().unwrap().id = newer_attempt;
+        }
+
+        assert!(!remember_open_child(first_attempt, 4242));
+        finish_open_spawn(first_attempt);
+        assert_eq!(
+            OPEN_ATTEMPT
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|attempt| attempt.id),
+            Some(newer_attempt)
+        );
+
+        finish_open_spawn(newer_attempt);
+    }
+
+    #[test]
+    #[ignore]
+    fn clean_child_exit_fixture() {}
+
+    #[test]
+    fn clean_child_exit_before_ready_does_not_retry() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "live_status::tests::clean_child_exit_fixture",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+
+        assert!(matches!(
+            await_live_window_ready(&mut child),
+            LiveWatchOutcome::ChildExitedCleanly
+        ));
+    }
+
+    #[test]
+    fn duplicate_instance_without_ready_window_requests_retry() {
+        let hwnd = 41usize as HWND;
+        assert_eq!(
+            duplicate_instance_disposition(None, |_| false),
+            DuplicateInstanceDisposition::Retry
+        );
+        assert_eq!(
+            duplicate_instance_disposition(Some(hwnd), |_| false),
+            DuplicateInstanceDisposition::Retry
+        );
+        assert_eq!(
+            duplicate_instance_disposition(Some(hwnd), |_| true),
+            DuplicateInstanceDisposition::Activate(hwnd)
+        );
+    }
+
+    #[test]
+    fn timeout_details_follow_their_controlling_constants() {
+        assert!(
+            no_window_timeout_detail().contains(&LIVE_WINDOW_START_TIMEOUT.as_secs().to_string())
+        );
+        assert!(
+            unpainted_timeout_detail().contains(&LIVE_WINDOW_VISIBLE_TIMEOUT.as_secs().to_string())
+        );
+    }
+
+    #[test]
+    fn fixture_output_must_name_one_executed_test() {
+        let expected = "live_status::tests::example_fixture";
+        assert!(fixture_output_confirms_exact_test(
+            "running 1 test\ntest live_status::tests::example_fixture ... ok",
+            expected
+        ));
+        assert!(!fixture_output_confirms_exact_test(
+            "running 0 tests\ntest result: ok",
+            expected
+        ));
+        assert!(!fixture_output_confirms_exact_test(
+            "running 1 test\ntest live_status::tests::different_fixture ... ok",
+            expected
+        ));
+    }
+
+    #[test]
+    fn open_attempt_gate_is_shared_across_processes() {
+        let _serialized = LIVE_OPEN_ATTEMPT_TEST_LOCK.lock().unwrap();
+        let fixture = "live_status::tests::shared_open_attempt_gate_parent_fixture";
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", fixture])
+            .env("HERDR_LIVE_STATUS_FIXTURE", "1")
+            .env(
+                LIVE_OPEN_ATTEMPT_MUTEX_ENV,
+                test_open_attempt_mutex_name("shared"),
+            )
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+
+        assert_fixture_output(output, fixture);
+    }
+
+    #[test]
+    fn ignored_child_fixtures_are_inert_without_parent_marker() {
+        for fixture in [
+            "live_status::tests::secondary_process_observes_active_open_attempt_fixture",
+            "live_status::tests::shared_open_attempt_gate_parent_fixture",
+            "live_status::tests::stale_open_attempt_parent_fixture",
+            "live_status::tests::terminate_and_reap_child_fixture",
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", fixture])
+                .env_remove("HERDR_LIVE_STATUS_FIXTURE")
+                .env(
+                    LIVE_OPEN_ATTEMPT_MUTEX_ENV,
+                    test_open_attempt_mutex_name("inert"),
+                )
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .unwrap();
+            assert_fixture_output(output, fixture);
+        }
+    }
+
+    #[test]
+    fn stale_attempt_cannot_clear_or_overwrite_a_newer_attempt() {
+        let _serialized = LIVE_OPEN_ATTEMPT_TEST_LOCK.lock().unwrap();
+        let fixture = "live_status::tests::stale_open_attempt_parent_fixture";
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", fixture])
+            .env("HERDR_LIVE_STATUS_FIXTURE", "1")
+            .env(
+                LIVE_OPEN_ATTEMPT_MUTEX_ENV,
+                test_open_attempt_mutex_name("stale"),
+            )
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+
+        assert_fixture_output(output, fixture);
+    }
+
+    #[test]
     fn dummy_event_target_window_is_not_the_live_window() {
         assert!(is_dummy_event_target_window(true, false, 4, 4));
         assert!(is_dummy_event_target_window(false, false, 4, 4));
@@ -3795,6 +4384,85 @@ mod tests {
         assert!(is_ready_live_window(true, false, 393, 190));
         assert!(is_ready_live_window(false, true, 4, 4));
         assert!(is_live_window_candidate(false, true, 4, 4));
+    }
+
+    #[test]
+    fn discarded_pass_does_not_complete_a_frame_early() {
+        let ctx = egui::Context::default();
+        let first_frame_nr = ctx.cumulative_frame_nr();
+        let mut passes_seen = 0;
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            passes_seen += 1;
+            if ui.ctx().current_pass_index() == 0 {
+                ui.ctx().request_discard("test sizing pass");
+            }
+            assert!(!has_completed_frame_since(
+                first_frame_nr,
+                ui.ctx().cumulative_frame_nr()
+            ));
+        });
+
+        assert_eq!(passes_seen, 2);
+        assert!(has_completed_frame_since(
+            first_frame_nr,
+            ctx.cumulative_frame_nr()
+        ));
+    }
+
+    #[test]
+    fn panic_and_open_failure_events_stay_distinguishable() {
+        assert_ne!(LIVE_STATUS_PANIC_EVENT, LIVE_STATUS_OPEN_FAILURE_EVENT);
+    }
+
+    #[test]
+    fn missing_refresh_timestamp_is_due_immediately() {
+        assert!(refresh_is_due(
+            None,
+            Duration::from_secs(600),
+            Instant::now(),
+        ));
+    }
+
+    #[test]
+    fn guard_retry_outlives_the_regular_spawn_retry() {
+        // A post-open death points at the graphics stack still waking up, so
+        // its retry must give the driver more time than a plain respawn.
+        assert!(LIVE_WINDOW_GUARD_RETRY_DELAY > LIVE_WINDOW_RETRY_DELAY);
+    }
+
+    #[test]
+    fn final_live_window_attempt_cannot_spawn_an_unwatched_child() {
+        assert!(live_window_attempt_can_retry(1));
+        assert!(live_window_attempt_can_retry(2));
+        assert!(!live_window_attempt_can_retry(LIVE_WINDOW_START_ATTEMPTS));
+    }
+
+    #[test]
+    #[ignore]
+    fn terminate_and_reap_child_fixture() {
+        if std::env::var_os("HERDR_LIVE_STATUS_FIXTURE").is_none() {
+            return;
+        }
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn terminate_and_reap_child_stops_the_process() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "live_status::tests::terminate_and_reap_child_fixture",
+            ])
+            .env("HERDR_LIVE_STATUS_FIXTURE", "1")
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+
+        terminate_and_reap_child(&mut child);
+
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]
