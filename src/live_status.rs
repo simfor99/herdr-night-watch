@@ -42,8 +42,19 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // seconds caused the tray opener to kill a healthy process during startup.
 const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const LIVE_WINDOW_START_ATTEMPTS: usize = 2;
+const LIVE_WINDOW_START_ATTEMPTS: usize = 3;
 const LIVE_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
+// The viewport starts hidden and is only revealed after egui presented its
+// first frame. Until then an existing HWND does not count as drawn, so the
+// watchdog waits for visibility instead of bare window existence.
+const LIVE_WINDOW_VISIBLE_TIMEOUT: Duration = Duration::from_secs(30);
+// After the window became visible a cold-boot GPU failure can still kill the
+// process a few frames later. Guard that phase too; a clean exit code 0 there
+// is the user closing the window on purpose and must not trigger a reopen.
+const LIVE_WINDOW_POST_OPEN_GUARD: Duration = Duration::from_secs(60);
+// A retry after an unpainted hang or a post-open death waits longer than the
+// regular spawn retry: the graphics driver needs time to finish waking up.
+const LIVE_WINDOW_GUARD_RETRY_DELAY: Duration = Duration::from_secs(10);
 const PRIMARY_TRAY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_TRAY_DISCOVERY_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_INSTANCE_MUTEX: &str = "Local\\HerdrNachtwaechter.LiveStatus";
@@ -104,7 +115,11 @@ pub fn open_from_secondary_instance() -> Result<()> {
 fn open_with_owner(owner_pid: Option<u32>) -> Result<()> {
     if let Some(hwnd) = find_existing_live_window() {
         apply_taskbar_visibility(hwnd);
-        activate_live_window(hwnd);
+        // A not yet drawn window is owned by a running open attempt; showing
+        // it here would surface an unpainted viewport and the white flash.
+        if live_window_is_ready_now(hwnd) {
+            activate_live_window(hwnd);
+        }
         return Ok(());
     }
 
@@ -134,58 +149,53 @@ fn open_with_owner(owner_pid: Option<u32>) -> Result<()> {
         let mut child = child;
         for attempt in 1..=LIVE_WINDOW_START_ATTEMPTS {
             remember_open_child(child.id());
-            let started_at = Instant::now();
-            loop {
-                if let Some(hwnd) = find_live_window_for_pid(child.id()) {
-                    apply_taskbar_visibility(hwnd);
+            let mut retry_delay = LIVE_WINDOW_RETRY_DELAY;
+            match await_live_window_ready(&mut child) {
+                LiveWatchOutcome::Ready(hwnd) => {
+                    // Reveal ran inside the child after its first painted
+                    // frame; activating an unpainted HWND here would
+                    // reintroduce the white flash window.
                     activate_live_window(hwnd);
-                    finish_open_spawn();
-                    return;
-                }
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let detail = format!(
-                            "Live-Status-Prozess wurde beendet, bevor ein Fenster sichtbar wurde ({status})"
-                        );
-                        if attempt == LIVE_WINDOW_START_ATTEMPTS {
-                            record_open_failure(&detail);
+                    match guard_live_window_after_ready(&mut child) {
+                        GuardOutcome::Done => {
                             finish_open_spawn();
                             return;
                         }
-                        record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
-                        break;
-                    }
-                    Ok(None) if started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let detail = "Live-Status-Prozess läuft, aber nach 30 Sekunden wurde kein Fenster gefunden";
-                        if attempt == LIVE_WINDOW_START_ATTEMPTS {
-                            record_open_failure(detail);
-                            finish_open_spawn();
-                            return;
+                        GuardOutcome::Retry(detail) => {
+                            record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
+                            retry_delay = LIVE_WINDOW_GUARD_RETRY_DELAY;
                         }
-                        record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let detail = format!(
-                            "Live-Status-Fenster wurde nicht sichtbar; Prozessstatus konnte nicht geprüft werden: {error}"
-                        );
-                        if attempt == LIVE_WINDOW_START_ATTEMPTS {
-                            record_open_failure(&detail);
-                            finish_open_spawn();
-                            return;
-                        }
-                        record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
-                        break;
                     }
                 }
-                thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
+                LiveWatchOutcome::ChildExited(detail) => {
+                    if attempt == LIVE_WINDOW_START_ATTEMPTS {
+                        record_open_failure(&detail);
+                        finish_open_spawn();
+                        return;
+                    }
+                    record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
+                }
+                LiveWatchOutcome::NoWindowTimeout => {
+                    let detail = "Live-Status-Prozess läuft, aber nach 30 Sekunden wurde kein Fenster gefunden";
+                    if attempt == LIVE_WINDOW_START_ATTEMPTS {
+                        record_open_failure(detail);
+                        finish_open_spawn();
+                        return;
+                    }
+                    record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
+                }
+                LiveWatchOutcome::UnpaintedTimeout => {
+                    let detail = "Live-Status-Fenster wurde gefunden, blieb aber nach 30 Sekunden ungezeichnet";
+                    if attempt == LIVE_WINDOW_START_ATTEMPTS {
+                        record_open_failure(detail);
+                        finish_open_spawn();
+                        return;
+                    }
+                    record_open_failure(&format!("{detail}; neuer Versuch wird gestartet"));
+                    retry_delay = LIVE_WINDOW_GUARD_RETRY_DELAY;
+                }
             }
-            thread::sleep(LIVE_WINDOW_RETRY_DELAY);
+            thread::sleep(retry_delay);
             child = match spawn_live_status_process(&executable, owner_pid) {
                 Ok(child) => {
                     // Register the replacement immediately so a concurrent
@@ -205,6 +215,100 @@ fn open_with_owner(owner_pid: Option<u32>) -> Result<()> {
         finish_open_spawn();
     });
     Ok(())
+}
+
+enum LiveWatchOutcome {
+    /// The window exists and reported itself drawn (visible or minimized).
+    Ready(HWND),
+    /// The process exited before any window became visible; carries the
+    /// already formatted log detail.
+    ChildExited(String),
+    /// The process lives but never created a window in time.
+    NoWindowTimeout,
+    /// A window exists but never became visible in time.
+    UnpaintedTimeout,
+}
+
+/// Phase one and two of the watchdog: wait until the child presents a live
+/// window (not merely creates its HWND), the child exits, or a timeout hits.
+/// A cold boot can leave the graphics stack unable to paint for a while, so
+/// existence alone must not count as success.
+fn await_live_window_ready(child: &mut Child) -> LiveWatchOutcome {
+    let started_at = Instant::now();
+    let mut found_at: Option<Instant> = None;
+    let mut hwnd: Option<HWND> = None;
+    loop {
+        if hwnd.is_none()
+            && let Some(found) = find_live_window_for_pid(child.id())
+        {
+            apply_taskbar_visibility(found);
+            hwnd = Some(found);
+            found_at = Some(Instant::now());
+        }
+        if let Some(hwnd) = hwnd
+            && live_window_is_ready_now(hwnd)
+        {
+            return LiveWatchOutcome::Ready(hwnd);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return LiveWatchOutcome::ChildExited(format!(
+                    "Live-Status-Prozess wurde beendet, bevor ein Fenster sichtbar wurde ({status})"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return LiveWatchOutcome::ChildExited(format!(
+                    "Live-Status-Fenster wurde nicht sichtbar; Prozessstatus konnte nicht geprüft werden: {error}"
+                ));
+            }
+        }
+        if hwnd.is_none() && started_at.elapsed() >= LIVE_WINDOW_START_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return LiveWatchOutcome::NoWindowTimeout;
+        }
+        if found_at.is_some_and(|found| found.elapsed() >= LIVE_WINDOW_VISIBLE_TIMEOUT) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return LiveWatchOutcome::UnpaintedTimeout;
+        }
+        thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
+    }
+}
+
+enum GuardOutcome {
+    /// The window stays open (or the user closed it cleanly); nothing to do.
+    Done,
+    /// The child died shortly after opening; carries the log detail.
+    Retry(String),
+}
+
+/// Phase three of the watchdog: after the window presented itself, a cold-boot
+/// GPU failure can still kill the process a few frames later. A clean exit
+/// code 0 means the user closed the window on purpose and must not reopen it.
+fn guard_live_window_after_ready(child: &mut Child) -> GuardOutcome {
+    let started_at = Instant::now();
+    while started_at.elapsed() < LIVE_WINDOW_POST_OPEN_GUARD {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return GuardOutcome::Done,
+            Ok(Some(status)) => {
+                return GuardOutcome::Retry(format!(
+                    "Live-Status-Prozess endete kurz nach dem Öffnen ({status})"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return GuardOutcome::Retry(format!(
+                    "Prozessstatus des Live-Status-Fensters konnte nach dem Öffnen nicht geprüft werden: {error}"
+                ));
+            }
+        }
+        thread::sleep(LIVE_WINDOW_POLL_INTERVAL);
+    }
+    GuardOutcome::Done
 }
 
 pub fn close() {
@@ -750,12 +854,27 @@ fn is_showable_live_window(visible: bool, minimized: bool, width: i32, height: i
     width >= LIVE_WINDOW_MIN_READY_WIDTH && height >= LIVE_WINDOW_MIN_READY_HEIGHT
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_ready_live_window(visible: bool, minimized: bool, width: i32, height: i32) -> bool {
     if minimized {
         return true;
     }
     visible && width >= LIVE_WINDOW_MIN_READY_WIDTH && height >= LIVE_WINDOW_MIN_READY_HEIGHT
+}
+
+/// Whether a concrete live window already presented itself. The viewport
+/// starts hidden and reveals after its first painted frame, so visibility is
+/// the reliable "first frame done" signal for the tray-side watchdog.
+fn live_window_is_ready_now(hwnd: HWND) -> bool {
+    let (visible, minimized, width, height) = live_window_metrics(hwnd);
+    is_ready_live_window(visible, minimized, width, height)
+}
+
+/// The update callback runs once per painted frame. The first run paints the
+/// initial frame while the window is still hidden; from the second run on
+/// that frame is guaranteed presented and the viewport can be shown without
+/// ever surfacing an unpainted, white surface.
+fn should_reveal_now(frames_seen: u32) -> bool {
+    frames_seen >= 2
 }
 
 fn apply_taskbar_visibility(hwnd: HWND) {
@@ -795,12 +914,18 @@ fn record_open_failure(detail: &str) {
 }
 
 pub fn run() -> Result<()> {
+    install_panic_logger();
     let instance_mutex = match acquire_live_instance()? {
         Some(handle) => handle,
         None => {
             if let Some(hwnd) = find_live_window() {
                 apply_taskbar_visibility(hwnd);
-                activate_live_window(hwnd);
+                // Only activate a window that already drew a frame; a still
+                // hidden one belongs to a running open attempt in this or the
+                // tray process and must not be forced visible.
+                if live_window_is_ready_now(hwnd) {
+                    activate_live_window(hwnd);
+                }
             }
             return Ok(());
         }
@@ -814,6 +939,18 @@ pub fn run() -> Result<()> {
         let _ = CloseHandle(instance_mutex);
     }
     result
+}
+
+/// A panicking live child dies with exit code 101 and, without this hook,
+/// leaves no trace: the watchdog may already have reported success and the
+/// Windows subsystem hides stderr. Write the panic into the shared error log
+/// so the next cold boot finally names the real culprit.
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        record_open_failure(&format!("Live-Status-Panik: {info}"));
+        default_hook(info);
+    }));
 }
 
 fn acquire_live_instance() -> Result<Option<HANDLE>> {
@@ -950,6 +1087,11 @@ fn monitor_work_areas() -> Vec<WorkArea> {
 fn run_window() -> Result<()> {
     let scale = window_settings::live_status_scale();
     let mut viewport = egui::ViewportBuilder::default()
+        // Start hidden and let the app reveal itself after its first painted
+        // frame: during a cold boot the GPU driver may not be ready yet, and
+        // a viewport shown before its first paint is the white flash window.
+        // Visibility thereby becomes the watchdog's "first frame done" signal.
+        .with_visible(false)
         .with_inner_size([DESIGN_WIDTH * scale, DESIGN_HEIGHT * scale])
         .with_min_inner_size([
             DESIGN_WIDTH * window_settings::MIN_LIVE_STATUS_SCALE,
@@ -1052,6 +1194,8 @@ struct LiveStatusApp {
     scale: f32,
     last_saved_position: Option<[f32; 2]>,
     owner_pid: Option<u32>,
+    reveal_pending: bool,
+    frames_seen: u32,
 }
 
 impl Drop for LiveStatusApp {
@@ -1116,6 +1260,27 @@ impl LiveStatusApp {
             scale,
             last_saved_position: window_settings::live_status_position(),
             owner_pid,
+            reveal_pending: true,
+            frames_seen: 0,
+        }
+    }
+
+    /// Reveal the viewport only after egui presented one frame. The update
+    /// callback runs once per painted frame, so on its second run the first
+    /// frame is guaranteed to have been presented and showing the window can
+    /// no longer surface an unpainted, white viewport.
+    fn reveal_after_first_frame(&mut self, ctx: &egui::Context) {
+        if !self.reveal_pending {
+            return;
+        }
+        self.frames_seen += 1;
+        if should_reveal_now(self.frames_seen) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            self.reveal_pending = false;
+        } else {
+            // The reveal decision runs in the next update pass, so make sure
+            // one is scheduled instead of waiting for external input.
+            ctx.request_repaint();
         }
     }
 
@@ -1320,6 +1485,7 @@ impl eframe::App for LiveStatusApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+        self.reveal_after_first_frame(ui.ctx());
         let current_language = Language::current();
         if current_language != self.language {
             self.language = current_language;
@@ -3795,6 +3961,23 @@ mod tests {
         assert!(is_ready_live_window(true, false, 393, 190));
         assert!(is_ready_live_window(false, true, 4, 4));
         assert!(is_live_window_candidate(false, true, 4, 4));
+    }
+
+    #[test]
+    fn reveal_waits_for_one_presented_frame() {
+        // The first update pass paints the initial frame while hidden; only
+        // the second pass may show the viewport.
+        assert!(!should_reveal_now(0));
+        assert!(!should_reveal_now(1));
+        assert!(should_reveal_now(2));
+        assert!(should_reveal_now(3));
+    }
+
+    #[test]
+    fn guard_retry_outlives_the_regular_spawn_retry() {
+        // A post-open death points at the graphics stack still waking up, so
+        // its retry must give the driver more time than a plain respawn.
+        assert!(LIVE_WINDOW_GUARD_RETRY_DELAY > LIVE_WINDOW_RETRY_DELAY);
     }
 
     #[test]
