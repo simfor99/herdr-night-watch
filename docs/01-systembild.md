@@ -46,7 +46,7 @@ Rust-Backend startet `wsl.exe --watch` als fensterlosen Hintergrundprozess
         v
 Wächter prüft aktuellen Herdr-Status, Ruhezeit und Warnfrist
         |
-        +-- Nachtlauf aktiv -> Tray setzt Windows-Ausführungsstatus gegen automatischen Leerlauf-Energiesparmodus
+        +-- Tray läuft -> Windows-Ausführungsstatus blockiert automatischen Leerlauf-Energiesparmodus
         |
         +-- Unsicherheit/blocked/fehlender Status -> refused, kein Shutdown
         |
@@ -66,7 +66,7 @@ Die öffentliche Anwendung speichert zwei lokale Angaben unter dem Windows-Benut
 
 Der Wetterort wird zusätzlich als lokale Windows-Registry-Einstellung gespeichert. Standardmäßig ist Leipzig hinterlegt. Die Live-App fragt die Temperatur im Hintergrund über Open-Meteo ab und zeigt bei fehlender Verbindung keinen erfundenen Wert. Diese Anzeige ist vollständig vom Wächter getrennt und kann keine Energieaktion auslösen.
 
-Auch die Position und die proportionale Größe des Live-Fensters werden lokal unter dem Windows-Benutzerkonto gespeichert. Beim erneuten Öffnen wird ein vorhandenes, bereits gezeichnetes Fenster restauriert und nach vorn geholt; ein noch verstecktes Vorbereitungsfenster bleibt unsichtbar, bis der erste Glow-Frame fertig ist. Der Startpfad schützt zusätzlich mit einer benannten Windows-Sperre vor doppelten Live-Fenstern. Fehlschläge beim Öffnen werden unter `logs/ui-errors.log` protokolliert. Ein Rechtsklick auf freie Fläche setzt die Größe auf 100 Prozent zurück.
+Auch die Position und die proportionale Größe des Live-Fensters sowie die Sichtbarkeit des blass-orangen Uhr-Sekundenzeigers werden lokal unter dem Windows-Benutzerkonto gespeichert. Beim erneuten Öffnen wird ein vorhandenes, bereits gezeichnetes Fenster restauriert und nach vorn geholt; ein noch verstecktes Vorbereitungsfenster bleibt unsichtbar, bis der erste Glow-Frame fertig ist. Der Startpfad schützt zusätzlich mit einer benannten Windows-Sperre vor doppelten Live-Fenstern. Fehlschläge beim Öffnen werden unter `logs/ui-errors.log` protokolliert. Ein Rechtsklick auf freie Fläche oder direkt auf die Uhr öffnet das Kontextmenü für Größe und Sekundenzeiger.
 
 ## Persistenter Zustand und Protokoll
 
@@ -87,7 +87,7 @@ Neue Läufe speichern `monitoring_scope=live_agents` und die Zahl der beim Start
 
 Die Abschlussaktion und die Warnfrist werden beim Start zusätzlich in `active-run.json` eingefroren. Damit kann ein Klick im Live-Fenster keinen schon gestarteten Ablauf verändern. Der Schalter und das Sekundenfeld sind deshalb während eines aktiven Nachtlaufs bewusst gesperrt. Im Modus `sleep` läuft dieselbe gewählte Warnfrist ab; danach fordert der Wächter Windows zum Energiesparen auf. Im Modus `shutdown` wird der bekannte Windows-Shutdown angesetzt.
 
-Solange der Nachtlauf den Zustand `Watching` oder `ShutdownWarning` meldet, setzt die Tray-App den Windows-Ausführungsstatus `ES_SYSTEM_REQUIRED`. Dadurch darf ein konfigurierter Leerlauf-Timer den Rechner nicht ungefragt in den Energiesparmodus schicken, während Herdr noch überwacht wird. Der Bildschirm darf sich weiterhin ausschalten. Die Sperre wird beim Stoppen, beim Ende des Nachtlaufs und beim Beenden der Tray-App wieder freigegeben. Eine vom Wächter selbst bestätigte Energieaktion bleibt davon unberührt.
+Solange die Tray-App läuft, setzt sie unabhängig vom Nachtmodus den Windows-Ausführungsstatus `ES_SYSTEM_REQUIRED`. Dadurch darf ein konfigurierter Leerlauf-Timer den Rechner nicht ungefragt in den Energiesparmodus schicken, auch wenn gerade kein Nachtlauf aktiv ist. Der Bildschirm darf sich weiterhin ausschalten. Erst beim Beenden der Tray-App wird die Sperre wieder freigegeben. Eine bewusste Energieaktion des Benutzers oder des Nachtwächters bleibt davon unberührt.
 
 Für Neustarts vergleicht der Wächter nicht nur die WSL-Boot-ID, sondern zusätzlich die letzte Windows-Bootzeit. Ändert sich eine der beiden Marken, gilt der alte Lauf als veraltet: Warnung und aktiver Zustand werden zurückgesetzt und als `system_restart` protokolliert.
 
@@ -95,7 +95,7 @@ Der Wächter prüft zusätzlich zwei unabhängige Internet-Endpunkte. Erst wenn 
 
 Die Tray-App schreibt zusätzlich während ihrer Laufzeit einen temporären Sitzungsmarker. Beim normalen Beenden wird er entfernt. Findet ein späterer Start den Marker ohne `expected_exit`, ergänzt er `tray-history.csv` um „Tray-App unplanmäßig beendet“. Das beweist keinen Absturz im engeren Sinn: Es kann auch ein erzwungenes Beenden, ein Windows-Neustart oder ein Stromverlust gewesen sein. Erwartete Energieaktionen werden vorher markiert und erzeugen keinen falschen Absturz-Eintrag.
 
-Abbrüche erhalten ebenfalls einen eigenen Verlauf. `cancellation-history.csv` nennt als Quelle zum Beispiel `live_window_moon`, `tray_menu`, `warning_dialog`, `manual_stop_script` oder `start_failed`. Damit ist am Folgetag nachvollziehbar, warum ein Nachtlauf nicht mehr aktiv war.
+Abbrüche erhalten ebenfalls einen eigenen Verlauf. `cancellation-history.csv` nennt als Quelle zum Beispiel `live_window_moon`, `tray_menu`, `warning_dialog`, `manual_stop_script`, `start_failed` oder `power_guard_failed`. Damit ist am Folgetag nachvollziehbar, warum ein Nachtlauf nicht mehr aktiv war.
 
 `live_agent_summary()` liefert dieselbe aktuelle Herdr-Sicht für Tooltip und Live-Fenster. Die Shutdown-Entscheidung ruft Herdr unabhängig erneut ab und vertraut nie auf eine alte Anzeige. Ist Herdr nicht erreichbar oder ein Agentenstatus unvollständig, wird kein Shutdown vorbereitet.
 

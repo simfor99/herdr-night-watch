@@ -16,16 +16,19 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{
-    Mutex,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender},
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GetLastError, HANDLE, HWND, LPARAM, RECT};
+use windows_sys::Win32::Foundation::{
+    BOOL, CloseHandle, GetLastError, HANDLE, HWND, LPARAM, RECT, SYSTEMTIME,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
 };
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
@@ -115,9 +118,11 @@ static NEXT_OPEN_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 // The pid of the most recently spawned live child, kept beyond the open
 // attempt so later opens and a tray quit can still clean it up.
 static LAST_LIVE_CHILD_PID: Mutex<Option<u32>> = Mutex::new(None);
-const MOON_SLOT_WIDTH: f32 = 77.0;
+const MOON_SLOT_WIDTH: f32 = 83.0;
 const MOON_ICON_DIAMETER: f32 = 59.5;
-const MOON_RIGHT_INSET: f32 = 34.0;
+const MOON_RIGHT_INSET: f32 = 13.5;
+const MOON_HALO_INNER_RADIUS: f32 = 1.16;
+const MOON_HALO_OUTER_RADIUS: f32 = 1.35;
 const KPI_PANEL_WIDTH: f32 = 264.0;
 
 pub fn open() -> Result<()> {
@@ -1406,6 +1411,7 @@ struct LiveStatusApp {
     resize_preview_scale: Option<f32>,
     resize_preview_window_size: Option<egui::Vec2>,
     context_menu_pos: Option<egui::Pos2>,
+    clock_second_hand_visible: bool,
     scale: f32,
     last_saved_position: Option<[f32; 2]>,
     owner_pid: Option<u32>,
@@ -1470,6 +1476,7 @@ impl LiveStatusApp {
             resize_preview_scale: None,
             resize_preview_window_size: None,
             context_menu_pos: None,
+            clock_second_hand_visible: window_settings::clock_second_hand_visible(),
             scale,
             last_saved_position: window_settings::live_status_position(),
             owner_pid,
@@ -1942,6 +1949,7 @@ impl eframe::App for LiveStatusApp {
                                         gradient_rect,
                                         moon.temperature_c,
                                         moon.phase,
+                                        self.clock_second_hand_visible,
                                     )
                                     .on_hover_text(moon.tooltip);
                                 if response.hovered() && !self.action_in_progress {
@@ -2242,7 +2250,7 @@ fn clamp_rect_inside(rect: egui::Rect, bounds: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(min, rect.size())
 }
 
-fn is_window_interactive_position(rect: egui::Rect, position: egui::Pos2) -> bool {
+fn is_live_context_menu_position(rect: egui::Rect, position: egui::Pos2) -> bool {
     let completion_switch = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 86.0, rect.top() + 12.0),
         egui::pos2(rect.left() + 168.0, rect.top() + 50.0),
@@ -2251,20 +2259,16 @@ fn is_window_interactive_position(rect: egui::Rect, position: egui::Pos2) -> boo
         egui::pos2(rect.left() + 176.0, rect.top() + 12.0),
         egui::pos2(rect.left() + 244.0, rect.top() + 50.0),
     );
-    let moon = egui::Rect::from_min_max(
-        egui::pos2(rect.right() - 200.0, rect.top() + 28.0),
-        egui::pos2(rect.right() - 20.0, rect.top() + 116.0),
-    );
     let control_hood = egui::Rect::from_min_max(
         egui::pos2(rect.right() - 138.0, rect.top() + 1.0),
         egui::pos2(rect.right() - 3.0, rect.top() + 30.0),
     );
-    completion_switch.contains(position)
-        || warning_seconds.contains(position)
-        || moon.contains(position)
-        || control_hood.contains(position)
-        || weather_control_rect(rect).contains(position)
-        || resize_grip_rect(rect).contains(position)
+    rect.contains(position)
+        && !completion_switch.contains(position)
+        && !warning_seconds.contains(position)
+        && !control_hood.contains(position)
+        && !weather_control_rect(rect).contains(position)
+        && !resize_grip_rect(rect).contains(position)
 }
 
 fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
@@ -2277,7 +2281,7 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
         )
     });
     if secondary_clicked
-        && pointer.is_some_and(|position| !is_window_interactive_position(rect, position))
+        && pointer.is_some_and(|position| is_live_context_menu_position(rect, position))
     {
         app.context_menu_pos = pointer;
     }
@@ -2287,6 +2291,7 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
 
     let scale_label = format!("{:.0} %", app.scale * 100.0);
     let mut reset_requested = false;
+    let mut second_hand_choice = None;
     let menu = egui::Area::new(egui::Id::new("live_status_context_menu"))
         .order(egui::Order::Foreground)
         .fixed_pos(menu_position + egui::vec2(4.0, 4.0))
@@ -2305,9 +2310,26 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
                 {
                     reset_requested = true;
                 }
+                ui.separator();
+                let mut show_second_hand = app.clock_second_hand_visible;
+                if ui
+                    .checkbox(
+                        &mut show_second_hand,
+                        app.language
+                            .text("Orangen Sekundenzeiger anzeigen", "Show orange second hand"),
+                    )
+                    .changed()
+                {
+                    second_hand_choice = Some(show_second_hand);
+                }
             });
         });
-    if reset_requested {
+    if let Some(show_second_hand) = second_hand_choice {
+        match window_settings::set_clock_second_hand_visible(show_second_hand) {
+            Ok(()) => app.clock_second_hand_visible = show_second_hand,
+            Err(error) => app.error = Some(error.to_string()),
+        }
+    } else if reset_requested {
         apply_live_status_scale(
             app,
             ui.ctx(),
@@ -2966,6 +2988,7 @@ fn moon_icon(
     gradient_rect: egui::Rect,
     temperature_c: Option<f64>,
     phase: f64,
+    show_second_hand: bool,
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::click());
@@ -2975,8 +2998,8 @@ fn moon_icon(
     let phase = phase.rem_euclid(1.0);
     let halo_outer = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18);
     let halo_inner = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 32);
-    painter.circle_filled(center, radius * 1.28, halo_outer);
-    painter.circle_filled(center, radius * 1.14, halo_inner);
+    painter.circle_filled(center, radius * MOON_HALO_OUTER_RADIUS, halo_outer);
+    painter.circle_filled(center, radius * MOON_HALO_INNER_RADIUS, halo_inner);
     let illumination = (1.0 - (std::f32::consts::TAU * phase as f32).cos()) * 0.5;
     let dark_side = if phase < 0.5 { 1.0 } else { -1.0 };
     let separation = moon_disc_separation(illumination) * radius;
@@ -2989,6 +3012,9 @@ fn moon_icon(
         radius,
         gradient_color_at(gradient_rect, dark_center),
     );
+    paint_clock_index_marks(painter, center, radius);
+    paint_clock_cardinal_labels(painter, center, radius);
+    paint_clock_hands(painter, center, radius, show_second_hand);
     if let Some(temperature_c) = temperature_c {
         paint_moon_temperature(
             painter,
@@ -3053,6 +3079,268 @@ fn paint_moon_shadow(
 
 fn moon_temperature_label(temperature_c: f64) -> String {
     format!("{temperature_c:.0}°C")
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClockHandTurns {
+    hour: f32,
+    minute: f32,
+    second: f32,
+}
+
+const HOUR_HAND_LENGTH: f32 = 0.72;
+const MINUTE_HAND_LENGTH: f32 = 0.96;
+const HOUR_HAND_BASE_WIDTH: f32 = 4.4;
+const MINUTE_HAND_BASE_WIDTH: f32 = 3.5;
+const MAIN_HAND_COLOR: egui::Color32 = PASTEL_GREEN;
+const MAIN_HAND_INNER_OUTLINE: egui::Color32 = egui::Color32::from_rgb(247, 241, 229);
+const MAIN_HAND_OUTER_OUTLINE: egui::Color32 = egui::Color32::from_rgb(5, 8, 15);
+const SECOND_HAND_SHAFT_WIDTH: f32 = 0.75;
+const SECOND_HAND_COLOR: egui::Color32 = egui::Color32::from_rgb(222, 142, 92);
+const CLOCK_CARDINAL_LABEL_RADIUS: f32 = 1.145;
+const CLOCK_CARDINAL_FONT_NAME: &str = "russo_one";
+const CLOCK_CARDINAL_FONT_SIZE: f32 = 9.3;
+const RUSSO_ONE_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/RussoOne-Regular.ttf");
+
+#[derive(Clone, Copy, Debug)]
+struct ClockIndexMarkSpec {
+    turns: f32,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClockCardinalLabelSpec {
+    turns: f32,
+    text: &'static str,
+}
+
+fn clock_index_mark_specs() -> [ClockIndexMarkSpec; 8] {
+    const MINOR_HOURS: [u8; 8] = [1, 2, 4, 5, 7, 8, 10, 11];
+    std::array::from_fn(|index| ClockIndexMarkSpec {
+        turns: MINOR_HOURS[index] as f32 / 12.0,
+        width: 2.0,
+        height: 3.5,
+    })
+}
+
+fn clock_cardinal_label_specs() -> [ClockCardinalLabelSpec; 4] {
+    [
+        ClockCardinalLabelSpec {
+            turns: 0.0,
+            text: "12",
+        },
+        ClockCardinalLabelSpec {
+            turns: 0.25,
+            text: "3",
+        },
+        ClockCardinalLabelSpec {
+            turns: 0.5,
+            text: "6",
+        },
+        ClockCardinalLabelSpec {
+            turns: 0.75,
+            text: "9",
+        },
+    ]
+}
+
+fn clock_hand_turns(hour: u16, minute: u16, second: u16, milliseconds: u16) -> ClockHandTurns {
+    let second = second as f32 + milliseconds as f32 / 1_000.0;
+    let minute = minute as f32 + second / 60.0;
+    let hour = (hour % 12) as f32 + minute / 60.0;
+    ClockHandTurns {
+        hour: hour / 12.0,
+        minute: minute / 60.0,
+        second: second / 60.0,
+    }
+}
+
+fn local_clock_hand_turns() -> ClockHandTurns {
+    let mut local_time = SYSTEMTIME {
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    unsafe { GetLocalTime(&mut local_time) };
+    clock_hand_turns(
+        local_time.wHour,
+        local_time.wMinute,
+        local_time.wSecond,
+        local_time.wMilliseconds,
+    )
+}
+
+fn clock_direction(turns: f32) -> egui::Vec2 {
+    let angle = turns * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+    egui::vec2(angle.cos(), angle.sin())
+}
+
+fn paint_clock_index_marks(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    let color = egui::Color32::from_rgba_unmultiplied(247, 241, 229, 72);
+    for mark in clock_index_mark_specs() {
+        painter.line_segment(
+            clock_index_mark_segment(center, radius, mark.turns, mark.height),
+            egui::Stroke::new(mark.width, color),
+        );
+    }
+}
+
+fn paint_clock_cardinal_labels(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    let fill = egui::Color32::from_rgb(225, 232, 190);
+    let outline = egui::Color32::from_rgba_unmultiplied(5, 8, 15, 218);
+    let font = russo_one_font(CLOCK_CARDINAL_FONT_SIZE);
+    for label in clock_cardinal_label_specs() {
+        let position = clock_cardinal_label_position(center, radius, label.turns);
+        paint_outlined_label(painter, position, label.text, font.clone(), fill, outline);
+    }
+}
+
+fn russo_one_font(size: f32) -> egui::FontId {
+    egui::FontId::new(
+        size,
+        egui::FontFamily::Name(Arc::from(CLOCK_CARDINAL_FONT_NAME)),
+    )
+}
+
+fn clock_cardinal_label_position(center: egui::Pos2, radius: f32, turns: f32) -> egui::Pos2 {
+    center + clock_direction(turns) * radius * CLOCK_CARDINAL_LABEL_RADIUS
+}
+
+fn clock_index_mark_segment(
+    center: egui::Pos2,
+    radius: f32,
+    turns: f32,
+    height: f32,
+) -> [egui::Pos2; 2] {
+    let direction = clock_direction(turns);
+    let inner = center + direction * radius * 1.06;
+    [inner, inner + direction * height]
+}
+
+fn needle_hand_points(
+    center: egui::Pos2,
+    radius: f32,
+    turns: f32,
+    length: f32,
+    max_width: f32,
+) -> [egui::Pos2; 5] {
+    let direction = clock_direction(turns);
+    let tangent = egui::vec2(-direction.y, direction.x);
+    let root_half_width = max_width * 0.24;
+    let shoulder = center + direction * radius * length * 0.8;
+    let shoulder_half_width = max_width / 2.0;
+    [
+        center - tangent * root_half_width,
+        shoulder - tangent * shoulder_half_width,
+        center + direction * radius * length,
+        shoulder + tangent * shoulder_half_width,
+        center + tangent * root_half_width,
+    ]
+}
+
+fn second_hand_points(center: egui::Pos2, radius: f32, turns: f32) -> [egui::Pos2; 5] {
+    let direction = clock_direction(turns);
+    let tangent = egui::vec2(-direction.y, direction.x);
+    let half_width = SECOND_HAND_SHAFT_WIDTH / 2.0;
+    let tail = center - direction * radius * 0.16;
+    let shoulder = center + direction * radius * 0.88;
+    [
+        tail - tangent * half_width,
+        shoulder - tangent * half_width,
+        center + direction * radius * 1.02,
+        shoulder + tangent * half_width,
+        tail + tangent * half_width,
+    ]
+}
+
+fn paint_layered_needle_hand(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    turns: f32,
+    length: f32,
+    max_width: f32,
+) {
+    let points = needle_hand_points(center, radius, turns, length, max_width);
+    let one_pixel = outline_width_in_points(painter.pixels_per_point());
+    painter.add(egui::Shape::convex_polygon(
+        points.to_vec(),
+        MAIN_HAND_COLOR,
+        egui::Stroke::new(one_pixel * 2.0, MAIN_HAND_OUTER_OUTLINE),
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        points.to_vec(),
+        MAIN_HAND_COLOR,
+        egui::Stroke::new(one_pixel, MAIN_HAND_INNER_OUTLINE),
+    ));
+}
+
+fn paint_outlined_hand_polygon<const N: usize>(
+    painter: &egui::Painter,
+    points: [egui::Pos2; N],
+    color: egui::Color32,
+) {
+    let outline = egui::Color32::from_rgba_unmultiplied(5, 8, 15, 220);
+    painter.add(egui::Shape::convex_polygon(
+        points.to_vec(),
+        color,
+        egui::Stroke::new(outline_width_in_points(painter.pixels_per_point()), outline),
+    ));
+}
+
+fn paint_clock_hands(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    show_second_hand: bool,
+) {
+    let turns = local_clock_hand_turns();
+
+    paint_layered_needle_hand(
+        painter,
+        center,
+        radius,
+        turns.hour,
+        HOUR_HAND_LENGTH,
+        HOUR_HAND_BASE_WIDTH,
+    );
+    paint_layered_needle_hand(
+        painter,
+        center,
+        radius,
+        turns.minute,
+        MINUTE_HAND_LENGTH,
+        MINUTE_HAND_BASE_WIDTH,
+    );
+    if show_second_hand {
+        paint_outlined_hand_polygon(
+            painter,
+            second_hand_points(center, radius, turns.second),
+            SECOND_HAND_COLOR,
+        );
+    }
+
+    let pin_outline = 2.6 + outline_width_in_points(painter.pixels_per_point());
+    painter.circle_filled(
+        center,
+        pin_outline,
+        egui::Color32::from_rgba_unmultiplied(5, 8, 15, 220),
+    );
+    painter.circle_filled(
+        center,
+        1.7,
+        if show_second_hand {
+            SECOND_HAND_COLOR
+        } else {
+            MAIN_HAND_INNER_OUTLINE
+        },
+    );
 }
 
 fn outline_width_in_points(pixels_per_point: f32) -> f32 {
@@ -3877,6 +4165,17 @@ fn glassy_frame(ui: &mut egui::Ui) -> egui::Frame {
 }
 
 fn configure_visuals(context: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        CLOCK_CARDINAL_FONT_NAME.to_owned(),
+        Arc::new(egui::FontData::from_static(RUSSO_ONE_FONT_BYTES)),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name(Arc::from(CLOCK_CARDINAL_FONT_NAME)),
+        vec![CLOCK_CARDINAL_FONT_NAME.to_owned()],
+    );
+    context.set_fonts(fonts);
+
     let mut visuals = egui::Visuals::dark();
     visuals.extreme_bg_color = BG_BOTTOM;
     visuals.faint_bg_color = egui::Color32::from_rgb(28, 36, 56);
@@ -4085,6 +4384,136 @@ mod tests {
             let length = (dx * dx + dy * dy).sqrt();
             assert!((length - 1.0).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn clock_hands_point_to_twelve_and_three_on_the_hour() {
+        let midnight = clock_hand_turns(0, 0, 0, 0);
+        assert!((midnight.hour - 0.0).abs() < f32::EPSILON);
+        assert!((midnight.minute - 0.0).abs() < f32::EPSILON);
+        assert!((midnight.second - 0.0).abs() < f32::EPSILON);
+
+        let three_oclock = clock_hand_turns(3, 0, 0, 0);
+        assert!((three_oclock.hour - 0.25).abs() < f32::EPSILON);
+        assert!((three_oclock.minute - 0.0).abs() < f32::EPSILON);
+        assert!((three_oclock.second - 0.0).abs() < f32::EPSILON);
+
+        let half_past_three = clock_hand_turns(3, 30, 30, 500);
+        assert!((half_past_three.second - 30.5 / 60.0).abs() < 0.0001);
+        assert!((half_past_three.minute - (30.0 + 30.5 / 60.0) / 60.0).abs() < 0.0001);
+        assert!((half_past_three.hour - (3.0 + (30.0 + 30.5 / 60.0) / 60.0) / 12.0).abs() < 0.0001);
+        assert!(
+            (clock_hand_turns(23, 0, 0, 0).hour - clock_hand_turns(11, 0, 0, 0).hour).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn clock_dial_replaces_quarter_hour_marks_with_cardinal_labels() {
+        let marks = clock_index_mark_specs();
+
+        assert_eq!(marks.len(), 8);
+        for mark in marks {
+            let hour = (mark.turns * 12.0).round() as u8;
+            assert_ne!(hour % 3, 0);
+            assert_eq!(mark.width, 2.0);
+            assert_eq!(mark.height, 3.5);
+        }
+
+        let labels = clock_cardinal_label_specs();
+        assert_eq!(labels.map(|label| label.text), ["12", "3", "6", "9"]);
+        assert_eq!(labels.map(|label| label.turns), [0.0, 0.25, 0.5, 0.75]);
+    }
+
+    #[test]
+    fn clock_index_marks_stay_outside_the_moon_and_inside_its_halo() {
+        let center = egui::Pos2::ZERO;
+        let radius = 30.0;
+        let [inner, outer] = clock_index_mark_segment(center, radius, 0.0, 3.5);
+
+        assert!(inner.distance(center) > radius);
+        assert!((outer.distance(inner) - 3.5).abs() < 0.001);
+        assert!(outer.distance(center) < radius * MOON_HALO_OUTER_RADIUS);
+    }
+
+    #[test]
+    fn clock_cardinal_numerals_stay_centered_in_the_expanded_moon_halo() {
+        let center = egui::Pos2::ZERO;
+        let radius = 30.0;
+
+        for label in clock_cardinal_label_specs() {
+            let position = clock_cardinal_label_position(center, radius, label.turns);
+            assert!(position.distance(center) > radius);
+            assert!(position.distance(center) < radius * MOON_HALO_OUTER_RADIUS);
+        }
+        assert_eq!(MOON_HALO_OUTER_RADIUS, 1.35);
+    }
+
+    #[test]
+    fn clock_cardinal_numerals_use_russo_one_at_one_and_a_half_times_size() {
+        assert_eq!(CLOCK_CARDINAL_FONT_NAME, "russo_one");
+        assert_eq!(CLOCK_CARDINAL_FONT_SIZE, 9.3);
+        assert!(RUSSO_ONE_FONT_BYTES.len() > 30_000);
+    }
+
+    #[test]
+    fn moon_moves_thirteen_and_a_half_points_right_for_balanced_outer_spacing() {
+        assert_eq!(MOON_RIGHT_INSET + MOON_SLOT_WIDTH / 2.0, 55.0);
+    }
+
+    #[test]
+    fn needle_hand_flares_from_a_narrow_root_before_its_exact_tip() {
+        let points = needle_hand_points(egui::Pos2::ZERO, 10.0, 0.0, 0.96, 4.0);
+
+        assert_eq!(points.len(), 5);
+        assert!(points[0].distance(egui::pos2(-0.96, 0.0)) < 0.001);
+        assert!(points[1].distance(egui::pos2(-2.0, -7.68)) < 0.001);
+        assert!(points[2].distance(egui::pos2(0.0, -9.6)) < 0.001);
+        assert!(points[3].distance(egui::pos2(2.0, -7.68)) < 0.001);
+        assert!(points[4].distance(egui::pos2(0.96, 0.0)) < 0.001);
+    }
+
+    #[test]
+    fn both_main_hands_use_green_with_white_and_black_contours() {
+        assert_eq!(MAIN_HAND_COLOR, PASTEL_GREEN);
+        assert_eq!(
+            MAIN_HAND_INNER_OUTLINE,
+            egui::Color32::from_rgb(247, 241, 229)
+        );
+        assert_eq!(MAIN_HAND_OUTER_OUTLINE, egui::Color32::from_rgb(5, 8, 15));
+    }
+
+    #[test]
+    fn main_hands_reach_beyond_the_temperature_and_to_the_outer_edge() {
+        assert_eq!(HOUR_HAND_LENGTH, 0.72);
+        assert_eq!(MINUTE_HAND_LENGTH, 0.96);
+    }
+
+    #[test]
+    fn second_hand_is_a_long_slim_mudmaster_style_needle() {
+        let points = second_hand_points(egui::Pos2::ZERO, 10.0, 0.0);
+
+        assert_eq!(SECOND_HAND_SHAFT_WIDTH, 0.75);
+        assert_eq!(SECOND_HAND_COLOR, egui::Color32::from_rgb(222, 142, 92));
+        assert!(points[0].distance(egui::pos2(-0.375, 1.6)) < 0.001);
+        assert!(points[1].distance(egui::pos2(-0.375, -8.8)) < 0.001);
+        assert!(points[2].distance(egui::pos2(0.0, -10.2)) < 0.001);
+        assert!(points[3].distance(egui::pos2(0.375, -8.8)) < 0.001);
+        assert!(points[4].distance(egui::pos2(0.375, 1.6)) < 0.001);
+    }
+
+    #[test]
+    fn context_menu_allows_the_clock_but_excludes_adjacent_controls() {
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(393.0, 190.0));
+
+        assert!(is_live_context_menu_position(
+            window,
+            egui::pos2(333.0, 72.0)
+        ));
+        assert!(!is_live_context_menu_position(
+            window,
+            egui::pos2(220.0, 30.0)
+        ));
     }
 
     #[test]

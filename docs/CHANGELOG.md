@@ -3,6 +3,45 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-24] - Analoge Uhr im Mond
+
+### 🕰️ Live-Status
+
+- **Zeit direkt im Mond** - Stunden- und Minutenzeiger leuchten sanft grün. Vom
+  schmalen Ansatz werden sie zunächst etwas breiter und laufen erst im letzten
+  Stück nadelförmig zusammen. Eine weiße Innenkontur und eine feine schwarze
+  Außenkontur halten beide Zeiger vor jeder Mondphase lesbar. Der Minutenzeiger
+  reicht nahe an den äußersten Mondrand; auch der Stundenzeiger ragt sicher über
+  die Temperaturanzeige hinaus. Die Temperatur bleibt als oberste Ebene
+  vollständig sichtbar.
+- **Feine Stundenorientierung** - Die blassen Ziffern `12`, `3`, `6` und `9`
+  ersetzen die vier breiten Viertelstunden-Striche. Acht kurze, zwei Pixel
+  breite Zwischenstriche bleiben erhalten. Russo One aus Google Fonts liefert
+  die nun 50 Prozent größeren, kräftigen Ziffern mit dunkler Kontur. Sie
+  skalieren ohne Qualitätsverlust und schweben außerhalb der Mondscheibe im
+  erweiterten Hof; der Mond sitzt zum Ausgleich 13,5 Pixel weiter rechts.
+- **Mudmaster-artiger Sekundenzeiger** - Ein sehr schmaler, hellerer und blasser
+  orangefarbener Sekundenzeiger reicht als lange Nadel bis knapp über den
+  Mondrand und ist standardmäßig eingeschaltet. Per
+  Rechtsklick auf die Uhr lässt er sich unmittelbar ein- oder ausblenden; die
+  Auswahl bleibt für spätere Starts gespeichert.
+
+## [2026-08-24] - Tray hält Windows durchgehend wach
+
+### 🛡️ Energieschutz
+
+- **Kein Leerlauf-Schlaf bei laufendem Tray** - Die Tray-App hält Windows jetzt
+  während ihrer gesamten Laufzeit wach, auch wenn kein Nachtmodus aktiv ist.
+  Der Bildschirm darf weiterhin ausgehen und bewusste Energieaktionen bleiben
+  möglich.
+- **Saubere Freigabe beim Beenden** - Die Windows-Anforderung ist direkt an die
+  Lebensdauer der Tray-App gebunden und wird beim Verlassen automatisch
+  freigegeben.
+- **Fehler bleibt fail-closed** - Lehnt Windows die Energiesperre beim
+  Tray-Start ab, läuft die primäre Tray-App nicht weiter. Ein bereits aktiver
+  oder nicht sicher abfragbarer Nachtlauf wird vorher über den normalen
+  Stopp-Pfad beendet.
+
 ## [2026-08-22] - Live-Fenster übersteht den Morgen nach dem Shutdown v0.1.24
 
 ### 🪟 Live-Status

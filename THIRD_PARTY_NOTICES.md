@@ -38,3 +38,11 @@ Open-Meteo service commercially. A commercial deployment must use an
 appropriate Open-Meteo commercial/customer plan or replace the provider with a
 service whose terms cover that use. The core watcher and the rest of this
 repository remain MIT-licensed.
+
+## Russo One font
+
+The analog clock's cardinal numerals embed Russo One Regular from the official
+[Google Fonts repository](https://github.com/google/fonts/tree/main/ofl/russoone).
+The font file is bundled as `assets/fonts/RussoOne-Regular.ttf`; its complete
+SIL Open Font License 1.1 is included alongside it as
+`assets/fonts/RussoOne-OFL.txt`.
