@@ -76,7 +76,7 @@ The moon also shows the current temperature and the real current lunar phase for
 ## Usage
 
 - **Start night mode**: continuously monitors all agents currently reported by Herdr and only shuts down Windows after the configured quiet period.
-- **Prevent idle sleep while watching**: while a night run is active, the tray app tells Windows that work is still required so an automatic idle-sleep timer cannot interrupt Herdr. The guard is released when the run stops or the app exits; the watcher's own confirmed sleep or shutdown action is still allowed.
+- **Prevent idle sleep while the tray runs**: for its entire lifetime, the tray app tells Windows that the system is still required, even when night mode is off. The display may still turn off. The guard is released only when the tray app exits; deliberate sleep or shutdown actions by the user or watcher are still allowed.
 - **Observe only**: runs the same monitoring flow without performing a shutdown.
 - **Stop and cancel shutdown**: ends the run and cancels only a pending shutdown scheduled by the watcher.
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.

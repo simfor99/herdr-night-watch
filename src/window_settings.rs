@@ -6,6 +6,7 @@ const OPACITY_VALUE: &str = "WindowOpacity";
 const LEVEL_VALUE: &str = "WindowLevel";
 const LIVE_STATUS_START_VALUE: &str = "OpenLiveStatusOnStartup";
 const LIVE_STATUS_TASKBAR_VALUE: &str = "ShowLiveStatusInTaskbar";
+const CLOCK_SECOND_HAND_VALUE: &str = "ShowClockSecondHand";
 const LIVE_STATUS_POS_X_VALUE: &str = "LiveStatusPositionX";
 const LIVE_STATUS_POS_Y_VALUE: &str = "LiveStatusPositionY";
 const LIVE_STATUS_SCALE_VALUE: &str = "LiveStatusScale";
@@ -84,31 +85,45 @@ pub fn set_opacity(value: u8) -> anyhow::Result<()> {
 }
 
 pub fn live_status_on_start() -> bool {
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(KEY)
-        .and_then(|key| key.get_value::<u32, _>(LIVE_STATUS_START_VALUE))
-        .map(|value| value != 0)
-        .unwrap_or(true)
+    read_bool_setting(LIVE_STATUS_START_VALUE, true)
 }
 
 pub fn set_live_status_on_start(enabled: bool) -> anyhow::Result<()> {
-    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
-    key.set_value(LIVE_STATUS_START_VALUE, &u32::from(enabled))?;
-    Ok(())
+    write_bool_setting(LIVE_STATUS_START_VALUE, enabled)
 }
 
 pub fn live_status_in_taskbar() -> bool {
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(KEY)
-        .and_then(|key| key.get_value::<u32, _>(LIVE_STATUS_TASKBAR_VALUE))
-        .map(|value| value != 0)
-        .unwrap_or(true)
+    read_bool_setting(LIVE_STATUS_TASKBAR_VALUE, true)
 }
 
 pub fn set_live_status_in_taskbar(show: bool) -> anyhow::Result<()> {
+    write_bool_setting(LIVE_STATUS_TASKBAR_VALUE, show)
+}
+
+fn bool_setting_value(value: Option<u32>, default: bool) -> bool {
+    value.map(|value| value != 0).unwrap_or(default)
+}
+
+fn read_bool_setting(value_name: &str, default: bool) -> bool {
+    let value = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .and_then(|key| key.get_value::<u32, _>(value_name))
+        .ok();
+    bool_setting_value(value, default)
+}
+
+fn write_bool_setting(value_name: &str, value: bool) -> anyhow::Result<()> {
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
-    key.set_value(LIVE_STATUS_TASKBAR_VALUE, &u32::from(show))?;
+    key.set_value(value_name, &u32::from(value))?;
     Ok(())
+}
+
+pub fn clock_second_hand_visible() -> bool {
+    read_bool_setting(CLOCK_SECOND_HAND_VALUE, true)
+}
+
+pub fn set_clock_second_hand_visible(show: bool) -> anyhow::Result<()> {
+    write_bool_setting(CLOCK_SECOND_HAND_VALUE, show)
 }
 
 pub fn live_status_position() -> Option<[f32; 2]> {
@@ -170,5 +185,12 @@ mod tests {
     #[test]
     fn live_status_scale_preserves_fractional_percent() {
         assert!((clamp_live_status_scale(1.37) - 1.37).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn bool_setting_value_uses_the_default_and_treats_zero_as_disabled() {
+        assert!(bool_setting_value(None, true));
+        assert!(!bool_setting_value(Some(0), true));
+        assert!(bool_setting_value(Some(1), true));
     }
 }

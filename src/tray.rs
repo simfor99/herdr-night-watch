@@ -62,9 +62,6 @@ struct App {
     checking: bool,
     result_rx: mpsc::Receiver<Result<backend::WatchStatus, String>>,
     result_tx: mpsc::Sender<Result<backend::WatchStatus, String>>,
-    power_guard_active: bool,
-    power_guard_error: bool,
-    power_guard_last_attempted: Option<bool>,
 }
 
 pub fn run() -> Result<()> {
@@ -80,6 +77,27 @@ pub fn run() -> Result<()> {
     // the startup marker aligned with the current executable before the tray
     // decides how to handle the live window.
     let _ = autostart::normalize_if_enabled();
+    let initial = backend::status();
+    let stop_on_guard_failure = initial.as_ref().map_or(true, night_watch_is_active);
+    let initial = initial.unwrap_or(backend::WatchStatus::Off {
+        agents: backend::AgentSummary::default(),
+        completion_action: backend::CompletionAction::Shutdown,
+        warning_seconds: 300,
+    });
+    let _power_guard = match power_guard::TrayPowerGuard::acquire() {
+        Ok(guard) => guard,
+        Err(error) if stop_on_guard_failure => {
+            return match backend::stop("power_guard_failed") {
+                Ok(()) => Err(anyhow::anyhow!(
+                    "Windows-Energiesperre fehlgeschlagen; Nachtmodus wurde sicher gestoppt ({error})"
+                )),
+                Err(stop_error) => Err(anyhow::anyhow!(
+                    "Windows-Energiesperre fehlgeschlagen ({error}); Nachtmodus konnte nicht sicher gestoppt werden ({stop_error})"
+                )),
+            };
+        }
+        Err(error) => return Err(error),
+    };
     let event_loop: EventLoop<Wake> = EventLoop::with_user_event().build()?;
     let proxy: EventLoopProxy<Wake> = event_loop.create_proxy();
     let (result_tx, result_rx) = mpsc::channel();
@@ -91,11 +109,6 @@ pub fn run() -> Result<()> {
     });
 
     let language = Language::current();
-    let initial = backend::status().unwrap_or(backend::WatchStatus::Off {
-        agents: backend::AgentSummary::default(),
-        completion_action: backend::CompletionAction::Shutdown,
-        warning_seconds: 300,
-    });
     let icon = icon_for(&initial)?;
     let tray = TrayIconBuilder::new()
         .with_tooltip(tooltip(&initial, None, language))
@@ -136,15 +149,10 @@ pub fn run() -> Result<()> {
         checking: false,
         result_rx,
         result_tx,
-        power_guard_active: false,
-        power_guard_error: false,
-        power_guard_last_attempted: None,
     };
-    app.sync_power_guard();
     app.sync_expected_exit();
     let result = event_loop.run_app(&mut app);
     live_status::close();
-    let _ = power_guard::set_prevent_sleep(false);
     if result.is_ok() {
         tray_history::finish_session();
     }
@@ -171,6 +179,13 @@ fn should_open_live_on_launch(from_windows_logon: bool, setting_enabled: bool) -
 
 fn live_open_delay(from_windows_logon: bool) -> Option<Duration> {
     from_windows_logon.then_some(LOGON_LIVE_OPEN_DELAY)
+}
+
+fn night_watch_is_active(status: &backend::WatchStatus) -> bool {
+    matches!(
+        status,
+        backend::WatchStatus::Watching { .. } | backend::WatchStatus::ShutdownWarning { .. }
+    )
 }
 
 fn acquire_tray_instance() -> Result<Option<HANDLE>> {
@@ -215,7 +230,6 @@ impl App {
                         matches!(status, backend::WatchStatus::ShutdownWarning { .. })
                             && !matches!(self.status, backend::WatchStatus::ShutdownWarning { .. });
                     self.status = status;
-                    self.sync_power_guard();
                     self.sync_expected_exit();
                     if show_notice {
                         let (
@@ -281,11 +295,10 @@ impl App {
                             );
                         }
                     }
-                    if !self.power_guard_error
-                        && self
-                            .message
-                            .as_deref()
-                            .is_some_and(|message| message.starts_with("Fehler:"))
+                    if self
+                        .message
+                        .as_deref()
+                        .is_some_and(|message| message.starts_with("Fehler:"))
                     {
                         self.message = None;
                     }
@@ -325,48 +338,6 @@ impl App {
                 autostart::enabled(),
                 self.language,
             ))));
-        }
-    }
-
-    fn set_power_guard(&mut self, active: bool) -> Result<()> {
-        if active == self.power_guard_active && !self.power_guard_error {
-            return Ok(());
-        }
-        power_guard::set_prevent_sleep(active)?;
-        self.power_guard_active = active;
-        self.power_guard_last_attempted = Some(active);
-        if self.power_guard_error {
-            self.message = None;
-        }
-        self.power_guard_error = false;
-        Ok(())
-    }
-
-    fn sync_power_guard(&mut self) {
-        let should_prevent_sleep = matches!(
-            self.status,
-            backend::WatchStatus::Watching { .. } | backend::WatchStatus::ShutdownWarning { .. }
-        );
-        if self.power_guard_last_attempted == Some(should_prevent_sleep) {
-            return;
-        }
-        self.power_guard_last_attempted = Some(should_prevent_sleep);
-        if let Err(error) = self.set_power_guard(should_prevent_sleep) {
-            self.power_guard_error = true;
-            self.power_guard_last_attempted = None;
-            self.message = Some(format!("Fehler: {error}"));
-            if should_prevent_sleep {
-                let stop_result = backend::stop("power_guard_failed");
-                if let Err(stop_error) = stop_result {
-                    self.message = Some(format!(
-                        "Fehler: Windows-Energiesperre fehlgeschlagen ({error}); Nachtmodus konnte nicht sicher gestoppt werden ({stop_error})"
-                    ));
-                } else {
-                    self.message = Some(format!(
-                        "Fehler: Windows-Energiesperre fehlgeschlagen; Nachtmodus wurde sicher gestoppt ({error})"
-                    ));
-                }
-            }
         }
     }
 
@@ -417,11 +388,7 @@ impl App {
                 .map_err(|error| anyhow::anyhow!("invalid opacity value: {error}"))
                 .and_then(window_settings::set_opacity),
             ID_QUIT => {
-                if matches!(
-                    self.status,
-                    backend::WatchStatus::Watching { .. }
-                        | backend::WatchStatus::ShutdownWarning { .. }
-                ) {
+                if night_watch_is_active(&self.status) {
                     // The tray owns the guaranteed foreground warning. Do not leave a
                     // running night watch behind when its only warning surface exits.
                     let _ = backend::stop("tray_app_quit");
@@ -492,33 +459,8 @@ impl App {
             }),
             Err(error) => Some(format!("Fehler: {error}")),
         };
-        if succeeded {
-            match action {
-                ID_START | ID_OBSERVE => {
-                    if let Err(error) = self.set_power_guard(true) {
-                        self.power_guard_error = true;
-                        self.power_guard_last_attempted = None;
-                        let rollback = backend::stop("power_guard_failed");
-                        self.message = Some(match rollback {
-                            Ok(()) => format!(
-                                "Fehler: Windows-Energiesperre fehlgeschlagen; Nachtmodus wurde sicher gestoppt ({error})"
-                            ),
-                            Err(stop_error) => format!(
-                                "Fehler: Windows-Energiesperre fehlgeschlagen ({error}); Nachtmodus konnte nicht sicher gestoppt werden ({stop_error})"
-                            ),
-                        });
-                    }
-                }
-                ID_STOP => {
-                    tray_history::set_expected_exit(false);
-                    if let Err(error) = self.set_power_guard(false) {
-                        self.power_guard_error = true;
-                        self.power_guard_last_attempted = None;
-                        self.message = Some(format!("Fehler: {error}"));
-                    }
-                }
-                _ => {}
-            }
+        if succeeded && action == ID_STOP {
+            tray_history::set_expected_exit(false);
         }
         if action == ID_LANGUAGE_DE {
             self.language = Language::German;
@@ -583,10 +525,7 @@ fn menu_for(
         let _ = menu.append(&MenuItem::with_id("message", message, false, None));
     }
     let _ = menu.append(&PredefinedMenuItem::separator());
-    let active = matches!(
-        status,
-        backend::WatchStatus::Watching { .. } | backend::WatchStatus::ShutdownWarning { .. }
-    );
+    let active = night_watch_is_active(status);
     let _ = menu.append(&MenuItem::with_id(
         ID_START,
         language.text("Nachtmodus starten", "Start night mode"),
@@ -936,9 +875,44 @@ fn icon_for(status: &backend::WatchStatus) -> Result<Icon> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOGON_LIVE_OPEN_DELAY, launched_by_windows_logon, live_open_delay,
+        LOGON_LIVE_OPEN_DELAY, launched_by_windows_logon, live_open_delay, night_watch_is_active,
         should_open_live_on_launch,
     };
+    use crate::backend::{AgentSummary, CompletionAction, WatchStatus};
+
+    #[test]
+    fn only_a_running_or_warning_night_watch_needs_fail_safe_stop() {
+        let off = WatchStatus::Off {
+            agents: AgentSummary::default(),
+            completion_action: CompletionAction::Shutdown,
+            warning_seconds: 300,
+        };
+        let watching = WatchStatus::Watching {
+            targets: 1,
+            live_scope: true,
+            observe_only: false,
+            quiet: false,
+            demo: false,
+            agents: AgentSummary::default(),
+            completion_action: CompletionAction::Shutdown,
+            warning_seconds: 300,
+        };
+        let warning = WatchStatus::ShutdownWarning {
+            targets: 1,
+            live_scope: true,
+            demo: false,
+            observe_only: false,
+            warning_seconds: 300,
+            seconds_remaining: 299,
+            agents: AgentSummary::default(),
+            completion_action: CompletionAction::Shutdown,
+            network_triggered: false,
+        };
+
+        assert!(!night_watch_is_active(&off));
+        assert!(night_watch_is_active(&watching));
+        assert!(night_watch_is_active(&warning));
+    }
 
     #[test]
     fn logon_launch_defers_the_first_live_open() {

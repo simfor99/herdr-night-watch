@@ -17,9 +17,9 @@ Zusätzlich schreibt der Wächter `diagnostics.jsonl` neben `watch.log`. Jede Ze
 
 Nach einem Windows- oder WSL-Neustart wird ein unvollständig liegen gebliebener Lauf nicht fortgesetzt. Der Wächter wartet beim Start kurz auf die geänderte WSL- und Windows-Boot-Marke, verwendet dieselbe bestätigte Marke für Reset und Überwachung, schreibt ein `RESET`-Ereignis mit `reason=boot_id_changed` und entfernt die alte Warnungsdatei. Fehlt eine der beiden Marken zu lange, startet die Überwachung nicht fail-open. Im `cancellation-history.csv` steht zusätzlich der Auslöser `system_restart`.
 
-Wenn Windows trotz aktivem Nachtlauf schlafen möchte, prüfe zuerst, ob die Tray-App noch läuft und den Status aktuell anzeigt. Nur ein aktiver Zustand `Watching` oder `ShutdownWarning` hält den Leerlauf-Schutz. Der Schutz verhindert keinen manuellen Schlaf- oder Shutdown-Befehl und wird absichtlich aufgehoben, sobald der Nachtlauf endet.
+Wenn Windows trotz laufender Tray-App automatisch schlafen möchte, prüfe zuerst, ob das Tray-Symbol noch vorhanden ist, und kontrolliere anschließend `powercfg.exe /requests`. Der Leerlauf-Schutz gilt unabhängig davon, ob der Nachtmodus aktiv oder ausgeschaltet ist. Er verhindert keinen bewussten Schlaf- oder Shutdown-Befehl und wird erst beim Beenden der Tray-App aufgehoben.
 
-Kann Windows die Energiesperre nicht setzen, stoppt die Tray-App den gerade gestarteten Nachtlauf sicher und zeigt den Fehler weiter an. Ein vorübergehend fehlender Windows-Bootmarker führt dagegen nicht zu einem Teilvergleich: Der Reset wird erst bewertet, wenn WSL- und Windows-Marke gemeinsam vorliegen.
+Kann Windows die Energiesperre beim Start nicht setzen, beendet sich die primäre Tray-App wieder. Ein bereits laufender oder nicht sicher abfragbarer Nachtlauf wird vorher über den normalen Stopp-Pfad beendet, damit er nicht ungeschützt weiterläuft. Ein vorübergehend fehlender Windows-Bootmarker führt dagegen nicht zu einem Teilvergleich: Der Reset wird erst bewertet, wenn WSL- und Windows-Marke gemeinsam vorliegen.
 
 ## Normale Betriebsprüfung
 

@@ -3,6 +3,37 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-24] - Analoge Uhr im Mond
+
+### 🕰️ Live-Status
+
+- **Zeit direkt im Mond** - Ein weißer Minutenzeiger und ein sanft grüner
+  Stundenzeiger laufen wie Instrumentennadeln spitz zu und liegen über der
+  Mondsichel. Die Temperatur bleibt als oberste Ebene vollständig sichtbar.
+- **Feine Stundenorientierung** - Zwölf kurze Randstriche machen die Uhrzeit
+  schneller erfassbar. Die Viertelstunden sind vier Pixel breit, die übrigen
+  Stunden zwei Pixel; alle bleiben mit 3,5 Pixeln bewusst niedrig.
+- **Mudmaster-artiger Sekundenzeiger** - Ein feiner roter Sekundenzeiger mit
+  kurzer technischer Pfeilspitze ist standardmäßig eingeschaltet. Per
+  Rechtsklick auf die Uhr lässt er sich unmittelbar ein- oder ausblenden; die
+  Auswahl bleibt für spätere Starts gespeichert.
+
+## [2026-08-24] - Tray hält Windows durchgehend wach
+
+### 🛡️ Energieschutz
+
+- **Kein Leerlauf-Schlaf bei laufendem Tray** - Die Tray-App hält Windows jetzt
+  während ihrer gesamten Laufzeit wach, auch wenn kein Nachtmodus aktiv ist.
+  Der Bildschirm darf weiterhin ausgehen und bewusste Energieaktionen bleiben
+  möglich.
+- **Saubere Freigabe beim Beenden** - Die Windows-Anforderung ist direkt an die
+  Lebensdauer der Tray-App gebunden und wird beim Verlassen automatisch
+  freigegeben.
+- **Fehler bleibt fail-closed** - Lehnt Windows die Energiesperre beim
+  Tray-Start ab, läuft die primäre Tray-App nicht weiter. Ein bereits aktiver
+  oder nicht sicher abfragbarer Nachtlauf wird vorher über den normalen
+  Stopp-Pfad beendet.
+
 ## [2026-08-22] - Live-Fenster übersteht den Morgen nach dem Shutdown v0.1.24
 
 ### 🪟 Live-Status
