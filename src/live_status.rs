@@ -31,6 +31,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
     TerminateProcess,
 };
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SW_RESTORE,
@@ -1160,6 +1161,21 @@ struct WorkArea {
 }
 
 impl WorkArea {
+    fn from_physical_rect(rect: RECT, pixels_per_point: f32) -> Self {
+        let pixels_per_point = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+            f64::from(pixels_per_point)
+        } else {
+            1.0
+        };
+        let to_points = |pixels: i32| (f64::from(pixels) / pixels_per_point).round() as i32;
+        Self {
+            left: to_points(rect.left),
+            top: to_points(rect.top),
+            right: to_points(rect.right),
+            bottom: to_points(rect.bottom),
+        }
+    }
+
     fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.left && x < self.right && y >= self.top && y < self.bottom
     }
@@ -1234,13 +1250,19 @@ unsafe extern "system" fn monitor_area_callback(
         let mut info: MONITORINFO = std::mem::zeroed();
         info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if GetMonitorInfoW(monitor, &mut info) != 0 {
-            let work = info.rcWork;
-            collector.areas.push(WorkArea {
-                left: work.left,
-                top: work.top,
-                right: work.right,
-                bottom: work.bottom,
-            });
+            let mut dpi_x = 96;
+            let mut dpi_y = 96;
+            let pixels_per_point =
+                if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) >= 0
+                    && dpi_x > 0
+                {
+                    dpi_x as f32 / 96.0
+                } else {
+                    1.0
+                };
+            collector
+                .areas
+                .push(WorkArea::from_physical_rect(info.rcWork, pixels_per_point));
         }
     }
     1
@@ -1296,24 +1318,32 @@ fn live_viewport_builder(
 fn run_window() -> Result<()> {
     let scale = window_settings::live_status_scale();
     let saved_position = window_settings::live_status_position();
-    let clamped_position = clamp_live_position(
-        saved_position,
-        [DESIGN_WIDTH * scale, DESIGN_HEIGHT * scale],
-        &monitor_work_areas(),
-    );
-    if let Some(position) = clamped_position
-        && saved_position != Some(position)
-    {
-        // Self-healing: the saved position pointed at a monitor that is
-        // not attached right now. Persist the corrected spot so the next
-        // start opens visibly without repeating the clamp.
-        let _ = window_settings::set_live_status_position(position);
-    }
-    let viewport = live_viewport_builder(scale, clamped_position, Language::current());
+    let viewport = live_viewport_builder(scale, None, Language::current());
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Glow,
         persist_window: false,
+        // eframe creates winit's event loop before invoking this hook. On
+        // Windows that is also when the process becomes per-monitor DPI
+        // aware, so GetDpiForMonitor and the saved egui position use the same
+        // logical coordinate system here.
+        window_builder: Some(Box::new(move |viewport| {
+            let clamped_position = clamp_live_position(
+                saved_position,
+                [DESIGN_WIDTH * scale, DESIGN_HEIGHT * scale],
+                &monitor_work_areas(),
+            );
+            if let Some(position) = clamped_position {
+                if saved_position != Some(position) {
+                    // Self-healing: persist the corrected position so the
+                    // next start does not repeat the clamp.
+                    let _ = window_settings::set_live_status_position(position);
+                }
+                viewport.with_position(position)
+            } else {
+                viewport
+            }
+        })),
         ..Default::default()
     };
     eframe::run_native(
@@ -4008,6 +4038,33 @@ mod tests {
         assert_eq!(
             clamp_live_position(Some([f32::MIN, 20.0]), [393.0, 190.0], &areas),
             Some([-2560.0, 20.0])
+        );
+    }
+
+    #[test]
+    fn physical_work_area_is_converted_before_clamping_at_150_percent() {
+        let area = WorkArea::from_physical_rect(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 3840,
+                bottom: 2160,
+            },
+            1.5,
+        );
+
+        assert_eq!(
+            area,
+            WorkArea {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            }
+        );
+        assert_eq!(
+            clamp_live_position(Some([3000.0, 100.0]), [393.0, 190.0], &[area]),
+            Some([2167.0, 100.0])
         );
     }
 
