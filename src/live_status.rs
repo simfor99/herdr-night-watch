@@ -3301,7 +3301,6 @@ fn paint_clock_hands(
     show_second_hand: bool,
 ) {
     let turns = local_clock_hand_turns();
-    let minute_white = egui::Color32::from_rgb(247, 241, 229);
 
     paint_layered_needle_hand(
         painter,
@@ -3339,7 +3338,7 @@ fn paint_clock_hands(
         if show_second_hand {
             SECOND_HAND_COLOR
         } else {
-            minute_white
+            MAIN_HAND_INNER_OUTLINE
         },
     );
 }

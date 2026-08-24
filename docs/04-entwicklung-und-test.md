@@ -34,6 +34,7 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - `--cancel` darf nur einen Shutdown abbrechen, für den eine gültige eigene Warnungsdatei existiert.
 - Die Tray-App und ihre Hilfsprozesse dürfen keine sichtbaren Konsolenfenster erzeugen.
 - Solange die Tray-App läuft, muss sie den automatischen Windows-Leerlauf-Energiesparmodus mit `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` verhindern - unabhängig davon, ob ein Nachtlauf aktiv ist. Der Bildschirm und bewusste Energieaktionen bleiben davon unberührt.
+- Lehnt Windows diese Energiesperre beim Start ab, darf die primäre Tray-App nicht weiterlaufen. Ein aktiver oder nicht sicher abfragbarer Nachtlauf wird vorher mit `power_guard_failed` beendet.
 - `diagnostics.jsonl` muss für jede relevante Zustandsänderung maschinenlesbare Ereignisse liefern und auf die letzten 500 Einträge begrenzt bleiben.
 - Eine neue Wächterinstanz darf erst nach Freigabe des Lock des Vorgängers prüfen.
 - Der Wächter darf nach einem Neustart erst überwachen, wenn eine vollständige WSL-/Windows-Boot-Marke bestätigt wurde; Reset und Watch müssen dieselbe bestätigte Marke verwenden.
