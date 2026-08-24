@@ -4398,6 +4398,15 @@ mod tests {
         assert!((three_oclock.hour - 0.25).abs() < f32::EPSILON);
         assert!((three_oclock.minute - 0.0).abs() < f32::EPSILON);
         assert!((three_oclock.second - 0.0).abs() < f32::EPSILON);
+
+        let half_past_three = clock_hand_turns(3, 30, 30, 500);
+        assert!((half_past_three.second - 30.5 / 60.0).abs() < 0.0001);
+        assert!((half_past_three.minute - (30.0 + 30.5 / 60.0) / 60.0).abs() < 0.0001);
+        assert!((half_past_three.hour - (3.0 + (30.0 + 30.5 / 60.0) / 60.0) / 12.0).abs() < 0.0001);
+        assert!(
+            (clock_hand_turns(23, 0, 0, 0).hour - clock_hand_turns(11, 0, 0, 0).hour).abs()
+                < f32::EPSILON
+        );
     }
 
     #[test]

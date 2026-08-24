@@ -908,10 +908,17 @@ mod tests {
             completion_action: CompletionAction::Shutdown,
             network_triggered: false,
         };
+        let finished = WatchStatus::Finished {
+            outcome: "sleep_confirmed".into(),
+            agents: AgentSummary::default(),
+            completion_action: CompletionAction::Sleep,
+            warning_seconds: 300,
+        };
 
         assert!(!night_watch_is_active(&off));
         assert!(night_watch_is_active(&watching));
         assert!(night_watch_is_active(&warning));
+        assert!(!night_watch_is_active(&finished));
     }
 
     #[test]

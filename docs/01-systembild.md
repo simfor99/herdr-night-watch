@@ -95,7 +95,7 @@ Der Wächter prüft zusätzlich zwei unabhängige Internet-Endpunkte. Erst wenn 
 
 Die Tray-App schreibt zusätzlich während ihrer Laufzeit einen temporären Sitzungsmarker. Beim normalen Beenden wird er entfernt. Findet ein späterer Start den Marker ohne `expected_exit`, ergänzt er `tray-history.csv` um „Tray-App unplanmäßig beendet“. Das beweist keinen Absturz im engeren Sinn: Es kann auch ein erzwungenes Beenden, ein Windows-Neustart oder ein Stromverlust gewesen sein. Erwartete Energieaktionen werden vorher markiert und erzeugen keinen falschen Absturz-Eintrag.
 
-Abbrüche erhalten ebenfalls einen eigenen Verlauf. `cancellation-history.csv` nennt als Quelle zum Beispiel `live_window_moon`, `tray_menu`, `warning_dialog`, `manual_stop_script` oder `start_failed`. Damit ist am Folgetag nachvollziehbar, warum ein Nachtlauf nicht mehr aktiv war.
+Abbrüche erhalten ebenfalls einen eigenen Verlauf. `cancellation-history.csv` nennt als Quelle zum Beispiel `live_window_moon`, `tray_menu`, `warning_dialog`, `manual_stop_script`, `start_failed` oder `power_guard_failed`. Damit ist am Folgetag nachvollziehbar, warum ein Nachtlauf nicht mehr aktiv war.
 
 `live_agent_summary()` liefert dieselbe aktuelle Herdr-Sicht für Tooltip und Live-Fenster. Die Shutdown-Entscheidung ruft Herdr unabhängig erneut ab und vertraut nie auf eine alte Anzeige. Ist Herdr nicht erreichbar oder ein Agentenstatus unvollständig, wird kein Shutdown vorbereitet.
 
