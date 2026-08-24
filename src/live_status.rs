@@ -2314,7 +2314,7 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
                     .checkbox(
                         &mut show_second_hand,
                         app.language
-                            .text("Roten Sekundenzeiger anzeigen", "Show red second hand"),
+                            .text("Orangen Sekundenzeiger anzeigen", "Show orange second hand"),
                     )
                     .changed()
                 {
@@ -3086,6 +3086,13 @@ struct ClockHandTurns {
     second: f32,
 }
 
+const HOUR_HAND_LENGTH: f32 = 0.72;
+const MINUTE_HAND_LENGTH: f32 = 0.96;
+const HOUR_HAND_BASE_WIDTH: f32 = 4.4;
+const MINUTE_HAND_BASE_WIDTH: f32 = 3.5;
+const SECOND_HAND_LINE_WIDTH: f32 = 0.65;
+const SECOND_HAND_COLOR: egui::Color32 = egui::Color32::from_rgb(210, 105, 30);
+
 #[derive(Clone, Copy, Debug)]
 struct ClockIndexMarkSpec {
     turns: f32,
@@ -3138,13 +3145,24 @@ fn clock_direction(turns: f32) -> egui::Vec2 {
 }
 
 fn paint_clock_index_marks(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
-    let color = egui::Color32::from_rgba_unmultiplied(247, 241, 229, 155);
+    let color = egui::Color32::from_rgba_unmultiplied(247, 241, 229, 72);
     for mark in clock_index_mark_specs() {
-        let direction = clock_direction(mark.turns);
-        let outer = center + direction * (radius - 1.0);
-        let inner = outer - direction * mark.height;
-        painter.line_segment([inner, outer], egui::Stroke::new(mark.width, color));
+        painter.line_segment(
+            clock_index_mark_segment(center, radius, mark.turns, mark.height),
+            egui::Stroke::new(mark.width, color),
+        );
     }
+}
+
+fn clock_index_mark_segment(
+    center: egui::Pos2,
+    radius: f32,
+    turns: f32,
+    height: f32,
+) -> [egui::Pos2; 2] {
+    let direction = clock_direction(turns);
+    let inner = center + direction * radius * 1.06;
+    [inner, inner + direction * height]
 }
 
 fn clock_hand_endpoint(center: egui::Pos2, radius: f32, turns: f32, length: f32) -> egui::Pos2 {
@@ -3157,13 +3175,17 @@ fn needle_hand_points(
     turns: f32,
     length: f32,
     base_width: f32,
-) -> [egui::Pos2; 3] {
+) -> [egui::Pos2; 5] {
     let direction = clock_direction(turns);
     let tangent = egui::vec2(-direction.y, direction.x);
     let half_width = base_width / 2.0;
+    let shoulder = center + direction * radius * length * 0.8;
+    let shoulder_half_width = base_width * 0.225;
     [
         center - tangent * half_width,
+        shoulder - tangent * shoulder_half_width,
         center + direction * radius * length,
+        shoulder + tangent * shoulder_half_width,
         center + tangent * half_width,
     ]
 }
@@ -3173,13 +3195,13 @@ fn second_hand_spear_points(center: egui::Pos2, radius: f32, turns: f32) -> [egu
     let tangent = egui::vec2(-direction.y, direction.x);
     let base = center + direction * radius * 0.64;
     [
-        base - tangent * 1.4,
+        base - tangent,
         center + direction * radius * 0.79,
-        base + tangent * 1.4,
+        base + tangent,
     ]
 }
 
-fn paint_outlined_clock_hand(
+fn paint_outlined_clock_line(
     painter: &egui::Painter,
     start: egui::Pos2,
     end: egui::Pos2,
@@ -3187,7 +3209,7 @@ fn paint_outlined_clock_hand(
     color: egui::Color32,
 ) {
     let outline = egui::Color32::from_rgba_unmultiplied(5, 8, 15, 220);
-    let outline_width = width + 2.0 * outline_width_in_points(painter.pixels_per_point());
+    let outline_width = width + outline_width_in_points(painter.pixels_per_point());
     painter.line_segment([start, end], egui::Stroke::new(outline_width, outline));
     painter.line_segment([start, end], egui::Stroke::new(width, color));
 }
@@ -3205,9 +3227,9 @@ fn paint_outlined_needle_hand(
     paint_outlined_hand_polygon(painter, points, color);
 }
 
-fn paint_outlined_hand_polygon(
+fn paint_outlined_hand_polygon<const N: usize>(
     painter: &egui::Painter,
-    points: [egui::Pos2; 3],
+    points: [egui::Pos2; N],
     color: egui::Color32,
 ) {
     let outline = egui::Color32::from_rgba_unmultiplied(5, 8, 15, 220);
@@ -3227,28 +3249,36 @@ fn paint_clock_hands(
     let turns = local_clock_hand_turns();
     let minute_white = egui::Color32::from_rgb(247, 241, 229);
 
-    paint_outlined_needle_hand(painter, center, radius, turns.hour, 0.48, 3.6, PASTEL_GREEN);
+    paint_outlined_needle_hand(
+        painter,
+        center,
+        radius,
+        turns.hour,
+        HOUR_HAND_LENGTH,
+        HOUR_HAND_BASE_WIDTH,
+        PASTEL_GREEN,
+    );
     paint_outlined_needle_hand(
         painter,
         center,
         radius,
         turns.minute,
-        0.70,
-        2.6,
+        MINUTE_HAND_LENGTH,
+        MINUTE_HAND_BASE_WIDTH,
         minute_white,
     );
     if show_second_hand {
-        paint_outlined_clock_hand(
+        paint_outlined_clock_line(
             painter,
             clock_hand_endpoint(center, radius, turns.second + 0.5, 0.16),
             clock_hand_endpoint(center, radius, turns.second, 0.67),
-            1.0,
-            RED,
+            SECOND_HAND_LINE_WIDTH,
+            SECOND_HAND_COLOR,
         );
         paint_outlined_hand_polygon(
             painter,
             second_hand_spear_points(center, radius, turns.second),
-            RED,
+            SECOND_HAND_COLOR,
         );
     }
 
@@ -3261,7 +3291,11 @@ fn paint_clock_hands(
     painter.circle_filled(
         center,
         1.7,
-        if show_second_hand { RED } else { minute_white },
+        if show_second_hand {
+            SECOND_HAND_COLOR
+        } else {
+            minute_white
+        },
     );
 }
 
@@ -4322,21 +4356,43 @@ mod tests {
     }
 
     #[test]
-    fn needle_hand_tapers_from_its_base_to_one_exact_tip() {
-        let points = needle_hand_points(egui::Pos2::ZERO, 10.0, 0.0, 0.7, 4.0);
+    fn clock_index_marks_stay_outside_the_moon_and_inside_its_halo() {
+        let center = egui::Pos2::ZERO;
+        let radius = 30.0;
+        let [inner, outer] = clock_index_mark_segment(center, radius, 0.0, 3.5);
 
-        assert!(points[0].distance(egui::pos2(-2.0, 0.0)) < 0.001);
-        assert!(points[1].distance(egui::pos2(0.0, -7.0)) < 0.001);
-        assert!(points[2].distance(egui::pos2(2.0, 0.0)) < 0.001);
+        assert!(inner.distance(center) > radius);
+        assert!((outer.distance(inner) - 3.5).abs() < 0.001);
+        assert!(outer.distance(center) < radius * 1.28);
     }
 
     #[test]
-    fn second_hand_ends_in_a_short_mudmaster_style_spear() {
+    fn needle_hand_keeps_a_broad_shaft_before_its_exact_tip() {
+        let points = needle_hand_points(egui::Pos2::ZERO, 10.0, 0.0, 0.96, 4.0);
+
+        assert_eq!(points.len(), 5);
+        assert!(points[0].distance(egui::pos2(-2.0, 0.0)) < 0.001);
+        assert!(points[1].distance(egui::pos2(-0.9, -7.68)) < 0.001);
+        assert!(points[2].distance(egui::pos2(0.0, -9.6)) < 0.001);
+        assert!(points[3].distance(egui::pos2(0.9, -7.68)) < 0.001);
+        assert!(points[4].distance(egui::pos2(2.0, 0.0)) < 0.001);
+    }
+
+    #[test]
+    fn main_hands_reach_beyond_the_temperature_and_to_the_outer_edge() {
+        assert_eq!(HOUR_HAND_LENGTH, 0.72);
+        assert_eq!(MINUTE_HAND_LENGTH, 0.96);
+    }
+
+    #[test]
+    fn second_hand_stays_slim_and_ends_in_a_short_mudmaster_style_spear() {
         let points = second_hand_spear_points(egui::Pos2::ZERO, 10.0, 0.0);
 
-        assert!(points[0].distance(egui::pos2(-1.4, -6.4)) < 0.001);
+        assert_eq!(SECOND_HAND_LINE_WIDTH, 0.65);
+        assert_eq!(SECOND_HAND_COLOR, egui::Color32::from_rgb(210, 105, 30));
+        assert!(points[0].distance(egui::pos2(-1.0, -6.4)) < 0.001);
         assert!(points[1].distance(egui::pos2(0.0, -7.9)) < 0.001);
-        assert!(points[2].distance(egui::pos2(1.4, -6.4)) < 0.001);
+        assert!(points[2].distance(egui::pos2(1.0, -6.4)) < 0.001);
     }
 
     #[test]

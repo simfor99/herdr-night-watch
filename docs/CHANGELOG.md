@@ -8,13 +8,18 @@
 ### 🕰️ Live-Status
 
 - **Zeit direkt im Mond** - Ein weißer Minutenzeiger und ein sanft grüner
-  Stundenzeiger laufen wie Instrumentennadeln spitz zu und liegen über der
-  Mondsichel. Die Temperatur bleibt als oberste Ebene vollständig sichtbar.
+  Stundenzeiger behalten bis kurz vor dem Ende einen kräftigen
+  Instrumentenschaft und laufen dann spitz zu. Der Minutenzeiger reicht nahe an
+  den äußersten Mondrand; auch der Stundenzeiger ragt sicher über die
+  Temperaturanzeige hinaus. Die Temperatur bleibt als oberste Ebene vollständig
+  sichtbar.
 - **Feine Stundenorientierung** - Zwölf kurze Randstriche machen die Uhrzeit
   schneller erfassbar. Die Viertelstunden sind vier Pixel breit, die übrigen
-  Stunden zwei Pixel; alle bleiben mit 3,5 Pixeln bewusst niedrig.
-- **Mudmaster-artiger Sekundenzeiger** - Ein feiner roter Sekundenzeiger mit
-  kurzer technischer Pfeilspitze ist standardmäßig eingeschaltet. Per
+  Stunden zwei Pixel; alle bleiben mit 3,5 Pixeln bewusst niedrig und schweben
+  in kaum sichtbarem blassem Weiß außerhalb der Mondscheibe im Mondhof.
+- **Mudmaster-artiger Sekundenzeiger** - Ein sehr schmaler dunkel-oranger
+  Sekundenzeiger mit kurzer technischer Pfeilspitze ist standardmäßig
+  eingeschaltet. Per
   Rechtsklick auf die Uhr lässt er sich unmittelbar ein- oder ausblenden; die
   Auswahl bleibt für spätere Starts gespeichert.
 
