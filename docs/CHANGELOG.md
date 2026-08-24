@@ -7,19 +7,21 @@
 
 ### 🕰️ Live-Status
 
-- **Zeit direkt im Mond** - Ein weißer Minutenzeiger und ein sanft grüner
-  Stundenzeiger behalten bis kurz vor dem Ende einen kräftigen
-  Instrumentenschaft und laufen dann spitz zu. Der Minutenzeiger reicht nahe an
-  den äußersten Mondrand; auch der Stundenzeiger ragt sicher über die
-  Temperaturanzeige hinaus. Die Temperatur bleibt als oberste Ebene vollständig
-  sichtbar.
-- **Feine Stundenorientierung** - Zwölf kurze Randstriche machen die Uhrzeit
-  schneller erfassbar. Die Viertelstunden sind vier Pixel breit, die übrigen
-  Stunden zwei Pixel; alle bleiben mit 3,5 Pixeln bewusst niedrig und schweben
-  in kaum sichtbarem blassem Weiß außerhalb der Mondscheibe im Mondhof.
-- **Mudmaster-artiger Sekundenzeiger** - Ein sehr schmaler dunkel-oranger
-  Sekundenzeiger mit kurzer technischer Pfeilspitze ist standardmäßig
-  eingeschaltet. Per
+- **Zeit direkt im Mond** - Stunden- und Minutenzeiger leuchten sanft grün. Vom
+  schmalen Ansatz werden sie zunächst etwas breiter und laufen erst im letzten
+  Stück nadelförmig zusammen. Eine weiße Innenkontur und eine feine schwarze
+  Außenkontur halten beide Zeiger vor jeder Mondphase lesbar. Der Minutenzeiger
+  reicht nahe an den äußersten Mondrand; auch der Stundenzeiger ragt sicher über
+  die Temperaturanzeige hinaus. Die Temperatur bleibt als oberste Ebene
+  vollständig sichtbar.
+- **Feine Stundenorientierung** - Die blassen Ziffern `12`, `3`, `6` und `9`
+  ersetzen die vier breiten Viertelstunden-Striche. Acht kurze, zwei Pixel
+  breite Zwischenstriche bleiben erhalten. Ziffern und Striche schweben in kaum
+  sichtbarem Weiß außerhalb der Mondscheibe im Hof; für etwas mehr Luft sitzt
+  der Mond vier Pixel weiter rechts.
+- **Mudmaster-artiger Sekundenzeiger** - Ein sehr schmaler, hellerer und blasser
+  orangefarbener Sekundenzeiger reicht als lange Nadel bis knapp über den
+  Mondrand und ist standardmäßig eingeschaltet. Per
   Rechtsklick auf die Uhr lässt er sich unmittelbar ein- oder ausblenden; die
   Auswahl bleibt für spätere Starts gespeichert.
 
