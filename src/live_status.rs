@@ -2329,7 +2329,6 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
             Ok(()) => app.clock_second_hand_visible = show_second_hand,
             Err(error) => app.error = Some(error.to_string()),
         }
-        app.context_menu_pos = None;
     } else if reset_requested {
         apply_live_status_scale(
             app,
