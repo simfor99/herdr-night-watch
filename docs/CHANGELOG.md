@@ -16,9 +16,10 @@
   vollständig sichtbar.
 - **Feine Stundenorientierung** - Die blassen Ziffern `12`, `3`, `6` und `9`
   ersetzen die vier breiten Viertelstunden-Striche. Acht kurze, zwei Pixel
-  breite Zwischenstriche bleiben erhalten. Ziffern und Striche schweben in kaum
-  sichtbarem Weiß außerhalb der Mondscheibe im Hof; für etwas mehr Luft sitzt
-  der Mond vier Pixel weiter rechts.
+  breite Zwischenstriche bleiben erhalten. Russo One aus Google Fonts liefert
+  die nun 50 Prozent größeren, kräftigen Ziffern mit dunkler Kontur. Sie
+  skalieren ohne Qualitätsverlust und schweben außerhalb der Mondscheibe im
+  erweiterten Hof; der Mond sitzt zum Ausgleich 13,5 Pixel weiter rechts.
 - **Mudmaster-artiger Sekundenzeiger** - Ein sehr schmaler, hellerer und blasser
   orangefarbener Sekundenzeiger reicht als lange Nadel bis knapp über den
   Mondrand und ist standardmäßig eingeschaltet. Per

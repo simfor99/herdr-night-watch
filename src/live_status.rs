@@ -16,7 +16,7 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{
-    Mutex,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender},
 };
@@ -118,9 +118,11 @@ static NEXT_OPEN_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 // The pid of the most recently spawned live child, kept beyond the open
 // attempt so later opens and a tray quit can still clean it up.
 static LAST_LIVE_CHILD_PID: Mutex<Option<u32>> = Mutex::new(None);
-const MOON_SLOT_WIDTH: f32 = 77.0;
+const MOON_SLOT_WIDTH: f32 = 83.0;
 const MOON_ICON_DIAMETER: f32 = 59.5;
-const MOON_RIGHT_INSET: f32 = 30.0;
+const MOON_RIGHT_INSET: f32 = 13.5;
+const MOON_HALO_INNER_RADIUS: f32 = 1.16;
+const MOON_HALO_OUTER_RADIUS: f32 = 1.35;
 const KPI_PANEL_WIDTH: f32 = 264.0;
 
 pub fn open() -> Result<()> {
@@ -2997,8 +2999,8 @@ fn moon_icon(
     let phase = phase.rem_euclid(1.0);
     let halo_outer = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18);
     let halo_inner = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 32);
-    painter.circle_filled(center, radius * 1.28, halo_outer);
-    painter.circle_filled(center, radius * 1.14, halo_inner);
+    painter.circle_filled(center, radius * MOON_HALO_OUTER_RADIUS, halo_outer);
+    painter.circle_filled(center, radius * MOON_HALO_INNER_RADIUS, halo_inner);
     let illumination = (1.0 - (std::f32::consts::TAU * phase as f32).cos()) * 0.5;
     let dark_side = if phase < 0.5 { 1.0 } else { -1.0 };
     let separation = moon_disc_separation(illumination) * radius;
@@ -3096,8 +3098,10 @@ const MAIN_HAND_INNER_OUTLINE: egui::Color32 = egui::Color32::from_rgb(247, 241,
 const MAIN_HAND_OUTER_OUTLINE: egui::Color32 = egui::Color32::from_rgb(5, 8, 15);
 const SECOND_HAND_SHAFT_WIDTH: f32 = 0.75;
 const SECOND_HAND_COLOR: egui::Color32 = egui::Color32::from_rgb(222, 142, 92);
-const CLOCK_CARDINAL_LABEL_FONT_SIZE: f32 = 6.2;
-const CLOCK_CARDINAL_LABEL_RADIUS: f32 = 1.125;
+const CLOCK_CARDINAL_LABEL_RADIUS: f32 = 1.145;
+const CLOCK_CARDINAL_FONT_NAME: &str = "russo_one";
+const CLOCK_CARDINAL_FONT_SIZE: f32 = 9.3;
+const RUSSO_ONE_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/RussoOne-Regular.ttf");
 
 #[derive(Clone, Copy, Debug)]
 struct ClockIndexMarkSpec {
@@ -3189,29 +3193,20 @@ fn paint_clock_index_marks(painter: &egui::Painter, center: egui::Pos2, radius: 
 }
 
 fn paint_clock_cardinal_labels(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
-    let fill = egui::Color32::from_rgba_unmultiplied(247, 241, 229, 96);
-    let outline = egui::Color32::from_rgba_unmultiplied(5, 8, 15, 112);
-    let font = egui::FontId::proportional(CLOCK_CARDINAL_LABEL_FONT_SIZE);
-    let outline_width = outline_width_in_points(painter.pixels_per_point()) * 0.5;
+    let fill = egui::Color32::from_rgb(225, 232, 190);
+    let outline = egui::Color32::from_rgba_unmultiplied(5, 8, 15, 218);
+    let font = russo_one_font(CLOCK_CARDINAL_FONT_SIZE);
     for label in clock_cardinal_label_specs() {
         let position = clock_cardinal_label_position(center, radius, label.turns);
-        for (dx, dy) in outline_offsets(outline_width) {
-            painter.text(
-                position + egui::vec2(dx, dy),
-                egui::Align2::CENTER_CENTER,
-                label.text,
-                font.clone(),
-                outline,
-            );
-        }
-        painter.text(
-            position,
-            egui::Align2::CENTER_CENTER,
-            label.text,
-            font.clone(),
-            fill,
-        );
+        paint_outlined_label(painter, position, label.text, font.clone(), fill, outline);
     }
+}
+
+fn russo_one_font(size: f32) -> egui::FontId {
+    egui::FontId::new(
+        size,
+        egui::FontFamily::Name(Arc::from(CLOCK_CARDINAL_FONT_NAME)),
+    )
 }
 
 fn clock_cardinal_label_position(center: egui::Pos2, radius: f32, turns: f32) -> egui::Pos2 {
@@ -4172,6 +4167,17 @@ fn glassy_frame(ui: &mut egui::Ui) -> egui::Frame {
 }
 
 fn configure_visuals(context: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        CLOCK_CARDINAL_FONT_NAME.to_owned(),
+        Arc::new(egui::FontData::from_static(RUSSO_ONE_FONT_BYTES)),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name(Arc::from(CLOCK_CARDINAL_FONT_NAME)),
+        vec![CLOCK_CARDINAL_FONT_NAME.to_owned()],
+    );
+    context.set_fonts(fonts);
+
     let mut visuals = egui::Visuals::dark();
     visuals.extreme_bg_color = BG_BOTTOM;
     visuals.faint_bg_color = egui::Color32::from_rgb(28, 36, 56);
@@ -4420,25 +4426,32 @@ mod tests {
 
         assert!(inner.distance(center) > radius);
         assert!((outer.distance(inner) - 3.5).abs() < 0.001);
-        assert!(outer.distance(center) < radius * 1.28);
+        assert!(outer.distance(center) < radius * MOON_HALO_OUTER_RADIUS);
     }
 
     #[test]
-    fn clock_cardinal_labels_sit_in_the_moon_halo() {
+    fn clock_cardinal_numerals_stay_centered_in_the_expanded_moon_halo() {
         let center = egui::Pos2::ZERO;
         let radius = 30.0;
 
         for label in clock_cardinal_label_specs() {
             let position = clock_cardinal_label_position(center, radius, label.turns);
             assert!(position.distance(center) > radius);
-            assert!(position.distance(center) < radius * 1.28);
+            assert!(position.distance(center) < radius * MOON_HALO_OUTER_RADIUS);
         }
-        assert_eq!(CLOCK_CARDINAL_LABEL_FONT_SIZE, 6.2);
+        assert_eq!(MOON_HALO_OUTER_RADIUS, 1.35);
     }
 
     #[test]
-    fn moon_moves_four_points_right_to_make_room_for_cardinal_labels() {
-        assert_eq!(MOON_RIGHT_INSET, 30.0);
+    fn clock_cardinal_numerals_use_russo_one_at_one_and_a_half_times_size() {
+        assert_eq!(CLOCK_CARDINAL_FONT_NAME, "russo_one");
+        assert_eq!(CLOCK_CARDINAL_FONT_SIZE, 9.3);
+        assert!(RUSSO_ONE_FONT_BYTES.len() > 30_000);
+    }
+
+    #[test]
+    fn moon_moves_thirteen_and_a_half_points_right_for_balanced_outer_spacing() {
+        assert_eq!(MOON_RIGHT_INSET + MOON_SLOT_WIDTH / 2.0, 55.0);
     }
 
     #[test]
