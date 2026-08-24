@@ -31,6 +31,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
     TerminateProcess,
 };
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SW_RESTORE,
@@ -45,9 +46,9 @@ const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_WINDOW_START_ATTEMPTS: usize = 3;
 const LIVE_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
-// The viewport starts hidden and is only revealed after egui presented its
-// first frame. Until then an existing HWND does not count as drawn, so the
-// watchdog waits for visibility instead of bare window existence.
+// eframe keeps the native viewport hidden until it has presented its first
+// frame. Until then an existing HWND does not count as drawn, so the watchdog
+// waits for visibility instead of bare window existence.
 const LIVE_WINDOW_VISIBLE_TIMEOUT: Duration = Duration::from_secs(30);
 // After the window became visible a cold-boot GPU failure can still kill the
 // process a few frames later. Guard that phase too; a clean exit code 0 there
@@ -1024,19 +1025,12 @@ fn is_ready_live_window(visible: bool, minimized: bool, width: i32, height: i32)
     visible && width >= LIVE_WINDOW_MIN_READY_WIDTH && height >= LIVE_WINDOW_MIN_READY_HEIGHT
 }
 
-/// Whether a concrete live window already presented itself. The viewport
-/// starts hidden and reveals after its first painted frame, so visibility is
-/// the reliable "first frame done" signal for the tray-side watchdog.
+/// Whether a concrete live window already presented itself. eframe creates
+/// the native window hidden and reveals it after the first rendered frame, so
+/// visibility is the reliable readiness signal for the tray-side watchdog.
 fn live_window_is_ready_now(hwnd: HWND) -> bool {
     let (visible, minimized, width, height) = live_window_metrics(hwnd);
     is_ready_live_window(visible, minimized, width, height)
-}
-
-/// `cumulative_frame_nr` advances only after egui finished all layout passes
-/// for a frame. A larger value therefore proves that the hidden viewport has
-/// a complete frame ready, even when an earlier pass requested a discard.
-fn has_completed_frame_since(first_frame_nr: u64, completed_frame_nr: u64) -> bool {
-    completed_frame_nr > first_frame_nr
 }
 
 /// A missing timestamp means the work has never run and is therefore due
@@ -1167,6 +1161,21 @@ struct WorkArea {
 }
 
 impl WorkArea {
+    fn from_physical_rect(rect: RECT, pixels_per_point: f32) -> Self {
+        let pixels_per_point = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+            f64::from(pixels_per_point)
+        } else {
+            1.0
+        };
+        let to_points = |pixels: i32| (f64::from(pixels) / pixels_per_point).round() as i32;
+        Self {
+            left: to_points(rect.left),
+            top: to_points(rect.top),
+            right: to_points(rect.right),
+            bottom: to_points(rect.bottom),
+        }
+    }
+
     fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.left && x < self.right && y >= self.top && y < self.bottom
     }
@@ -1241,13 +1250,19 @@ unsafe extern "system" fn monitor_area_callback(
         let mut info: MONITORINFO = std::mem::zeroed();
         info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if GetMonitorInfoW(monitor, &mut info) != 0 {
-            let work = info.rcWork;
-            collector.areas.push(WorkArea {
-                left: work.left,
-                top: work.top,
-                right: work.right,
-                bottom: work.bottom,
-            });
+            let mut dpi_x = 96;
+            let mut dpi_y = 96;
+            let pixels_per_point =
+                if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) >= 0
+                    && dpi_x > 0
+                {
+                    dpi_x as f32 / 96.0
+                } else {
+                    1.0
+                };
+            collector
+                .areas
+                .push(WorkArea::from_physical_rect(info.rcWork, pixels_per_point));
         }
     }
     1
@@ -1266,14 +1281,16 @@ fn monitor_work_areas() -> Vec<WorkArea> {
     collector.areas
 }
 
-fn run_window() -> Result<()> {
-    let scale = window_settings::live_status_scale();
+fn live_viewport_builder(
+    scale: f32,
+    position: Option<[f32; 2]>,
+    language: Language,
+) -> egui::ViewportBuilder {
     let mut viewport = egui::ViewportBuilder::default()
-        // Start hidden and let the app reveal itself after its first painted
-        // frame: during a cold boot the GPU driver may not be ready yet, and
-        // a viewport shown before its first paint is the white flash window.
-        // Visibility thereby becomes the watchdog's "first frame done" signal.
-        .with_visible(false)
+        // Do not set `visible=false` here. eframe already creates native
+        // windows hidden and reveals them after their first rendered frame.
+        // Marking the egui viewport itself hidden prevents `App::ui` from
+        // running, so the native window can only expose an empty white surface.
         .with_inner_size([DESIGN_WIDTH * scale, DESIGN_HEIGHT * scale])
         .with_min_inner_size([
             DESIGN_WIDTH * window_settings::MIN_LIVE_STATUS_SCALE,
@@ -1288,29 +1305,45 @@ fn run_window() -> Result<()> {
         .with_window_level(window_chrome::window_level(
             window_settings::WindowLevel::current(),
         ))
-        .with_title(match Language::current() {
+        .with_title(match language {
             Language::German => "Herdr-Nachtwächter - Live-Status",
             Language::English => "Herdr Night Watch - Live Status",
         });
-    let saved_position = window_settings::live_status_position();
-    let clamped_position = clamp_live_position(
-        saved_position,
-        [DESIGN_WIDTH * scale, DESIGN_HEIGHT * scale],
-        &monitor_work_areas(),
-    );
-    if let Some(position) = clamped_position {
+    if let Some(position) = position {
         viewport = viewport.with_position(position);
-        if saved_position != Some(position) {
-            // Self-healing: the saved position pointed at a monitor that is
-            // not attached right now. Persist the corrected spot so the next
-            // start opens visibly without repeating the clamp.
-            let _ = window_settings::set_live_status_position(position);
-        }
     }
+    viewport
+}
+
+fn run_window() -> Result<()> {
+    let scale = window_settings::live_status_scale();
+    let saved_position = window_settings::live_status_position();
+    let viewport = live_viewport_builder(scale, None, Language::current());
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Glow,
         persist_window: false,
+        // eframe creates winit's event loop before invoking this hook. On
+        // Windows that is also when the process becomes per-monitor DPI
+        // aware, so GetDpiForMonitor and the saved egui position use the same
+        // logical coordinate system here.
+        window_builder: Some(Box::new(move |viewport| {
+            let clamped_position = clamp_live_position(
+                saved_position,
+                [DESIGN_WIDTH * scale, DESIGN_HEIGHT * scale],
+                &monitor_work_areas(),
+            );
+            if let Some(position) = clamped_position {
+                if saved_position != Some(position) {
+                    // Self-healing: persist the corrected position so the
+                    // next start does not repeat the clamp.
+                    let _ = window_settings::set_live_status_position(position);
+                }
+                viewport.with_position(position)
+            } else {
+                viewport
+            }
+        })),
         ..Default::default()
     };
     eframe::run_native(
@@ -1376,8 +1409,6 @@ struct LiveStatusApp {
     scale: f32,
     last_saved_position: Option<[f32; 2]>,
     owner_pid: Option<u32>,
-    reveal_pending: bool,
-    first_frame_nr: Option<u64>,
 }
 
 impl Drop for LiveStatusApp {
@@ -1442,27 +1473,6 @@ impl LiveStatusApp {
             scale,
             last_saved_position: window_settings::live_status_position(),
             owner_pid,
-            reveal_pending: true,
-            first_frame_nr: None,
-        }
-    }
-
-    /// Reveal the viewport only after egui completed one whole frame. The
-    /// frame number advances after all sizing passes finish, so a later
-    /// `request_discard` in the same UI callback cannot be counted early.
-    fn reveal_after_first_frame(&mut self, ctx: &egui::Context) {
-        if !self.reveal_pending {
-            return;
-        }
-        let completed_frame_nr = ctx.cumulative_frame_nr();
-        let first_frame_nr = *self.first_frame_nr.get_or_insert(completed_frame_nr);
-        if has_completed_frame_since(first_frame_nr, completed_frame_nr) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            self.reveal_pending = false;
-        } else {
-            // The reveal decision runs in the next update pass, so make sure
-            // one is scheduled instead of waiting for external input.
-            ctx.request_repaint();
         }
     }
 
@@ -1679,7 +1689,6 @@ impl eframe::App for LiveStatusApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        self.reveal_after_first_frame(ui.ctx());
         let current_language = Language::current();
         if current_language != self.language {
             self.language = current_language;
@@ -4033,6 +4042,33 @@ mod tests {
     }
 
     #[test]
+    fn physical_work_area_is_converted_before_clamping_at_150_percent() {
+        let area = WorkArea::from_physical_rect(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 3840,
+                bottom: 2160,
+            },
+            1.5,
+        );
+
+        assert_eq!(
+            area,
+            WorkArea {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            }
+        );
+        assert_eq!(
+            clamp_live_position(Some([3000.0, 100.0]), [393.0, 190.0], &[area]),
+            Some([2167.0, 100.0])
+        );
+    }
+
+    #[test]
     fn finished_halo_rim_stays_one_screen_pixel() {
         assert!((outline_width_in_points(1.0) - 1.0).abs() < f32::EPSILON);
         assert!((outline_width_in_points(3.0) - (1.0 / 3.0)).abs() < 0.001);
@@ -4387,27 +4423,10 @@ mod tests {
     }
 
     #[test]
-    fn discarded_pass_does_not_complete_a_frame_early() {
-        let ctx = egui::Context::default();
-        let first_frame_nr = ctx.cumulative_frame_nr();
-        let mut passes_seen = 0;
+    fn eframe_owns_the_initial_hidden_until_painted_lifecycle() {
+        let viewport = live_viewport_builder(1.0, None, Language::German);
 
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            passes_seen += 1;
-            if ui.ctx().current_pass_index() == 0 {
-                ui.ctx().request_discard("test sizing pass");
-            }
-            assert!(!has_completed_frame_since(
-                first_frame_nr,
-                ui.ctx().cumulative_frame_nr()
-            ));
-        });
-
-        assert_eq!(passes_seen, 2);
-        assert!(has_completed_frame_since(
-            first_frame_nr,
-            ctx.cumulative_frame_nr()
-        ));
+        assert_ne!(viewport.visible, Some(false));
     }
 
     #[test]
