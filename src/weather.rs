@@ -11,6 +11,7 @@ const REGISTRY_KEY: &str = r"Software\HerdrNachtwaechter";
 const LOCATION_VALUE: &str = "WeatherLocation";
 const GEOCODING_ENDPOINT: &str = "https://geocoding-api.open-meteo.com/v1/search";
 const FORECAST_ENDPOINT: &str = "https://api.open-meteo.com/v1/forecast";
+const WIND_SYMBOL_THRESHOLD_KMH: f64 = 35.0;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct WeatherLocation {
@@ -33,6 +34,21 @@ pub struct WeatherReading {
     pub observed_at: String,
     pub location: WeatherLocation,
     pub moon_phase: f64,
+    pub symbol: WeatherSymbol,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WeatherSymbol {
+    ClearDay,
+    ClearNight,
+    PartlyCloudy,
+    Overcast,
+    Fog,
+    Rain,
+    Snow,
+    Storm,
+    Wind,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -50,6 +66,9 @@ struct ForecastResponse {
 struct CurrentWeather {
     temperature_2m: f64,
     time: String,
+    weather_code: Option<u8>,
+    is_day: Option<u8>,
+    wind_speed_10m: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -97,7 +116,7 @@ pub fn search_locations(
 
 pub fn fetch_current(location: WeatherLocation) -> Result<WeatherReading> {
     let url = format!(
-        "{FORECAST_ENDPOINT}?latitude={:.5}&longitude={:.5}&current=temperature_2m&daily=moon_phase&temperature_unit=celsius&timezone=auto",
+        "{FORECAST_ENDPOINT}?latitude={:.5}&longitude={:.5}&current=temperature_2m,weather_code,is_day,wind_speed_10m&daily=moon_phase&temperature_unit=celsius&wind_speed_unit=kmh&timezone=auto",
         location.latitude, location.longitude
     );
     let payload: ForecastResponse = fetch_json(&url)?;
@@ -114,7 +133,42 @@ pub fn fetch_current(location: WeatherLocation) -> Result<WeatherReading> {
             .and_then(|phases| phases.first().copied())
             .filter(|phase| phase.is_finite())
             .unwrap_or_else(estimated_moon_phase),
+        symbol: weather_symbol_for(
+            current.weather_code,
+            current.is_day != Some(0),
+            current.wind_speed_10m,
+        ),
     })
+}
+
+fn weather_symbol_for(
+    weather_code: Option<u8>,
+    is_day: bool,
+    wind_speed_kmh: Option<f64>,
+) -> WeatherSymbol {
+    let Some(weather_code) = weather_code else {
+        return WeatherSymbol::Unknown;
+    };
+    let symbol = match weather_code {
+        0 if is_day => WeatherSymbol::ClearDay,
+        0 => WeatherSymbol::ClearNight,
+        1 | 2 => WeatherSymbol::PartlyCloudy,
+        3 => WeatherSymbol::Overcast,
+        45 | 48 => WeatherSymbol::Fog,
+        51..=67 | 80..=82 => WeatherSymbol::Rain,
+        71..=77 | 85 | 86 => WeatherSymbol::Snow,
+        95..=99 => WeatherSymbol::Storm,
+        _ => WeatherSymbol::Unknown,
+    };
+    if matches!(
+        symbol,
+        WeatherSymbol::ClearDay | WeatherSymbol::ClearNight | WeatherSymbol::PartlyCloudy
+    ) && wind_speed_kmh.is_some_and(|speed| speed >= WIND_SYMBOL_THRESHOLD_KMH)
+    {
+        WeatherSymbol::Wind
+    } else {
+        symbol
+    }
 }
 
 /// Returns the current lunar phase as a fraction in [0, 1): new moon at 0,
@@ -176,5 +230,59 @@ fn default_location() -> WeatherLocation {
         country_code: "DE".into(),
         admin1: "Sachsen".into(),
         timezone: "Europe/Berlin".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groups_open_meteo_weather_codes_into_the_approved_symbol_family() {
+        assert_eq!(
+            weather_symbol_for(Some(0), true, None),
+            WeatherSymbol::ClearDay
+        );
+        assert_eq!(
+            weather_symbol_for(Some(0), false, None),
+            WeatherSymbol::ClearNight
+        );
+        assert_eq!(
+            weather_symbol_for(Some(2), true, None),
+            WeatherSymbol::PartlyCloudy
+        );
+        assert_eq!(
+            weather_symbol_for(Some(3), true, None),
+            WeatherSymbol::Overcast
+        );
+        assert_eq!(weather_symbol_for(Some(45), true, None), WeatherSymbol::Fog);
+        assert_eq!(
+            weather_symbol_for(Some(61), true, None),
+            WeatherSymbol::Rain
+        );
+        assert_eq!(
+            weather_symbol_for(Some(75), true, None),
+            WeatherSymbol::Snow
+        );
+        assert_eq!(
+            weather_symbol_for(Some(96), true, None),
+            WeatherSymbol::Storm
+        );
+    }
+
+    #[test]
+    fn shows_wind_without_hiding_rain_snow_or_storm() {
+        assert_eq!(
+            weather_symbol_for(Some(1), true, Some(35.0)),
+            WeatherSymbol::Wind
+        );
+        assert_eq!(
+            weather_symbol_for(Some(63), true, Some(60.0)),
+            WeatherSymbol::Rain
+        );
+        assert_eq!(
+            weather_symbol_for(Some(75), true, Some(60.0)),
+            WeatherSymbol::Snow
+        );
     }
 }
