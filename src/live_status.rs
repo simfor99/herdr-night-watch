@@ -3241,10 +3241,9 @@ const CLOCK_CARDINAL_LABEL_RADIUS: f32 = 1.145;
 const CLOCK_CARDINAL_FONT_NAME: &str = "russo_one";
 const CLOCK_CARDINAL_FONT_SIZE: f32 = 9.3;
 const CLOCK_TEMPERATURE_FONT_SIZE: f32 = 11.0;
-// The weather row lives in the free space above the dial. The live review
-// placed the first correction ten screen pixels too low, so this sits exactly
-// halfway between the two reviewed positions while the dial remains fixed.
-const CLOCK_TEMPERATURE_VERTICAL_OFFSET: f32 = 1.80;
+// The weather row lives in the free space above the dial. The latest live
+// review places it about ten screen pixels higher than the clock halo.
+const CLOCK_TEMPERATURE_VERTICAL_OFFSET: f32 = 2.0;
 const CLOCK_WEATHER_SYMBOL_SIZE: f32 = 32.0;
 const WEATHER_SYMBOL_COLOR: egui::Color32 = egui::Color32::from_rgb(229, 201, 137);
 const WEATHER_SYMBOL_STROKE_WIDTH: f32 = 1.2;
@@ -4909,7 +4908,7 @@ mod tests {
 
         assert!(temperature.y < center.y - radius * MOON_HALO_OUTER_RADIUS);
         assert!(temperature.y > center.y - radius * 2.4);
-        assert_eq!(CLOCK_TEMPERATURE_VERTICAL_OFFSET, 1.80);
+        assert_eq!(CLOCK_TEMPERATURE_VERTICAL_OFFSET, 2.0);
         assert_eq!(CLOCK_TEMPERATURE_FONT_SIZE, 11.0);
         assert_eq!(CLOCK_WEATHER_SYMBOL_SIZE, 32.0);
         assert!(CLOCK_WEATHER_SYMBOL_SIZE >= 15.0 * 2.0);
