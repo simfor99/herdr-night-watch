@@ -6,6 +6,7 @@ const OPACITY_VALUE: &str = "WindowOpacity";
 const LEVEL_VALUE: &str = "WindowLevel";
 const LIVE_STATUS_START_VALUE: &str = "OpenLiveStatusOnStartup";
 const LIVE_STATUS_TASKBAR_VALUE: &str = "ShowLiveStatusInTaskbar";
+const CLOCK_VISIBLE_VALUE: &str = "ShowAnalogClock";
 const CLOCK_SECOND_HAND_VALUE: &str = "ShowClockSecondHand";
 const LIVE_STATUS_POS_X_VALUE: &str = "LiveStatusPositionX";
 const LIVE_STATUS_POS_Y_VALUE: &str = "LiveStatusPositionY";
@@ -98,6 +99,14 @@ pub fn live_status_in_taskbar() -> bool {
 
 pub fn set_live_status_in_taskbar(show: bool) -> anyhow::Result<()> {
     write_bool_setting(LIVE_STATUS_TASKBAR_VALUE, show)
+}
+
+pub fn clock_visible() -> bool {
+    read_bool_setting(CLOCK_VISIBLE_VALUE, true)
+}
+
+pub fn set_clock_visible(show: bool) -> anyhow::Result<()> {
+    write_bool_setting(CLOCK_VISIBLE_VALUE, show)
 }
 
 fn bool_setting_value(value: Option<u32>, default: bool) -> bool {

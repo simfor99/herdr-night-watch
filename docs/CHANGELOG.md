@@ -3,6 +3,25 @@
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
+## [2026-08-24] - Wetterlage trägt die Anzeige
+
+### 🌡️ Live-Status
+
+- **Großes Wetterzeichen, ruhige Gradzahl** - Über der Monduhr sitzt jetzt ein
+  messinginfarbenes Vektorzeichen im Stil einer meteorologischen Lehrtafel.
+  Klar, Nacht, Wolken, Nebel, Regen, Schnee, Gewitter und Wind bleiben in
+  jeder Fenstergröße scharf; Schnee zeigt drei eindeutige sechszackige
+  Sternflocken. Die Gradzahl ist bewusst kleiner und gedämpfter daneben
+  gesetzt, damit beide Angaben ohne Zeigerchaos lesbar bleiben.
+- **Nachtzeiger mit eigenem Signal** - Leuchtet der Mond für einen aktiven
+  Nachtmodus grün, wechseln Stunden- und Minutenzeiger auf ein warmes Gelb.
+  Außerhalb dieses Zustands bleiben sie sanft grün; der blass-orange
+  Sekundenzeiger bleibt unverändert.
+- **Ruhiger Mondmodus** - Das Rechtsklick-Menü kann die Analoguhr dauerhaft
+  ausblenden. Dann bleiben nur Mondphase und die mittige Temperatur sichtbar;
+  das Wetterzeichen wird bewusst ausgeblendet. Jede Auswahl schließt das Menü
+  sofort.
+
 ## [2026-08-24] - Analoge Uhr im Mond
 
 ### 🕰️ Live-Status
@@ -12,8 +31,8 @@
   Stück nadelförmig zusammen. Eine weiße Innenkontur und eine feine schwarze
   Außenkontur halten beide Zeiger vor jeder Mondphase lesbar. Der Minutenzeiger
   reicht nahe an den äußersten Mondrand; auch der Stundenzeiger ragt sicher über
-  die Temperaturanzeige hinaus. Die Temperatur bleibt als oberste Ebene
-  vollständig sichtbar.
+  die Temperaturanzeige hinaus. Die Temperatur steht oberhalb der Uhr im
+  freien Mondhof und bleibt vollständig sichtbar.
 - **Feine Stundenorientierung** - Die blassen Ziffern `12`, `3`, `6` und `9`
   ersetzen die vier breiten Viertelstunden-Striche. Acht kurze, zwei Pixel
   breite Zwischenstriche bleiben erhalten. Russo One aus Google Fonts liefert

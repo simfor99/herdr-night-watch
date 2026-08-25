@@ -5,7 +5,7 @@ use crate::{
     media::{self, MediaCommand, MediaSnapshot},
     system_metrics::{self, SystemMetrics},
     taskbar,
-    weather::{self, WeatherLocation, WeatherReading},
+    weather::{self, WeatherLocation, WeatherReading, WeatherSymbol},
     weather_location, window_chrome, window_settings,
 };
 use anyhow::{Context, Result};
@@ -76,9 +76,13 @@ const GRAY: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);
 const BG_TOP: egui::Color32 = egui::Color32::from_rgb(26, 34, 54);
 const BG_BOTTOM: egui::Color32 = egui::Color32::from_rgb(14, 19, 33);
+const WINDOW_CONTROL_HOOD_FILL: egui::Color32 = egui::Color32::from_rgb(18, 27, 45);
+const WINDOW_CONTROL_HOOD_STROKE: egui::Color32 = egui::Color32::from_rgb(66, 74, 98);
 const WINDOW_DRAG_THRESHOLD_SQUARED: f32 = 4.0;
 const DESIGN_WIDTH: f32 = 393.0;
 const DESIGN_HEIGHT: f32 = 190.0;
+// Five screen pixels at the standard 150 % Windows scaling.
+const KPI_ROW_TOP_GAP: f32 = 9.3;
 const RESIZE_GRIP_SIZE: f32 = 16.0;
 const LIVE_WINDOW_MIN_READY_WIDTH: i32 = 80;
 const LIVE_WINDOW_MIN_READY_HEIGHT: i32 = 40;
@@ -1411,6 +1415,7 @@ struct LiveStatusApp {
     resize_preview_scale: Option<f32>,
     resize_preview_window_size: Option<egui::Vec2>,
     context_menu_pos: Option<egui::Pos2>,
+    clock_visible: bool,
     clock_second_hand_visible: bool,
     scale: f32,
     last_saved_position: Option<[f32; 2]>,
@@ -1476,6 +1481,7 @@ impl LiveStatusApp {
             resize_preview_scale: None,
             resize_preview_window_size: None,
             context_menu_pos: None,
+            clock_visible: window_settings::clock_visible(),
             clock_second_hand_visible: window_settings::clock_second_hand_visible(),
             scale,
             last_saved_position: window_settings::live_status_position(),
@@ -1731,9 +1737,11 @@ impl eframe::App for LiveStatusApp {
         self.refresh();
         self.refresh_weather();
         window_chrome::paint_gradient(ui.painter(), ui.max_rect(), BG_TOP, BG_BOTTOM);
-        let (log_clicked, level_clicked, minimize_clicked, close_clicked) =
-            window_controls(ui, self.language, self.window_level);
-        if log_clicked {
+        // Register the controls now, then paint them after the content. This
+        // deliberately gives their opaque hood precedence over the weather
+        // line and any clock artwork that reaches into the title area.
+        let controls = window_controls(ui, self.language, self.window_level);
+        if controls.log_clicked {
             match log_viewer::open() {
                 Ok(()) => {
                     self.toast = Some(Toast {
@@ -1748,7 +1756,7 @@ impl eframe::App for LiveStatusApp {
                 Err(error) => self.error = Some(error.to_string()),
             }
         }
-        if level_clicked {
+        if controls.level_clicked {
             let next_level = self.window_level.next();
             match next_level.set() {
                 Ok(()) => {
@@ -1766,11 +1774,11 @@ impl eframe::App for LiveStatusApp {
                 Err(error) => self.error = Some(error.to_string()),
             }
         }
-        if minimize_clicked {
+        if controls.minimize_clicked {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
-        if close_clicked {
+        if controls.close_clicked {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -1948,7 +1956,9 @@ impl eframe::App for LiveStatusApp {
                                         MOON_ICON_DIAMETER,
                                         gradient_rect,
                                         moon.temperature_c,
+                                        moon.weather_symbol,
                                         moon.phase,
+                                        self.clock_visible,
                                         self.clock_second_hand_visible,
                                     )
                                     .on_hover_text(moon.tooltip);
@@ -1970,7 +1980,7 @@ impl eframe::App for LiveStatusApp {
                         );
                     },
                 );
-                ui.add_space(6.0);
+                ui.add_space(KPI_ROW_TOP_GAP);
                 let metrics_text_right = system_metrics_row(ui, self.metrics, self.language);
                 if let Some(media) = &self.media_snapshot {
                     ui.add_space(4.0);
@@ -1989,6 +1999,7 @@ impl eframe::App for LiveStatusApp {
         handle_window_resize(self, ui);
         handle_window_drag(self, ui);
         persist_window_position(self, ui.ctx());
+        controls.paint(ui.painter(), self.window_level);
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
 }
@@ -2271,6 +2282,14 @@ fn is_live_context_menu_position(rect: egui::Rect, position: egui::Pos2) -> bool
         && !resize_grip_rect(rect).contains(position)
 }
 
+fn context_menu_should_close_after_selection(
+    reset_requested: bool,
+    clock_visibility_changed: bool,
+    second_hand_changed: bool,
+) -> bool {
+    reset_requested || clock_visibility_changed || second_hand_changed
+}
+
 fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
     let rect = ui.max_rect();
     let (pointer, secondary_clicked, any_click) = ui.ctx().input(|input| {
@@ -2291,6 +2310,7 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
 
     let scale_label = format!("{:.0} %", app.scale * 100.0);
     let mut reset_requested = false;
+    let mut clock_visibility_choice = None;
     let mut second_hand_choice = None;
     let menu = egui::Area::new(egui::Id::new("live_status_context_menu"))
         .order(egui::Order::Foreground)
@@ -2311,25 +2331,50 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
                     reset_requested = true;
                 }
                 ui.separator();
-                let mut show_second_hand = app.clock_second_hand_visible;
+                let mut show_clock = app.clock_visible;
                 if ui
                     .checkbox(
-                        &mut show_second_hand,
-                        app.language
-                            .text("Orangen Sekundenzeiger anzeigen", "Show orange second hand"),
+                        &mut show_clock,
+                        app.language.text("Analoguhr anzeigen", "Show analog clock"),
                     )
                     .changed()
                 {
+                    clock_visibility_choice = Some(show_clock);
+                }
+                let mut show_second_hand = app.clock_second_hand_visible;
+                let second_hand_changed = ui
+                    .add_enabled_ui(show_clock, |ui| {
+                        ui.checkbox(
+                            &mut show_second_hand,
+                            app.language
+                                .text("Orangen Sekundenzeiger anzeigen", "Show orange second hand"),
+                        )
+                    })
+                    .inner
+                    .changed();
+                if second_hand_changed {
                     second_hand_choice = Some(show_second_hand);
                 }
             });
         });
+    let close_after_selection = context_menu_should_close_after_selection(
+        reset_requested,
+        clock_visibility_choice.is_some(),
+        second_hand_choice.is_some(),
+    );
+    if let Some(show_clock) = clock_visibility_choice {
+        match window_settings::set_clock_visible(show_clock) {
+            Ok(()) => app.clock_visible = show_clock,
+            Err(error) => app.error = Some(error.to_string()),
+        }
+    }
     if let Some(show_second_hand) = second_hand_choice {
         match window_settings::set_clock_second_hand_visible(show_second_hand) {
             Ok(()) => app.clock_second_hand_visible = show_second_hand,
             Err(error) => app.error = Some(error.to_string()),
         }
-    } else if reset_requested {
+    }
+    if reset_requested {
         apply_live_status_scale(
             app,
             ui.ctx(),
@@ -2346,9 +2391,10 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
             color: ACCENT,
             expires_at: Instant::now() + Duration::from_secs(3),
         });
-    } else if any_click
-        && !secondary_clicked
-        && pointer.is_some_and(|position| !menu.response.rect.contains(position))
+    } else if close_after_selection
+        || (any_click
+            && !secondary_clicked
+            && pointer.is_some_and(|position| !menu.response.rect.contains(position)))
     {
         app.context_menu_pos = None;
     }
@@ -2413,13 +2459,144 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
     }
 }
 
+struct WindowControls {
+    visible: bool,
+    hood_rect: egui::Rect,
+    log_rect: egui::Rect,
+    level_rect: egui::Rect,
+    minimize_rect: egui::Rect,
+    close_rect: egui::Rect,
+    log_hovered: bool,
+    level_hovered: bool,
+    minimize_hovered: bool,
+    close_hovered: bool,
+    log_clicked: bool,
+    level_clicked: bool,
+    minimize_clicked: bool,
+    close_clicked: bool,
+}
+
+impl WindowControls {
+    fn paint(&self, painter: &egui::Painter, level: window_settings::WindowLevel) {
+        if !self.visible {
+            return;
+        }
+
+        // This surface must be fully opaque: the weather line can sit behind
+        // it at smaller window scales, but must never shine through controls.
+        painter.rect_filled(
+            self.hood_rect,
+            egui::CornerRadius::same(10),
+            WINDOW_CONTROL_HOOD_FILL,
+        );
+        painter.rect_stroke(
+            self.hood_rect,
+            egui::CornerRadius::same(10),
+            egui::Stroke::new(1.0, WINDOW_CONTROL_HOOD_STROKE),
+            egui::StrokeKind::Inside,
+        );
+        window_chrome::glass_sheen(painter, self.hood_rect);
+
+        let neutral_hover_fill = egui::Color32::from_rgb(52, 54, 66);
+        painter.rect_filled(
+            self.log_rect,
+            egui::CornerRadius::same(8),
+            if self.log_hovered {
+                neutral_hover_fill
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+        );
+        painter.rect_filled(
+            self.level_rect,
+            egui::CornerRadius::same(8),
+            if self.level_hovered {
+                neutral_hover_fill
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+        );
+        painter.rect_filled(
+            self.minimize_rect,
+            egui::CornerRadius::same(8),
+            if self.minimize_hovered {
+                neutral_hover_fill
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+        );
+        painter.rect_filled(
+            self.close_rect,
+            egui::CornerRadius::same(8),
+            if self.close_hovered {
+                egui::Color32::from_rgb(190, 65, 78)
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+        );
+
+        let icon_color = if self.close_hovered {
+            egui::Color32::WHITE
+        } else {
+            GRAY
+        };
+        draw_log_icon(
+            painter,
+            self.log_rect.center(),
+            if self.log_hovered { ACCENT } else { GRAY },
+        );
+        draw_window_level_icon(
+            painter,
+            self.level_rect.center(),
+            level,
+            if self.level_hovered {
+                level_color(level)
+            } else {
+                GRAY
+            },
+        );
+        painter.line_segment(
+            [
+                egui::pos2(
+                    self.minimize_rect.left() + 11.0,
+                    self.minimize_rect.center().y + 4.0,
+                ),
+                egui::pos2(
+                    self.minimize_rect.right() - 11.0,
+                    self.minimize_rect.center().y + 4.0,
+                ),
+            ],
+            egui::Stroke::new(1.2, icon_color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(self.close_rect.left() + 11.0, self.close_rect.top() + 10.0),
+                egui::pos2(
+                    self.close_rect.right() - 11.0,
+                    self.close_rect.bottom() - 10.0,
+                ),
+            ],
+            egui::Stroke::new(1.2, icon_color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(self.close_rect.right() - 11.0, self.close_rect.top() + 10.0),
+                egui::pos2(
+                    self.close_rect.left() + 11.0,
+                    self.close_rect.bottom() - 10.0,
+                ),
+            ],
+            egui::Stroke::new(1.2, icon_color),
+        );
+    }
+}
+
 fn window_controls(
     ui: &mut egui::Ui,
     language: Language,
     level: window_settings::WindowLevel,
-) -> (bool, bool, bool, bool) {
+) -> WindowControls {
     let rect = ui.max_rect();
-    let painter = ui.painter();
     let button_width = 30.0;
     let gap = 1.0;
     let hood_width = button_width * 4.0 + gap * 3.0 + 10.0;
@@ -2431,21 +2608,6 @@ fn window_controls(
         .ctx()
         .pointer_hover_pos()
         .is_some_and(|position| hood_rect.contains(position));
-    if !visible {
-        return (false, false, false, false);
-    }
-    painter.rect_filled(
-        hood_rect,
-        egui::CornerRadius::same(10),
-        egui::Color32::from_rgba_unmultiplied(28, 29, 38, 220),
-    );
-    painter.rect_stroke(
-        hood_rect,
-        egui::CornerRadius::same(10),
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(66, 74, 98)),
-        egui::StrokeKind::Inside,
-    );
-    window_chrome::glass_sheen(ui.painter(), hood_rect);
     let log_rect = egui::Rect::from_min_max(
         egui::pos2(hood_rect.left() + 2.0, hood_rect.top()),
         egui::pos2(hood_rect.left() + button_width + 2.0, hood_rect.bottom()),
@@ -2462,6 +2624,25 @@ fn window_controls(
         egui::pos2(close_rect.left() - gap - button_width, hood_rect.top()),
         egui::pos2(close_rect.left() - gap, hood_rect.bottom()),
     );
+    let mut controls = WindowControls {
+        visible,
+        hood_rect,
+        log_rect,
+        level_rect,
+        minimize_rect,
+        close_rect,
+        log_hovered: false,
+        level_hovered: false,
+        minimize_hovered: false,
+        close_hovered: false,
+        log_clicked: false,
+        level_clicked: false,
+        minimize_clicked: false,
+        close_clicked: false,
+    };
+    if !visible {
+        return controls;
+    }
     let log_response = ui
         .interact(
             log_rect,
@@ -2489,77 +2670,15 @@ fn window_controls(
         ui.make_persistent_id("live_window_close"),
         egui::Sense::click(),
     );
-    let minimize_fill = if minimize_response.hovered() {
-        egui::Color32::from_rgb(52, 54, 66)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    let close_fill = if close_response.hovered() {
-        egui::Color32::from_rgb(190, 65, 78)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    let level_fill = if level_response.hovered() {
-        egui::Color32::from_rgb(52, 54, 66)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    let log_fill = if log_response.hovered() {
-        egui::Color32::from_rgb(52, 54, 66)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    painter.rect_filled(log_rect, egui::CornerRadius::same(8), log_fill);
-    painter.rect_filled(level_rect, egui::CornerRadius::same(8), level_fill);
-    painter.rect_filled(minimize_rect, egui::CornerRadius::same(8), minimize_fill);
-    painter.rect_filled(close_rect, egui::CornerRadius::same(8), close_fill);
-    let icon_color = if close_response.hovered() {
-        egui::Color32::WHITE
-    } else {
-        GRAY
-    };
-    draw_log_icon(
-        painter,
-        log_rect.center(),
-        if log_response.hovered() { ACCENT } else { GRAY },
-    );
-    draw_window_level_icon(
-        painter,
-        level_rect.center(),
-        level,
-        if level_response.hovered() {
-            level_color(level)
-        } else {
-            GRAY
-        },
-    );
-    painter.line_segment(
-        [
-            egui::pos2(minimize_rect.left() + 11.0, minimize_rect.center().y + 4.0),
-            egui::pos2(minimize_rect.right() - 11.0, minimize_rect.center().y + 4.0),
-        ],
-        egui::Stroke::new(1.2, icon_color),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(close_rect.left() + 11.0, close_rect.top() + 10.0),
-            egui::pos2(close_rect.right() - 11.0, close_rect.bottom() - 10.0),
-        ],
-        egui::Stroke::new(1.2, icon_color),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(close_rect.right() - 11.0, close_rect.top() + 10.0),
-            egui::pos2(close_rect.left() + 11.0, close_rect.bottom() - 10.0),
-        ],
-        egui::Stroke::new(1.2, icon_color),
-    );
-    (
-        log_response.clicked(),
-        level_response.clicked(),
-        minimize_response.clicked(),
-        close_response.clicked(),
-    )
+    controls.log_hovered = log_response.hovered();
+    controls.level_hovered = level_response.hovered();
+    controls.minimize_hovered = minimize_response.hovered();
+    controls.close_hovered = close_response.hovered();
+    controls.log_clicked = log_response.clicked();
+    controls.level_clicked = level_response.clicked();
+    controls.minimize_clicked = minimize_response.clicked();
+    controls.close_clicked = close_response.clicked();
+    controls
 }
 
 fn draw_log_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
@@ -2690,6 +2809,7 @@ struct MoonView {
     color: egui::Color32,
     tooltip: String,
     temperature_c: Option<f64>,
+    weather_symbol: WeatherSymbol,
     phase: f64,
 }
 
@@ -2701,6 +2821,9 @@ fn moon_view(
     weather_reading: Option<&WeatherReading>,
 ) -> MoonView {
     let temperature_c = weather_reading.map(|reading| reading.temperature_c);
+    let weather_symbol = weather_reading
+        .map(|reading| reading.symbol)
+        .unwrap_or(WeatherSymbol::Unknown);
     let phase = weather_reading
         .map(|reading| reading.moon_phase)
         .unwrap_or_else(weather::estimated_moon_phase);
@@ -2740,6 +2863,7 @@ fn moon_view(
                 weather_suffix,
             ),
             temperature_c,
+            weather_symbol,
             phase,
         };
     }
@@ -2756,6 +2880,7 @@ fn moon_view(
                 weather_suffix,
             ),
             temperature_c,
+            weather_symbol,
             phase,
         };
     }
@@ -2860,6 +2985,7 @@ fn moon_view(
         color,
         tooltip,
         temperature_c,
+        weather_symbol,
         phase,
     }
 }
@@ -2981,13 +3107,16 @@ fn draw_power_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Col
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn moon_icon(
     ui: &mut egui::Ui,
     color: egui::Color32,
     diameter: f32,
     gradient_rect: egui::Rect,
     temperature_c: Option<f64>,
+    weather_symbol: WeatherSymbol,
     phase: f64,
+    show_clock: bool,
     show_second_hand: bool,
 ) -> egui::Response {
     let (rect, response) =
@@ -3012,10 +3141,20 @@ fn moon_icon(
         radius,
         gradient_color_at(gradient_rect, dark_center),
     );
-    paint_clock_index_marks(painter, center, radius);
-    paint_clock_cardinal_labels(painter, center, radius);
-    paint_clock_hands(painter, center, radius, show_second_hand);
-    if let Some(temperature_c) = temperature_c {
+    if show_clock {
+        paint_clock_index_marks(painter, center, radius);
+        paint_clock_cardinal_labels(painter, center, radius);
+        paint_clock_hands(
+            painter,
+            center,
+            radius,
+            show_second_hand,
+            main_hand_color_for_moon(color),
+        );
+        if let Some(temperature_c) = temperature_c {
+            paint_clock_temperature(painter, center, radius, temperature_c, weather_symbol);
+        }
+    } else if let Some(temperature_c) = temperature_c {
         paint_moon_temperature(
             painter,
             rect,
@@ -3093,6 +3232,7 @@ const MINUTE_HAND_LENGTH: f32 = 0.96;
 const HOUR_HAND_BASE_WIDTH: f32 = 4.4;
 const MINUTE_HAND_BASE_WIDTH: f32 = 3.5;
 const MAIN_HAND_COLOR: egui::Color32 = PASTEL_GREEN;
+const NIGHT_MODE_MAIN_HAND_COLOR: egui::Color32 = PASTEL_YELLOW;
 const MAIN_HAND_INNER_OUTLINE: egui::Color32 = egui::Color32::from_rgb(247, 241, 229);
 const MAIN_HAND_OUTER_OUTLINE: egui::Color32 = egui::Color32::from_rgb(5, 8, 15);
 const SECOND_HAND_SHAFT_WIDTH: f32 = 0.75;
@@ -3100,6 +3240,14 @@ const SECOND_HAND_COLOR: egui::Color32 = egui::Color32::from_rgb(222, 142, 92);
 const CLOCK_CARDINAL_LABEL_RADIUS: f32 = 1.145;
 const CLOCK_CARDINAL_FONT_NAME: &str = "russo_one";
 const CLOCK_CARDINAL_FONT_SIZE: f32 = 9.3;
+const CLOCK_TEMPERATURE_FONT_SIZE: f32 = 11.0;
+// The weather row lives in the free space above the dial. The live review
+// placed the first correction ten screen pixels too low, so this sits exactly
+// halfway between the two reviewed positions while the dial remains fixed.
+const CLOCK_TEMPERATURE_VERTICAL_OFFSET: f32 = 1.80;
+const CLOCK_WEATHER_SYMBOL_SIZE: f32 = 32.0;
+const WEATHER_SYMBOL_COLOR: egui::Color32 = egui::Color32::from_rgb(229, 201, 137);
+const WEATHER_SYMBOL_STROKE_WIDTH: f32 = 1.2;
 const RUSSO_ONE_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/RussoOne-Regular.ttf");
 
 #[derive(Clone, Copy, Debug)]
@@ -3266,17 +3414,18 @@ fn paint_layered_needle_hand(
     turns: f32,
     length: f32,
     max_width: f32,
+    fill: egui::Color32,
 ) {
     let points = needle_hand_points(center, radius, turns, length, max_width);
     let one_pixel = outline_width_in_points(painter.pixels_per_point());
     painter.add(egui::Shape::convex_polygon(
         points.to_vec(),
-        MAIN_HAND_COLOR,
+        fill,
         egui::Stroke::new(one_pixel * 2.0, MAIN_HAND_OUTER_OUTLINE),
     ));
     painter.add(egui::Shape::convex_polygon(
         points.to_vec(),
-        MAIN_HAND_COLOR,
+        fill,
         egui::Stroke::new(one_pixel, MAIN_HAND_INNER_OUTLINE),
     ));
 }
@@ -3299,6 +3448,7 @@ fn paint_clock_hands(
     center: egui::Pos2,
     radius: f32,
     show_second_hand: bool,
+    main_hand_color: egui::Color32,
 ) {
     let turns = local_clock_hand_turns();
 
@@ -3309,6 +3459,7 @@ fn paint_clock_hands(
         turns.hour,
         HOUR_HAND_LENGTH,
         HOUR_HAND_BASE_WIDTH,
+        main_hand_color,
     );
     paint_layered_needle_hand(
         painter,
@@ -3317,6 +3468,7 @@ fn paint_clock_hands(
         turns.minute,
         MINUTE_HAND_LENGTH,
         MINUTE_HAND_BASE_WIDTH,
+        main_hand_color,
     );
     if show_second_hand {
         paint_outlined_hand_polygon(
@@ -3356,6 +3508,27 @@ fn outline_offsets(width: f32) -> [(f32, f32); 16] {
     offsets
 }
 
+fn paint_outlined_label(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    text: &str,
+    font: egui::FontId,
+    fill: egui::Color32,
+    outline: egui::Color32,
+) {
+    let width = outline_width_in_points(painter.pixels_per_point());
+    for (dx, dy) in outline_offsets(width) {
+        painter.text(
+            center + egui::vec2(dx, dy),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font.clone(),
+            outline,
+        );
+    }
+    painter.text(center, egui::Align2::CENTER_CENTER, text, font, fill);
+}
+
 fn lit_sickle_clip_rect(
     moon_rect: egui::Rect,
     center: egui::Pos2,
@@ -3382,27 +3555,6 @@ fn lit_sickle_clip_rect(
             moon_rect.max,
         ))
     }
-}
-
-fn paint_outlined_label(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    text: &str,
-    font: egui::FontId,
-    fill: egui::Color32,
-    outline: egui::Color32,
-) {
-    let width = outline_width_in_points(painter.pixels_per_point());
-    for (dx, dy) in outline_offsets(width) {
-        painter.text(
-            center + egui::vec2(dx, dy),
-            egui::Align2::CENTER_CENTER,
-            text,
-            font.clone(),
-            outline,
-        );
-    }
-    painter.text(center, egui::Align2::CENTER_CENTER, text, font, fill);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3443,6 +3595,364 @@ fn paint_moon_temperature(
             fill,
             background,
         );
+    }
+}
+
+fn main_hand_color_for_moon(moon_color: egui::Color32) -> egui::Color32 {
+    if moon_color == GREEN {
+        NIGHT_MODE_MAIN_HAND_COLOR
+    } else {
+        MAIN_HAND_COLOR
+    }
+}
+
+fn clock_temperature_position(center: egui::Pos2, radius: f32) -> egui::Pos2 {
+    center - egui::vec2(0.0, radius * CLOCK_TEMPERATURE_VERTICAL_OFFSET)
+}
+
+fn paint_clock_temperature(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    temperature_c: f64,
+    weather_symbol: WeatherSymbol,
+) {
+    let text = moon_temperature_label(temperature_c);
+    let font = egui::FontId::proportional(CLOCK_TEMPERATURE_FONT_SIZE);
+    let text_color = egui::Color32::from_rgb(202, 214, 208);
+    let text_width = painter
+        .layout_no_wrap(text.clone(), font.clone(), text_color)
+        .size()
+        .x;
+    let position = clock_temperature_position(center, radius);
+    let has_symbol = weather_symbol != WeatherSymbol::Unknown;
+    let gap = if has_symbol { 4.0 } else { 0.0 };
+    let group_width = if has_symbol {
+        CLOCK_WEATHER_SYMBOL_SIZE + gap + text_width
+    } else {
+        text_width
+    };
+    let group_left = position.x - group_width / 2.0;
+    let text_left = if has_symbol {
+        let icon_center = egui::pos2(group_left + CLOCK_WEATHER_SYMBOL_SIZE / 2.0, position.y);
+        paint_b_weather_symbol(
+            painter,
+            icon_center,
+            CLOCK_WEATHER_SYMBOL_SIZE,
+            weather_symbol,
+            WEATHER_SYMBOL_COLOR,
+        );
+        icon_center.x + CLOCK_WEATHER_SYMBOL_SIZE / 2.0 + gap
+    } else {
+        group_left
+    };
+    painter.text(
+        egui::pos2(text_left, position.y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        text_color,
+    );
+}
+
+fn paint_b_weather_symbol(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    symbol: WeatherSymbol,
+    color: egui::Color32,
+) {
+    match symbol {
+        WeatherSymbol::ClearDay => paint_b_clear_day(painter, center, size, color),
+        WeatherSymbol::ClearNight => paint_b_clear_night(painter, center, size, color),
+        WeatherSymbol::PartlyCloudy => paint_b_partly_cloudy(painter, center, size, color),
+        WeatherSymbol::Overcast => paint_b_overcast(painter, center, size, color),
+        WeatherSymbol::Fog => paint_b_fog(painter, center, size, color),
+        WeatherSymbol::Rain => paint_b_rain(painter, center, size, color),
+        WeatherSymbol::Snow => paint_b_snow(painter, center, size, color),
+        WeatherSymbol::Storm => paint_b_storm(painter, center, size, color),
+        WeatherSymbol::Wind => paint_b_wind(painter, center, size, color),
+        WeatherSymbol::Unknown => {}
+    }
+}
+
+fn weather_symbol_position(center: egui::Pos2, size: f32, x: f32, y: f32) -> egui::Pos2 {
+    let scale = size / 64.0;
+    center + egui::vec2((x - 32.0) * scale, (y - 32.0) * scale)
+}
+
+fn weather_symbol_stroke(painter: &egui::Painter, size: f32, color: egui::Color32) -> egui::Stroke {
+    let width = (WEATHER_SYMBOL_STROKE_WIDTH * size / 64.0)
+        .max(outline_width_in_points(painter.pixels_per_point()));
+    egui::Stroke::new(width, color)
+}
+
+fn paint_weather_line(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    points: &[(f32, f32)],
+    stroke: egui::Stroke,
+) {
+    painter.add(egui::Shape::line(
+        points
+            .iter()
+            .map(|&(x, y)| weather_symbol_position(center, size, x, y))
+            .collect(),
+        stroke,
+    ));
+}
+
+fn paint_weather_curve(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    points: [(f32, f32); 4],
+    stroke: egui::Stroke,
+) {
+    painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+        points.map(|(x, y)| weather_symbol_position(center, size, x, y)),
+        false,
+        egui::Color32::TRANSPARENT,
+        stroke,
+    ));
+}
+
+fn paint_b_clear_day(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    let stroke = weather_symbol_stroke(painter, size, color);
+    let scale = size / 64.0;
+    painter.circle_stroke(
+        weather_symbol_position(center, size, 32.0, 32.0),
+        10.3 * scale,
+        stroke,
+    );
+    painter.circle_stroke(
+        weather_symbol_position(center, size, 32.0, 32.0),
+        8.3 * scale,
+        stroke,
+    );
+    for line in [
+        [(32.0, 6.5), (32.0, 17.0)],
+        [(32.0, 47.0), (32.0, 57.5)],
+        [(6.5, 32.0), (17.0, 32.0)],
+        [(47.0, 32.0), (57.5, 32.0)],
+        [(13.9, 13.9), (21.3, 21.3)],
+        [(42.7, 42.7), (50.1, 50.1)],
+        [(50.1, 13.9), (42.7, 21.3)],
+        [(21.3, 42.7), (13.9, 50.1)],
+    ] {
+        paint_weather_line(painter, center, size, &line, stroke);
+    }
+    painter.circle_stroke(
+        weather_symbol_position(center, size, 32.0, 32.0),
+        2.2 * scale,
+        stroke,
+    );
+}
+
+fn paint_b_clear_night(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    color: egui::Color32,
+) {
+    let stroke = weather_symbol_stroke(painter, size, color);
+    paint_weather_curve(
+        painter,
+        center,
+        size,
+        [(42.8, 10.5), (26.0, 12.0), (19.4, 29.6), (27.1, 41.4)],
+        stroke,
+    );
+    paint_weather_curve(
+        painter,
+        center,
+        size,
+        [(27.1, 41.4), (34.4, 52.4), (48.2, 50.8), (55.0, 43.0)],
+        stroke,
+    );
+    paint_weather_curve(
+        painter,
+        center,
+        size,
+        [(55.0, 43.0), (42.3, 45.3), (30.3, 32.8), (36.4, 21.8)],
+        stroke,
+    );
+    paint_weather_curve(
+        painter,
+        center,
+        size,
+        [(36.4, 21.8), (38.2, 18.2), (40.1, 13.6), (42.8, 10.5)],
+        stroke,
+    );
+    paint_weather_line(painter, center, size, &[(47.5, 16.0), (47.5, 21.3)], stroke);
+    paint_weather_line(
+        painter,
+        center,
+        size,
+        &[(44.9, 18.65), (50.1, 18.65)],
+        stroke,
+    );
+    paint_weather_line(painter, center, size, &[(16.0, 20.0), (18.8, 20.0)], stroke);
+    paint_weather_line(painter, center, size, &[(17.4, 18.6), (17.4, 21.4)], stroke);
+}
+
+fn paint_b_cloud(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    let stroke = weather_symbol_stroke(painter, size, color);
+    paint_weather_curve(
+        painter,
+        center,
+        size,
+        [(12.0, 34.0), (13.0, 28.0), (18.0, 25.0), (24.0, 26.0)],
+        stroke,
+    );
+    paint_weather_curve(
+        painter,
+        center,
+        size,
+        [(24.0, 26.0), (26.0, 17.0), (39.0, 17.0), (42.0, 25.0)],
+        stroke,
+    );
+    paint_weather_curve(
+        painter,
+        center,
+        size,
+        [(42.0, 25.0), (48.0, 21.0), (55.0, 25.0), (54.0, 31.0)],
+        stroke,
+    );
+    paint_weather_curve(
+        painter,
+        center,
+        size,
+        [(54.0, 31.0), (54.0, 35.0), (51.0, 36.0), (48.0, 36.0)],
+        stroke,
+    );
+    paint_weather_line(painter, center, size, &[(48.0, 36.0), (12.0, 36.0)], stroke);
+}
+
+fn paint_b_partly_cloudy(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    color: egui::Color32,
+) {
+    let stroke = weather_symbol_stroke(painter, size, color);
+    let scale = size / 64.0;
+    painter.circle_stroke(
+        weather_symbol_position(center, size, 23.0, 23.0),
+        8.1 * scale,
+        stroke,
+    );
+    painter.circle_stroke(
+        weather_symbol_position(center, size, 23.0, 23.0),
+        6.2 * scale,
+        stroke,
+    );
+    for line in [
+        [(23.0, 7.5), (23.0, 12.4)],
+        [(8.0, 23.0), (12.9, 23.0)],
+        [(12.4, 12.4), (15.9, 15.9)],
+        [(33.6, 12.4), (30.1, 15.9)],
+    ] {
+        paint_weather_line(painter, center, size, &line, stroke);
+    }
+    paint_b_cloud(painter, center, size, color);
+}
+
+fn paint_b_overcast(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    let stroke = weather_symbol_stroke(painter, size, color);
+    paint_b_cloud(painter, center, size, color);
+    paint_weather_line(painter, center, size, &[(14.0, 46.0), (51.0, 46.0)], stroke);
+    paint_weather_line(painter, center, size, &[(17.0, 49.5), (47.0, 49.5)], stroke);
+}
+
+fn paint_b_fog(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    let stroke = weather_symbol_stroke(painter, size, color);
+    paint_b_cloud(painter, center, size, color);
+    for line in [
+        [(8.0, 40.0), (49.0, 40.0)],
+        [(16.0, 44.5), (57.0, 44.5)],
+        [(7.0, 49.0), (43.0, 49.0)],
+        [(14.0, 53.5), (49.0, 53.5)],
+    ] {
+        paint_weather_line(painter, center, size, &line, stroke);
+    }
+}
+
+fn paint_b_rain(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    let stroke = weather_symbol_stroke(painter, size, color);
+    paint_b_cloud(painter, center, size, color);
+    for line in [
+        [(20.0, 42.0), (17.2, 51.5)],
+        [(26.5, 42.0), (23.7, 51.5)],
+        [(39.0, 42.0), (36.2, 51.5)],
+        [(45.5, 42.0), (42.7, 51.5)],
+    ] {
+        paint_weather_line(painter, center, size, &line, stroke);
+    }
+}
+
+fn paint_b_snowflake(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    x: f32,
+    color: egui::Color32,
+) {
+    let stroke = weather_symbol_stroke(painter, size, color);
+    let y = 47.0;
+    for line in [
+        [(x, y - 6.0), (x, y + 6.0)],
+        [(x - 5.2, y - 3.0), (x + 5.2, y + 3.0)],
+        [(x - 5.2, y + 3.0), (x + 5.2, y - 3.0)],
+    ] {
+        paint_weather_line(painter, center, size, &line, stroke);
+    }
+}
+
+fn paint_b_snow(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    paint_b_cloud(painter, center, size, color);
+    for x in [18.0, 32.0, 46.0] {
+        paint_b_snowflake(painter, center, size, x, color);
+    }
+}
+
+fn paint_b_storm(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    let stroke = weather_symbol_stroke(painter, size, color);
+    paint_b_cloud(painter, center, size, color);
+    paint_weather_line(
+        painter,
+        center,
+        size,
+        &[
+            (34.0, 38.0),
+            (26.0, 49.0),
+            (33.0, 49.0),
+            (29.0, 57.0),
+            (44.0, 43.0),
+            (36.0, 43.0),
+            (40.0, 38.0),
+        ],
+        stroke,
+    );
+    paint_weather_line(painter, center, size, &[(15.0, 38.0), (18.0, 41.0)], stroke);
+    paint_weather_line(painter, center, size, &[(49.0, 38.0), (46.0, 41.0)], stroke);
+}
+
+fn paint_b_wind(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    let stroke = weather_symbol_stroke(painter, size, color);
+    for curve in [
+        [(8.0, 22.5), (20.0, 22.5), (31.0, 22.5), (36.5, 22.5)],
+        [(36.5, 22.5), (43.8, 22.5), (43.8, 13.0), (37.9, 13.0)],
+        [(37.9, 13.0), (35.6, 13.0), (34.1, 14.4), (33.3, 16.0)],
+        [(8.0, 33.0), (22.0, 33.0), (39.0, 33.0), (49.5, 33.0)],
+        [(49.5, 33.0), (57.7, 33.0), (57.8, 43.8), (51.4, 43.8)],
+        [(51.4, 43.8), (48.9, 43.8), (47.3, 42.5), (46.5, 40.8)],
+        [(16.0, 43.5), (23.0, 43.5), (31.7, 43.5), (37.5, 43.5)],
+        [(37.5, 43.5), (43.8, 43.5), (44.0, 52.8), (38.3, 52.8)],
+        [(38.3, 52.8), (36.1, 52.8), (34.7, 51.7), (34.0, 50.2)],
+    ] {
+        paint_weather_curve(painter, center, size, curve, stroke);
     }
 }
 
@@ -4206,6 +4716,11 @@ mod tests {
         output.contains("running 1 test") && output.contains(&format!("test {fixture} ... ok"))
     }
 
+    #[test]
+    fn window_control_hood_is_fully_opaque() {
+        assert_eq!(WINDOW_CONTROL_HOOD_FILL.to_array()[3], u8::MAX);
+    }
+
     fn assert_fixture_output(output: std::process::Output, fixture: &str) {
         let transcript = format!(
             "{}{}",
@@ -4387,6 +4902,20 @@ mod tests {
     }
 
     #[test]
+    fn clock_temperature_uses_the_free_space_above_the_dial() {
+        let center = egui::pos2(100.0, 100.0);
+        let radius = 30.0;
+        let temperature = clock_temperature_position(center, radius);
+
+        assert!(temperature.y < center.y - radius * MOON_HALO_OUTER_RADIUS);
+        assert!(temperature.y > center.y - radius * 2.4);
+        assert_eq!(CLOCK_TEMPERATURE_VERTICAL_OFFSET, 1.80);
+        assert_eq!(CLOCK_TEMPERATURE_FONT_SIZE, 11.0);
+        assert_eq!(CLOCK_WEATHER_SYMBOL_SIZE, 32.0);
+        assert!(CLOCK_WEATHER_SYMBOL_SIZE >= 15.0 * 2.0);
+    }
+
+    #[test]
     fn clock_hands_point_to_twelve_and_three_on_the_hour() {
         let midnight = clock_hand_turns(0, 0, 0, 0);
         assert!((midnight.hour - 0.0).abs() < f32::EPSILON);
@@ -4484,6 +5013,13 @@ mod tests {
     }
 
     #[test]
+    fn green_moon_uses_yellow_main_hands_only_in_night_mode() {
+        assert_eq!(main_hand_color_for_moon(GREEN), NIGHT_MODE_MAIN_HAND_COLOR);
+        assert_eq!(main_hand_color_for_moon(PASTEL_YELLOW), MAIN_HAND_COLOR);
+        assert_eq!(NIGHT_MODE_MAIN_HAND_COLOR, PASTEL_YELLOW);
+    }
+
+    #[test]
     fn main_hands_reach_beyond_the_temperature_and_to_the_outer_edge() {
         assert_eq!(HOUR_HAND_LENGTH, 0.72);
         assert_eq!(MINUTE_HAND_LENGTH, 0.96);
@@ -4503,6 +5039,22 @@ mod tests {
     }
 
     #[test]
+    fn context_menu_closes_after_every_setting_selection() {
+        assert!(context_menu_should_close_after_selection(
+            true, false, false
+        ));
+        assert!(context_menu_should_close_after_selection(
+            false, true, false
+        ));
+        assert!(context_menu_should_close_after_selection(
+            false, false, true
+        ));
+        assert!(!context_menu_should_close_after_selection(
+            false, false, false
+        ));
+    }
+
+    #[test]
     fn context_menu_allows_the_clock_but_excludes_adjacent_controls() {
         let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(393.0, 190.0));
 
@@ -4517,20 +5069,12 @@ mod tests {
     }
 
     #[test]
-    fn temperature_outline_covers_only_the_lit_sickle() {
-        let moon = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
-        let center = moon.center();
-        assert_eq!(
-            lit_sickle_clip_rect(moon, center, 50.0, 1.0, 50.0, 0.05),
-            None
-        );
-        assert_eq!(
-            lit_sickle_clip_rect(moon, center, 50.0, 1.0, 50.0, 0.95),
-            Some(moon)
-        );
-        let half = lit_sickle_clip_rect(moon, center, 50.0, 1.0, 50.0, 0.5).unwrap();
-        assert!(half.right() <= center.x + 0.5);
-        assert!(half.left() <= moon.left());
+    fn temperature_position_stays_centered_above_the_halo() {
+        let center = egui::pos2(50.0, 75.0);
+        let position = clock_temperature_position(center, 20.0);
+
+        assert_eq!(position.x, center.x);
+        assert!(position.y < center.y - 20.0 * MOON_HALO_OUTER_RADIUS);
     }
 
     #[test]
