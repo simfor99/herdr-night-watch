@@ -3,7 +3,7 @@
 # Systembild
 
 > **Zweck:** Eine spätere Änderung soll an der richtigen Sicherheitsgrenze ansetzen.
-> **Quellstand:** 2026-08-04
+> **Quellstand:** 2026-09-01
 
 ---
 

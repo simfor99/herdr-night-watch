@@ -738,37 +738,38 @@ def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: i
     reset_stale_run_after_restart(current_boot_id=boot_id)
     root, state_path, warning_path, _ = paths()
     root.mkdir(parents=True, exist_ok=True)
-    existing = load_json(state_path)
-    if existing and not existing.get("outcome"):
-        raise RuntimeError("A night watch is already armed. Use the Windows cancel shortcut first.")
-    if warning_path.exists():
-        warning = load_json(warning_path) or {}
-        cancelable_until = parse_time(warning.get("cancelable_until"))
-        if cancelable_until and utc_now() < cancelable_until:
-            raise RuntimeError("A Herdr shutdown warning is already active. Cancel it before arming a new run.")
-        warning_path.unlink()
+    with completion_lock():
+        existing = load_json(state_path)
+        if existing and not existing.get("outcome"):
+            raise RuntimeError("A night watch is already armed. Use the Windows cancel shortcut first.")
+        if warning_path.exists():
+            warning = load_json(warning_path) or {}
+            cancelable_until = parse_time(warning.get("cancelable_until"))
+            if cancelable_until and utc_now() < cancelable_until:
+                raise RuntimeError("A Herdr shutdown warning is already active. Cancel it before arming a new run.")
+            warning_path.unlink()
 
-    verify_herdr()
-    working = [agent for agent in list_agents() if agent.get("agent_status") == "working"]
+        verify_herdr()
+        working = [agent for agent in list_agents() if agent.get("agent_status") == "working"]
 
-    state = {
-        "schema_version": STATE_SCHEMA_VERSION,
-        "demo": False,
-        "run_id": str(uuid.uuid4()),
-        "boot_id": boot_id,
-        "armed_at": iso_now(),
-        "dry_run": dry_run,
-        "poll_seconds": poll_seconds,
-        "quiet_seconds": quiet_seconds,
-        "warning_seconds": warning_seconds,
-        "all_terminal_since": None,
-        "monitoring_scope": LIVE_MONITORING_SCOPE,
-        "armed_working_count": len(working),
-        "completion_action": preferred_completion_action(),
-        "network_unavailable_since": None,
-        "targets": [],
-    }
-    write_json(state_path, state)
+        state = {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "demo": False,
+            "run_id": str(uuid.uuid4()),
+            "boot_id": boot_id,
+            "armed_at": iso_now(),
+            "dry_run": dry_run,
+            "poll_seconds": poll_seconds,
+            "quiet_seconds": quiet_seconds,
+            "warning_seconds": warning_seconds,
+            "all_terminal_since": None,
+            "monitoring_scope": LIVE_MONITORING_SCOPE,
+            "armed_working_count": len(working),
+            "completion_action": preferred_completion_action(),
+            "network_unavailable_since": None,
+            "targets": [],
+        }
+        write_json(state_path, state)
     log(
         f"ARMED run={state['run_id']} scope={LIVE_MONITORING_SCOPE} "
         f"working_at_arm={len(working)} completion_action={state['completion_action']} "
@@ -783,27 +784,28 @@ def demo() -> int:
     reset_stale_run_after_restart(current_boot_id=boot_id)
     root, state_path, warning_path, _ = paths()
     root.mkdir(parents=True, exist_ok=True)
-    existing = load_json(state_path)
-    if existing and not existing.get("outcome"):
-        raise RuntimeError("A night watch is already armed. Stop it before starting the demo.")
-    if warning_path.exists():
-        warning_path.unlink()
-    state = {
-        "schema_version": STATE_SCHEMA_VERSION,
-        "demo": True,
-        "run_id": str(uuid.uuid4()),
-        "boot_id": boot_id,
-        "armed_at": iso_now(),
-        "dry_run": True,
-        "poll_seconds": 1,
-        "quiet_seconds": 8,
-        "warning_seconds": 15,
-        "all_terminal_since": None,
-        "monitoring_scope": "demo",
-        "completion_action": "shutdown",
-        "targets": [],
-    }
-    write_json(state_path, state)
+    with completion_lock():
+        existing = load_json(state_path)
+        if existing and not existing.get("outcome"):
+            raise RuntimeError("A night watch is already armed. Stop it before starting the demo.")
+        if warning_path.exists():
+            warning_path.unlink()
+        state = {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "demo": True,
+            "run_id": str(uuid.uuid4()),
+            "boot_id": boot_id,
+            "armed_at": iso_now(),
+            "dry_run": True,
+            "poll_seconds": 1,
+            "quiet_seconds": 8,
+            "warning_seconds": 15,
+            "all_terminal_since": None,
+            "monitoring_scope": "demo",
+            "completion_action": "shutdown",
+            "targets": [],
+        }
+        write_json(state_path, state)
     log(f"DEMO ARMED run={state['run_id']} - no Windows shutdown will occur")
     return 0
 
@@ -941,7 +943,7 @@ def request_windows_shutdown_now() -> None:
     log("Windows shutdown requested immediately after user confirmation")
 
 
-def abort_shutdown_if_ours() -> bool | None:
+def abort_shutdown_if_ours(expected_run_id: str | None = None) -> bool | None:
     """Remove our watcher-owned warning without touching other shutdowns."""
     _, _, warning_path, _ = paths()
     try:
@@ -950,6 +952,9 @@ def abort_shutdown_if_ours() -> bool | None:
         log(f"Watcher shutdown warning could not be read: {error}")
         return False
     if not warning:
+        return None
+    if expected_run_id and warning.get("run_id") != expected_run_id:
+        log("Watcher shutdown warning belongs to a different run; leaving it untouched")
         return None
     try:
         warning_path.unlink(missing_ok=True)
@@ -971,7 +976,7 @@ def abort_shutdown_or_fail(
     require_warning: bool = False,
 ) -> bool:
     """Abort the active warning or finish the run if cancellation is unsafe."""
-    result = abort_shutdown_if_ours()
+    result = abort_shutdown_if_ours(state.get("run_id"))
     if result is True or (result is None and not require_warning):
         return True
     finish(state, "shutdown_abort_failed", detail)
@@ -1002,7 +1007,7 @@ def confirm_completion() -> int:
             return 0
         action = completion_action(warning.get("completion_action"))
         outcome = "sleep_confirmed" if action == "sleep" else "shutdown_confirmed"
-        if abort_shutdown_if_ours() is not True:
+        if abort_shutdown_if_ours(state.get("run_id")) is not True:
             finish(
                 state,
                 "shutdown_abort_failed",
@@ -1158,7 +1163,10 @@ def watch() -> int:
             while utc_now() < deadline:
                 time.sleep(min(5, max(1, state["poll_seconds"])))
                 if not active_run(state["run_id"]):
-                    abort_shutdown_if_ours()
+                    with completion_lock():
+                        if active_run(state["run_id"]):
+                            continue
+                        abort_shutdown_if_ours(state.get("run_id"))
                     log("Completion warning cancelled outside the watcher")
                     return 0
                 if warning_reason == "network_unavailable":
@@ -1213,9 +1221,10 @@ def watch() -> int:
             if warning_interrupted:
                 continue
             with completion_lock():
-                state = active_run(state["run_id"])
+                run_id = state["run_id"]
+                state = active_run(run_id)
                 if not state:
-                    abort_shutdown_if_ours()
+                    abort_shutdown_if_ours(run_id)
                     log("Completion action cancelled before execution")
                     return 0
                 warning = load_json(paths()[2])
@@ -1274,13 +1283,12 @@ def watch() -> int:
                     if warning_reason == "network_unavailable"
                     else "no Herdr agents remained working through the warning"
                 )
-                if not state.get("demo") and not state.get("dry_run"):
-                    if not abort_shutdown_or_fail(
-                        state,
-                        "The active completion warning could not be removed before the Windows energy action",
-                        require_warning=True,
-                    ):
-                        return 1
+                if not abort_shutdown_or_fail(
+                    state,
+                    "The active completion warning could not be removed before completion",
+                    require_warning=True,
+                ):
+                    return 1
                 if action == "sleep" and not state.get("demo") and not state.get("dry_run"):
                     try:
                         # Sleep can suspend the process before any following
@@ -1324,7 +1332,7 @@ def cancel(source: str) -> int:
         if state and not state.get("outcome"):
             run_id = str(state.get("run_id"))
             finish(state, "cancelled", f"cancelled by {source}")
-            abort_shutdown_if_ours()
+            abort_shutdown_if_ours(run_id)
             try:
                 record_cancellation(source, run_id)
             except (OSError, UnicodeError, csv.Error) as error:

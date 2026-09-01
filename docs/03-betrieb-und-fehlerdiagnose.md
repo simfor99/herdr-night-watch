@@ -3,7 +3,7 @@
 # Betrieb und Fehlerdiagnose
 
 > **Zweck:** Probleme nachvollziehen, ohne den Sicherheitsvertrag durch Schnellreparaturen zu schwächen.
-> **Quellstand:** 2026-08-04
+> **Quellstand:** 2026-09-01
 
 ---
 

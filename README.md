@@ -128,7 +128,7 @@ The tooltip and live status window show the current Herdr count for information 
 
 An armed night run never survives a Windows or WSL restart. The watcher compares a composite WSL and Windows boot marker, uses a 30-second cache for ordinary status display, and forces a fresh comparison at safety-critical transitions. A changed marker clears any stale warning, records the reset, and returns to the safe inactive state. A new night run must always be started deliberately.
 
-In a real night run, five seconds of confirmed inactivity starts the 300-second warning period. The Windows dialog offers `Cancel`; choosing it stops the watcher and cancels that specific pending shutdown.
+In a real night run, five seconds of confirmed inactivity starts the configured watcher-internal warning period, which defaults to 300 seconds and can be saved between 10 and 3,600 seconds. The tray and live window show that warning and can cancel it without touching unrelated Windows power actions.
 
 ## Maintenance documentation
 

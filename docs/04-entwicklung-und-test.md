@@ -3,7 +3,7 @@
 # Entwicklung und Test
 
 > **Zweck:** Änderungen am Komfort dürfen die Fail-closed-Grenze nicht unbemerkt schwächen.
-> **Quellstand:** 2026-08-04
+> **Quellstand:** 2026-09-01
 
 ---
 

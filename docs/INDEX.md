@@ -1,9 +1,9 @@
 # Herdr-Nachtwächter - Wartungsdokumentation
 
 > **Produkt:** Herdr-Nachtwächter
-> **Status:** In Betrieb, Quellstand vom 2026-08-04
+> **Status:** In Betrieb, Quellstand vom 2026-09-01
 > **Erstellt:** 2026-08-04
-> **Letztes Update:** 2026-08-04
+> **Letztes Update:** 2026-09-01
 
 ---
 

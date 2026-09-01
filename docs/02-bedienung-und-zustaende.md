@@ -3,7 +3,7 @@
 # Bedienung und Zustände
 
 > **Zweck:** Die sichtbare Bedienung soll immer dieselbe Bedeutung wie der Sicherheitszustand haben.
-> **Quellstand:** 2026-08-04
+> **Quellstand:** 2026-09-01
 
 ---
 
@@ -19,7 +19,7 @@ Das Menü sperrt Start, Beobachtung, Demo und Stopp passend zum aktiven Zustand.
 |---|---|---|
 | `Nachtmodus starten` | Schaltet die Prüfung aller aktuell von Herdr gemeldeten Agenten ein und erlaubt späteren echten Abschluss. | Ein bewusster Start ist auch ohne gerade arbeitenden Agenten erlaubt; dann beginnt die Ruhezeit unmittelbar. |
 | `Nur beobachten` | Gleiche Erfassung, aber mit `dry_run=true`. | Es wird nie eine Windows-Energieaktion ausgeführt, auch nicht nach einem Klick auf OK. |
-| `Stopp und Shutdown abbrechen` | Löscht den aktiven Lauf und die eigene Warnung. | Es betrifft keine fremde Windows-Energieaktion. |
+| `Stopp und Shutdown abbrechen` | Markiert den aktiven Lauf als `cancelled` und entfernt die eigene `shutdown-warning.json`. | Der Laufstatus bleibt zur Diagnose erhalten; fremde Windows-Energieaktionen bleiben unberührt. |
 | `Demo: Abschluss simulieren` | Simuliert Ruhezeit und Warnung in wenigen Sekunden. | `demo=true` und `dry_run=true`; kein Herdr-Check und kein echter Shutdown. |
 | `Live-Status öffnen` | Öffnet ein kleines bewegliches Statusfenster mit einem klickbaren Mond, Abschluss-Schalter, Sekundenfeld und Temperaturanzeige. | Linksklick auf das Tray-Symbol öffnet dasselbe Fenster, Rechtsklick zeigt dieses Menü. Klick auf den grauen Mond startet, Klick auf einen farbigen Mond stoppt über denselben sicheren Pfad wie das Tray-Menü. Der Schalter wählt links mit Stecker Energiesparmodus und rechts mit Power-Symbol Herunterfahren. Das Feld legt die Warnfrist von 10 bis 3.600 Sekunden für den nächsten Nachtlauf fest. Nach einem Klick erscheint drei Sekunden ein Toast; das X schließt nur das Fenster. |
 | `Live-Fenster beim Start öffnen` | Speichert, ob die Tray-App nach einem Windows-Login zusätzlich das Live-Fenster öffnen soll. Ein Doppelklick auf die EXE öffnet das Fenster immer, auch wenn diese Option aus ist. | Der Standard ist an. Die Einstellung startet keinen Nachtlauf und verändert keine Wächterentscheidung. |
@@ -56,7 +56,7 @@ Letzter Lauf
 | Grün | Nachtmodus, Arbeit läuft | Mindestens ein aktuell gemeldeter Herdr-Agent ist aktiv |
 | Blau | Nur beobachten | Gleicher Prüfablauf, aber ohne Shutdown |
 | Gelb | Ruhezeit | Herdr meldet aktuell keine arbeitenden Agenten, Zeit wird bestätigt |
-| Rot | Warnfrist | Shutdown ist vorbereitet und noch abbrechbar |
+| Rot | Warnfrist | Die eigene Energieaktions-Warnung läuft und ist noch abbrechbar |
 
 ## Warnfenster und Abbrechen
 
@@ -64,7 +64,7 @@ Im echten Nachtmodus beginnt nach fünf Sekunden erfolgreicher Ruhezeit die im S
 
 Während der gesamten Warnfrist prüft der Wächter Herdr weiter. Meldet ein Agent wieder `working`, bricht er die eigene Warnung ab, setzt die Ruhezeit auf null und beginnt nach bestätigter neuer Ruhezeit eine vollständig neue Warnfrist. Direkt vor der Energieaktion erfolgt zusätzlich eine letzte Herdr-Prüfung. Dadurch wird auch die kleine Grenzsekunde am Ende des Countdowns fail-safe behandelt.
 
-Die Schaltfläche **OK** ist eine bewusste Sofortbestätigung: Der Tray ruft dafür den separaten Bestätigungspfad mit `--confirm` auf, der die beim Start gewählte Aktion direkt ausführt. Bei Energiesparmodus fordert der Wächter Windows unmittelbar zum Schlafen auf; beim Herunterfahren fordert er den sofortigen Shutdown an. Die Schaltfläche **Abbrechen** ruft `backend::stop()` auf, der wiederum `Stop-HerdrNightWatch.ps1` ausführt. Dieser Pfad löscht den aktiven Lauf und die eigene Warnungsdatei, ohne fremde Windows-Shutdowns mit `shutdown.exe /a` zu berühren. Ohne Klick läuft die Warnfrist weiter und der Wächter führt danach die letzte Sicherheitsprüfung aus.
+Die Schaltfläche **OK** ist eine bewusste Sofortbestätigung: Der Tray ruft dafür den separaten Bestätigungspfad mit `--confirm` auf, der die beim Start gewählte Aktion direkt ausführt. Bei Energiesparmodus fordert der Wächter Windows unmittelbar zum Schlafen auf; beim Herunterfahren fordert er den sofortigen Shutdown an. Die Schaltfläche **Abbrechen** ruft `backend::stop()` auf, der wiederum `Stop-HerdrNightWatch.ps1` ausführt. Dieser Pfad markiert den aktiven Lauf als `cancelled` und entfernt die eigene Warnungsdatei, ohne fremde Windows-Shutdowns mit `shutdown.exe /a` zu berühren. Ohne Klick läuft die Warnfrist weiter und der Wächter führt danach die letzte Sicherheitsprüfung aus.
 
 ## Demo ist eine Sicherheitsprobe, keine verkürzte Nacht
 
@@ -74,7 +74,7 @@ Damit lässt sich das sichtbare Ende des Ablaufs testen, ohne Herdr-Arbeit zu ve
 
 ## Bekannte Bedienungsgrenzen
 
-Der Nachtlauf beobachtet fortlaufend den aktuellen Herdr-Status. Beginnt nach dem Scharfstellen neue Arbeit in einem anderen Pane, gehört sie automatisch dazu und setzt eine laufende Ruhezeit zurück. Beginnt sie während der Warnfrist, bricht der Wächter seinen eigenen Windows-Countdown ab und beobachtet weiter. Nicht von Herdr verwaltete Shell-Prozesse sind absichtlich außerhalb der Entscheidung.
+Der Nachtlauf beobachtet fortlaufend den aktuellen Herdr-Status. Beginnt nach dem Scharfstellen neue Arbeit in einem anderen Pane, gehört sie automatisch dazu und setzt eine laufende Ruhezeit zurück. Beginnt sie während der Warnfrist, bricht der Wächter seine eigene Warnfrist ab und beobachtet weiter. Nicht von Herdr verwaltete Shell-Prozesse sind absichtlich außerhalb der Entscheidung.
 
 Fällt die Internetverbindung aus, zählt das nicht sofort als „fertig“. Erst nach fünf Minuten ohne erfolgreiche Antwort von zwei unabhängigen Verbindungschecks beginnt die normale Warnfrist. Das Warnfenster erklärt den Grund. Kommt Internet während des Countdowns zurück, wird der Countdown abgebrochen. Im Installationsordner stehen `logs\completion-history.csv` für angeforderte Energiespar- oder Shutdown-Vorgänge und `logs\tray-history.csv` für erkannte unplanmäßige Tray-Enden. Der Log-Viewer zeigt diese Quellen getrennt in den Bereichen „Energieaktionen“ und „Tray und Diagnose“, jeweils mit bis zu 30 Einträgen. Die Tabelle trennt Datum, Uhrzeit, Aktion, Ergebnis und Erklärung. Ein grüner Haken bedeutet, dass der Wächter die Windows-Anforderung erfolgreich angenommen hat; ein tatsächlicher Neustart oder das physische Ausschalten wird nicht nachträglich vom Rechner bestätigt. Wenn der Abschlussdatensatz nicht dauerhaft geschrieben werden kann, bricht der Wächter die Energieaktion ab, statt unprotokolliert fortzufahren. Das Abschlussprotokoll lässt sich über die Ecke unten rechts frei vergrößern oder verkleinern. Die Oberfläche und die Meldungen wechseln mit der globalen Spracheinstellung zwischen Deutsch und Englisch.
 

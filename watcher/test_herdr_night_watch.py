@@ -7,7 +7,7 @@ import importlib.util
 import csv
 import json
 import tempfile
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -156,6 +156,44 @@ class ArmingTests(unittest.TestCase):
             ):
                 WATCHER.arm(False, 1, 5, 300)
             self.assertEqual(WATCHER.load_json(state_path)["armed_working_count"], 0)
+
+    def test_arm_serializes_state_and_warning_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            lock_held = False
+
+            @contextmanager
+            def tracked_completion_lock():
+                nonlocal lock_held
+                self.assertFalse(lock_held)
+                lock_held = True
+                try:
+                    yield
+                finally:
+                    lock_held = False
+
+            def verify_while_locked() -> None:
+                self.assertTrue(lock_held)
+
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "settings_path", return_value=root / "settings.json"),
+                patch.object(WATCHER, "wait_for_runtime_boot_id", return_value="boot-current"),
+                patch.object(WATCHER, "reset_stale_run_after_restart"),
+                patch.object(WATCHER, "completion_lock", side_effect=tracked_completion_lock),
+                patch.object(WATCHER, "verify_herdr", side_effect=verify_while_locked),
+                patch.object(WATCHER, "list_agents", return_value=[]),
+                patch.object(WATCHER, "log"),
+            ):
+                WATCHER.arm(False, 1, 5, 300)
+
+            self.assertFalse(lock_held)
+            self.assertEqual(WATCHER.load_json(state_path)["boot_id"], "boot-current")
 
 
 class ConfirmationTests(unittest.TestCase):
@@ -691,6 +729,29 @@ class ShutdownSchedulingTests(unittest.TestCase):
             self.assertTrue(warning_path.exists())
             log.assert_called_once()
 
+    def test_stale_run_does_not_remove_newer_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            warning_path = root / "shutdown-warning.json"
+            WATCHER.write_json(
+                warning_path,
+                {
+                    "run_id": "new-run",
+                    "completion_action": "shutdown",
+                },
+            )
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, root / "active-run.json", warning_path, root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "log"),
+            ):
+                self.assertIsNone(WATCHER.abort_shutdown_if_ours("old-run"))
+
+            self.assertTrue(warning_path.exists())
+
     def test_abort_owned_warning_reports_unlink_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -804,6 +865,81 @@ class WatchWarningRecoveryTests(unittest.TestCase):
             self.assertEqual(operations, ["record", "shutdown"])
             self.assertEqual(WATCHER.load_json(state_path)["outcome"], "shutdown_scheduled")
             self.assertFalse(warning_path.exists())
+
+    def test_dry_run_completion_removes_owned_warning_without_windows_action(self) -> None:
+        state = self.state()
+        state["dry_run"] = True
+        state["warning_seconds"] = 0
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            WATCHER.write_json(state_path, state)
+            base = datetime(2026, 8, 31, 22, 26, tzinfo=timezone.utc)
+
+            def schedule_warning(current: dict[str, object], reason: str) -> None:
+                WATCHER.write_json(
+                    warning_path,
+                    {
+                        "run_id": current["run_id"],
+                        "completion_action": "shutdown",
+                        "reason": reason,
+                        "cancelable_until": base.isoformat(),
+                    },
+                )
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(
+                        WATCHER,
+                        "evaluate",
+                        side_effect=[("terminal", []), ("terminal", []), ("terminal", [])],
+                    )
+                )
+                stack.enter_context(patch.object(WATCHER, "utc_now", return_value=base))
+                record = stack.enter_context(patch.object(WATCHER, "record_completion"))
+                shutdown = stack.enter_context(patch.object(WATCHER, "request_windows_shutdown_now"))
+                for context in self.patches(root, state_path):
+                    stack.enter_context(context)
+                stack.enter_context(
+                    patch.object(WATCHER, "schedule_shutdown", side_effect=schedule_warning)
+                )
+                stack.enter_context(patch.object(WATCHER, "active_run", return_value=state))
+                self.assertEqual(WATCHER.watch(), 0)
+
+            record.assert_not_called()
+            shutdown.assert_not_called()
+            self.assertFalse(warning_path.exists())
+
+    def test_cancelled_before_execution_uses_the_known_run_id(self) -> None:
+        state = self.state()
+        state["warning_seconds"] = 0
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            WATCHER.write_json(state_path, state)
+            base = datetime(2026, 8, 31, 22, 26, tzinfo=timezone.utc)
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(
+                        WATCHER,
+                        "evaluate",
+                        side_effect=[("terminal", []), ("terminal", [])],
+                    )
+                )
+                stack.enter_context(patch.object(WATCHER, "utc_now", return_value=base))
+                for context in self.patches(root, state_path):
+                    stack.enter_context(context)
+                stack.enter_context(
+                    patch.object(WATCHER, "active_run", side_effect=[state, None])
+                )
+                abort = stack.enter_context(
+                    patch.object(WATCHER, "abort_shutdown_if_ours", return_value=True)
+                )
+                self.assertEqual(WATCHER.watch(), 0)
+
+            abort.assert_called_once_with("watch-run")
 
     def test_warning_abort_failure_fails_closed_without_completion_action(self) -> None:
         state = self.state()
