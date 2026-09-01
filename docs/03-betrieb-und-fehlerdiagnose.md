@@ -3,13 +3,13 @@
 # Betrieb und Fehlerdiagnose
 
 > **Zweck:** Probleme nachvollziehen, ohne den Sicherheitsvertrag durch Schnellreparaturen zu schwächen.
-> **Quellstand:** 2026-08-04
+> **Quellstand:** 2026-09-01
 
 ---
 
 ## Erst prüfen, dann eingreifen
 
-Bei einem auffälligen Nachtlauf ist der Status der beste Einstieg. Ein voreiliges Löschen der Zustandsdateien kann verschleiern, ob ein Shutdown noch abgebrochen werden muss. Der offizielle Stopp-Pfad räumt beides geordnet auf: den Wächter und einen von ihm selbst angelegten ausstehenden Shutdown.
+Bei einem auffälligen Nachtlauf ist der Status der beste Einstieg. Ein voreiliges Löschen der Zustandsdateien kann verschleiern, ob eine eigene Warnphase noch abgebrochen werden muss. Der offizielle Stopp-Pfad räumt beides geordnet auf: den Wächter und seine `shutdown-warning.json`; während der Warnfrist ist noch kein Windows-Shutdown angesetzt.
 
 Die Bedienoberfläche ist absichtlich nicht der einzige Beobachtungspunkt. Der WSL-Status zeigt, dass die aktuelle Herdr-Arbeit überwacht wird. Das Protokoll erklärt danach die konkrete Entscheidung in zeitlicher Reihenfolge.
 
@@ -43,7 +43,7 @@ Wenn ein Lauf nicht weiterlaufen soll, immer den vorgesehenen Stopp verwenden:
 & "<Repository>\windows\Stop-HerdrNightWatch.ps1"
 ```
 
-Das Skript ruft zuerst `herdr-night-watch.py --cancel` auf und stoppt danach den Windows-Task, sofern er noch läuft. `--cancel` versucht `shutdown.exe /a` nur, wenn eine gültige eigene `shutdown-warning.json` existiert. Deshalb darf dieser Befehl nicht durch einen pauschalen `shutdown /a`-Alias ersetzt werden: Der Wächter soll keine fremden Shutdowns beeinflussen.
+Das Skript ruft zuerst `herdr-night-watch.py --cancel` auf und stoppt danach den Windows-Task, sofern er noch läuft. `--cancel` entfernt nur die eigene `shutdown-warning.json`; während der Warnfrist ist noch keine Windows-Energieaktion geplant. Dadurch beeinflusst der Wächter keine fremden Shutdowns.
 
 ## Häufige Bilder und ihre Ursache
 
@@ -75,7 +75,7 @@ Beim raschen Stoppen und erneuten Starten kann die alte WSL-Instanz noch wenige 
 | `STATUS` | Aktueller Herdr-Status aller gemeldeten Agenten |
 | `No Herdr agents are working` | Ruhezeit hat begonnen |
 | `DRY RUN` | Demo oder Beobachtungsmodus - kein echter Shutdown |
-| `Windows shutdown scheduled` | Echter Shutdown wurde mit Warnfrist angesetzt |
+| `Windows shutdown will be requested` | Eigene Warnfrist läuft; Windows wurde noch nicht zum Herunterfahren aufgefordert |
 | `FINISHED outcome=refused` | Fail-closed: keine eindeutige Grundlage für Shutdown |
 | `Shutdown warning cancelled` | Neue Herdr-Arbeit hat den Countdown abgebrochen; der Nachtlauf beobachtet weiter |
 | `Internet connection unavailable` | Fünfminütige Toleranzzeit für einen Verbindungs-Ausfall hat begonnen |

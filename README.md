@@ -78,7 +78,7 @@ The moon also shows the current temperature and the real current lunar phase for
 - **Start night mode**: continuously monitors all agents currently reported by Herdr and only shuts down Windows after the configured quiet period.
 - **Prevent idle sleep while the tray runs**: for its entire lifetime, the tray app tells Windows that the system is still required, even when night mode is off. The display may still turn off. The guard is released only when the tray app exits; deliberate sleep or shutdown actions by the user or watcher are still allowed.
 - **Observe only**: runs the same monitoring flow without performing a shutdown.
-- **Stop and cancel shutdown**: ends the run and cancels only a pending shutdown scheduled by the watcher.
+- **Stop and cancel shutdown**: ends the run and removes only the watcher's own warning; Windows is not asked to shut down until the warning has completed.
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.
 - **Open live status**: opens a freely movable status window that can be closed at any time. Left-clicking the tray icon opens it; right-clicking shows the menu.
 - **Reliable live window**: opening the live status again restores and focuses the existing window instead of creating a duplicate. Its last desktop position is stored locally and reused after the next start.
@@ -128,7 +128,7 @@ The tooltip and live status window show the current Herdr count for information 
 
 An armed night run never survives a Windows or WSL restart. The watcher compares a composite WSL and Windows boot marker, uses a 30-second cache for ordinary status display, and forces a fresh comparison at safety-critical transitions. A changed marker clears any stale warning, records the reset, and returns to the safe inactive state. A new night run must always be started deliberately.
 
-In a real night run, five seconds of confirmed inactivity starts the 300-second warning period. The Windows dialog offers `Cancel`; choosing it stops the watcher and cancels that specific pending shutdown.
+In a real night run, five seconds of confirmed inactivity starts the configured watcher-internal warning period, which defaults to 300 seconds and can be saved between 10 and 3,600 seconds. The tray and live window show that warning and can cancel it without touching unrelated Windows power actions.
 
 ## Maintenance documentation
 

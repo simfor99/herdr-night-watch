@@ -39,6 +39,13 @@ NETWORK_CHECK_INTERVAL_SECONDS = 15
 BOOT_MARKER_CACHE_TTL_SECONDS = 30
 BOOT_MARKER_RETRY_INTERVAL_SECONDS = 5
 BOOT_MARKER_RETRY_ATTEMPTS = 12
+BOOT_MARKER_WAIT_DEADLINE_SECONDS = 60
+CONFIRM_BOOT_MARKER_DEADLINE_SECONDS = min(DEFAULT_WARNING_SECONDS, 30)
+STATUS_BOOT_MARKER_DEADLINE_SECONDS = 15
+WINDOWS_COMMAND_TIMEOUT_SECONDS = 30
+MIN_ABORT_TIMEOUT_SECONDS = 5
+WINDOWS_PATH_SEPARATORS = ("\\", "/")
+CANCEL_BOOT_MARKER_DEADLINE_SECONDS = MIN_ABORT_TIMEOUT_SECONDS
 CONNECTIVITY_URLS = (
     "https://www.msftconnecttest.com/connecttest.txt",
     "https://www.gstatic.com/generate_204",
@@ -46,8 +53,11 @@ CONNECTIVITY_URLS = (
 COMPLETION_HISTORY_LIMIT = 30
 DIAGNOSTIC_HISTORY_LIMIT = 500
 def windows_path_to_wsl(path: str) -> Path | None:
+    """Convert an absolute Windows drive path, rejecting drive-relative input."""
     cleaned = path.strip().strip('"')
     if len(cleaned) < 3 or cleaned[1] != ":" or not cleaned[0].isalpha():
+        return None
+    if cleaned[2] not in WINDOWS_PATH_SEPARATORS:
         return None
     rest = cleaned[3:].replace("\\", "/").lstrip("/")
     return Path(f"/mnt/{cleaned[0].lower()}/{rest}")
@@ -56,7 +66,7 @@ def windows_path_to_wsl(path: str) -> Path | None:
 def default_windows_install_log_dir() -> Path:
     env = os.environ.get("HERDR_NIGHT_WATCH_LOG_DIR")
     if env:
-        return Path(env)
+        return windows_path_to_wsl(env) or Path(env)
     users = Path("/mnt/c/Users")
     preferred = (os.environ.get("USER") or os.environ.get("USERNAME") or "").casefold()
     discovered: list[Path] = []
@@ -69,21 +79,39 @@ def default_windows_install_log_dir() -> Path:
             apps = child / "Apps" / "HerdrNachtwaechter"
             if apps.is_dir():
                 discovered.append(apps / "logs")
-    if discovered:
-        for candidate in discovered:
-            if preferred and candidate.parts and candidate.parts[-4].casefold() == preferred:
-                return candidate
+    discovered.sort()
+    for candidate in discovered:
+        if preferred and candidate.parts and candidate.parts[-4].casefold() == preferred:
+            return candidate
+    if len(discovered) == 1:
         return discovered[0]
+    if discovered:
+        raise RuntimeError(
+            "Several HerdrNachtwaechter installations were found. "
+            "Set HERDR_NIGHT_WATCH_LOG_DIR to the correct logs directory."
+        )
     return Path("/mnt/c/Users/Public/HerdrNachtwaechter/logs")
 
 
-WINDOWS_INSTALL_LOG_DIR = default_windows_install_log_dir()
+WINDOWS_INSTALL_LOG_DIR: Path | None = None
+
+
+def windows_install_log_dir() -> Path:
+    """Resolve the Windows log directory only when a history operation needs it."""
+    global WINDOWS_INSTALL_LOG_DIR
+    if WINDOWS_INSTALL_LOG_DIR is None:
+        WINDOWS_INSTALL_LOG_DIR = default_windows_install_log_dir()
+    return WINDOWS_INSTALL_LOG_DIR
 LIVE_MONITORING_SCOPE = "live_agents"
 DEFAULT_COMPLETION_ACTION = "shutdown"
 COMPLETION_ACTIONS = {"sleep", "shutdown"}
 STATE_SCHEMA_VERSION = 4
 _RUNTIME_BOOT_ID: str | None = None
 _RUNTIME_BOOT_ID_READ_AT: float | None = None
+
+
+class ShutdownAbortError(RuntimeError):
+    """The Windows shutdown was accepted but could not be cancelled safely."""
 
 
 def utc_now() -> datetime:
@@ -106,13 +134,15 @@ def windows_boot_time_from_marker(boot_id: str | None) -> datetime | None:
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     # .NET's round-trip format may contain seven fractional digits while
-    # Python's datetime accepts at most six.
-    if "." in value and "+" in value:
-        prefix, suffix = value.split("+", 1)
-        fraction = prefix.rsplit(".", 1)[1]
+    # Python's datetime accepts at most six. Keep any timezone suffix intact.
+    prefix, separator, fractional_and_zone = value.partition(".")
+    if separator:
+        digit_count = 0
+        while digit_count < len(fractional_and_zone) and fractional_and_zone[digit_count].isdigit():
+            digit_count += 1
+        fraction = fractional_and_zone[:digit_count]
         if len(fraction) > 6:
-            prefix = prefix[: -(len(fraction) - 6)]
-        value = f"{prefix}+{suffix}"
+            value = f"{prefix}.{fraction[:6]}{fractional_and_zone[digit_count:]}"
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
@@ -139,7 +169,7 @@ def wsl_boot_id() -> str | None:
     return value or None
 
 
-def windows_boot_id() -> str | None:
+def windows_boot_id(deadline: float | None = None) -> str | None:
     """Return Windows' last boot time when this watcher runs inside WSL."""
     queries = (
         (
@@ -153,6 +183,12 @@ def windows_boot_id() -> str | None:
         ),
     )
     for index, (method, query) in enumerate(queries):
+        timeout = float(WINDOWS_COMMAND_TIMEOUT_SECONDS)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            timeout = min(timeout, max(0.1, remaining))
         try:
             result = subprocess.run(
                 [
@@ -165,8 +201,11 @@ def windows_boot_id() -> str | None:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=3,
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired:
+            record_diagnostic("WINDOWS_BOOT_MARKER_TIMEOUT", method=method)
+            continue
         except (OSError, subprocess.SubprocessError):
             continue
         value = result.stdout.strip()
@@ -178,7 +217,7 @@ def windows_boot_id() -> str | None:
     return None
 
 
-def runtime_boot_id(force: bool = False) -> str | None:
+def runtime_boot_id(force: bool = False, deadline: float | None = None) -> str | None:
     """Return a cached boot marker, or refresh it for safety-critical paths."""
     global _RUNTIME_BOOT_ID, _RUNTIME_BOOT_ID_READ_AT
     wsl_marker = wsl_boot_id()
@@ -212,7 +251,7 @@ def runtime_boot_id(force: bool = False) -> str | None:
             _RUNTIME_BOOT_ID_READ_AT = now
             return _RUNTIME_BOOT_ID
 
-    windows_marker = windows_boot_id()
+    windows_marker = windows_boot_id(deadline=deadline)
     if not windows_marker:
         return None
     _RUNTIME_BOOT_ID = f"wsl:{wsl_marker}|windows:{windows_marker}"
@@ -234,6 +273,7 @@ def runtime_boot_id(force: bool = False) -> str | None:
 def reset_stale_run_after_restart(
     force: bool = False,
     current_boot_id: str | None = None,
+    boot_marker_deadline: float | None = None,
 ) -> bool:
     """Finish an armed run left behind by a Windows/WSL restart.
 
@@ -243,7 +283,7 @@ def reset_stale_run_after_restart(
     """
     _, state_path, warning_path, _ = paths()
     if current_boot_id is None:
-        current_boot_id = runtime_boot_id(force=force)
+        current_boot_id = runtime_boot_id(force=force, deadline=boot_marker_deadline)
     if not current_boot_id:
         return False
     completed_run_id: str | None = None
@@ -296,38 +336,58 @@ def reset_stale_run_after_restart(
             state["reset_reason"] = reset_reason
             write_json(state_path, state)
             warning_path.unlink(missing_ok=True)
+            try:
+                record_cancellation("system_restart", run_id)
+            except (OSError, UnicodeError, csv.Error) as error:
+                log(f"CANCELLATION HISTORY ERROR {error}")
+            log(
+                f"RESET run={run_id} reason={state['reset_reason']} "
+                "active night watch was cleared after restart"
+            )
     if completed_run_id is not None:
         log(
             f"RESET completed run={completed_run_id} after WSL/Windows restart; "
             "current night watch state cleared"
         )
         return True
-    try:
-        record_cancellation("system_restart", run_id)
-    except (OSError, UnicodeError, csv.Error) as error:
-        log(f"CANCELLATION HISTORY ERROR {error}")
-    log(
-        f"RESET run={run_id} reason={state['reset_reason']} "
-        "active night watch was cleared after restart"
-    )
     return True
 
 
-def wait_for_runtime_boot_id() -> str:
-    """Wait briefly for both WSL and Windows to expose their boot markers."""
+def wait_for_runtime_boot_id(deadline_seconds: float = BOOT_MARKER_WAIT_DEADLINE_SECONDS) -> str:
+    """Wait for both boot markers without exceeding one monotonic deadline."""
+    deadline = time.monotonic() + max(0.0, float(deadline_seconds))
     for attempt in range(BOOT_MARKER_RETRY_ATTEMPTS):
-        boot_id = runtime_boot_id(force=True)
+        if time.monotonic() >= deadline:
+            break
+        boot_id = runtime_boot_id(force=True, deadline=deadline)
         if boot_id:
             return boot_id
-        if attempt + 1 < BOOT_MARKER_RETRY_ATTEMPTS:
+        remaining = deadline - time.monotonic()
+        if attempt + 1 < BOOT_MARKER_RETRY_ATTEMPTS and remaining > 0:
             log(
                 "Complete WSL/Windows boot marker unavailable; "
-                f"waiting {BOOT_MARKER_RETRY_INTERVAL_SECONDS} seconds before retry"
+                f"waiting {min(BOOT_MARKER_RETRY_INTERVAL_SECONDS, remaining):.1f} seconds before retry"
             )
-            time.sleep(BOOT_MARKER_RETRY_INTERVAL_SECONDS)
+            time.sleep(min(BOOT_MARKER_RETRY_INTERVAL_SECONDS, remaining))
     raise RuntimeError(
         "Complete WSL/Windows boot marker unavailable; refusing to continue the night watch"
     )
+
+
+def confirmation_boot_marker_deadline_seconds() -> float:
+    """Keep confirmation boot-marker refresh inside the active warning window."""
+    _, _, warning_path, _ = paths()
+    try:
+        warning = load_json(warning_path)
+        cancelable_until = parse_time(warning.get("cancelable_until")) if warning else None
+    except (OSError, UnicodeError, ValueError):
+        cancelable_until = None
+    except TypeError:
+        cancelable_until = None
+    if cancelable_until is None:
+        return CONFIRM_BOOT_MARKER_DEADLINE_SECONDS
+    remaining = max(0.0, (cancelable_until - utc_now()).total_seconds())
+    return min(CONFIRM_BOOT_MARKER_DEADLINE_SECONDS, remaining)
 
 
 def completion_lock_path() -> Path:
@@ -375,7 +435,10 @@ def preferred_warning_seconds() -> int:
 def set_completion_action(action: str) -> int:
     if action not in COMPLETION_ACTIONS:
         raise RuntimeError("Unsupported completion action.")
-    reset_stale_run_after_restart(force=True)
+    reset_stale_run_after_restart(
+        force=True,
+        boot_marker_deadline=time.monotonic() + STATUS_BOOT_MARKER_DEADLINE_SECONDS,
+    )
     _, state_path, _, _ = paths()
     state = load_json(state_path)
     if state and not state.get("outcome"):
@@ -392,7 +455,10 @@ def set_warning_seconds(seconds: int) -> int:
         raise RuntimeError(
             f"Warning seconds must be between {MIN_WARNING_SECONDS} and {MAX_WARNING_SECONDS}."
         )
-    reset_stale_run_after_restart(force=True)
+    reset_stale_run_after_restart(
+        force=True,
+        boot_marker_deadline=time.monotonic() + STATUS_BOOT_MARKER_DEADLINE_SECONDS,
+    )
     _, state_path, _, _ = paths()
     state = load_json(state_path)
     if state and not state.get("outcome"):
@@ -440,7 +506,6 @@ def record_diagnostic(message: str, **details: object) -> None:
 
 def record_completion(action: str, trigger: str, run_id: str) -> None:
     """Keep the latest 30 actual Windows completion requests beside the installed app."""
-    path = WINDOWS_INSTALL_LOG_DIR / "completion-history.csv"
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     action_label = "Energiesparmodus angefordert" if action == "sleep" else "Herunterfahren angefordert"
     trigger_label = {
@@ -449,6 +514,7 @@ def record_completion(action: str, trigger: str, run_id: str) -> None:
         "confirmed": "Sofortbestätigung",
     }.get(trigger, trigger)
     try:
+        path = windows_install_log_dir() / "completion-history.csv"
         rows: list[dict[str, str]] = []
         if path.exists():
             with path.open("r", encoding="utf-8", newline="") as handle:
@@ -474,15 +540,15 @@ def record_completion(action: str, trigger: str, run_id: str) -> None:
             writer.writerows(rows)
         temporary.replace(path)
         log(f"COMPLETION HISTORY action={action} trigger={trigger} path={path}")
-    except (OSError, UnicodeError, csv.Error) as error:
+    except (OSError, UnicodeError, ValueError, RuntimeError, csv.Error) as error:
         log(f"COMPLETION HISTORY ERROR {error}")
         raise RuntimeError(f"Completion history could not be persisted: {error}") from error
 
 
 def record_cancellation(source: str, run_id: str) -> None:
-    path = WINDOWS_INSTALL_LOG_DIR / "cancellation-history.csv"
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     try:
+        path = windows_install_log_dir() / "cancellation-history.csv"
         rows: list[dict[str, str]] = []
         if path.exists():
             with path.open("r", encoding="utf-8", newline="") as handle:
@@ -507,7 +573,7 @@ def record_cancellation(source: str, run_id: str) -> None:
             writer.writerows(rows)
         temporary.replace(path)
         log(f"CANCELLATION HISTORY source={source} path={path}")
-    except OSError as error:
+    except (OSError, UnicodeError, ValueError, RuntimeError, csv.Error) as error:
         log(f"CANCELLATION HISTORY ERROR {error}")
 
 
@@ -672,37 +738,38 @@ def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: i
     reset_stale_run_after_restart(current_boot_id=boot_id)
     root, state_path, warning_path, _ = paths()
     root.mkdir(parents=True, exist_ok=True)
-    existing = load_json(state_path)
-    if existing and not existing.get("outcome"):
-        raise RuntimeError("A night watch is already armed. Use the Windows cancel shortcut first.")
-    if warning_path.exists():
-        warning = load_json(warning_path) or {}
-        cancelable_until = parse_time(warning.get("cancelable_until"))
-        if cancelable_until and utc_now() < cancelable_until:
-            raise RuntimeError("A Herdr shutdown warning is already active. Cancel it before arming a new run.")
-        warning_path.unlink()
+    with completion_lock():
+        existing = load_json(state_path)
+        if existing and not existing.get("outcome"):
+            raise RuntimeError("A night watch is already armed. Use the Windows cancel shortcut first.")
+        if warning_path.exists():
+            warning = load_json(warning_path) or {}
+            cancelable_until = parse_time(warning.get("cancelable_until"))
+            if cancelable_until and utc_now() < cancelable_until:
+                raise RuntimeError("A Herdr shutdown warning is already active. Cancel it before arming a new run.")
+            warning_path.unlink()
 
-    verify_herdr()
-    working = [agent for agent in list_agents() if agent.get("agent_status") == "working"]
+        verify_herdr()
+        working = [agent for agent in list_agents() if agent.get("agent_status") == "working"]
 
-    state = {
-        "schema_version": STATE_SCHEMA_VERSION,
-        "demo": False,
-        "run_id": str(uuid.uuid4()),
-        "boot_id": boot_id,
-        "armed_at": iso_now(),
-        "dry_run": dry_run,
-        "poll_seconds": poll_seconds,
-        "quiet_seconds": quiet_seconds,
-        "warning_seconds": warning_seconds,
-        "all_terminal_since": None,
-        "monitoring_scope": LIVE_MONITORING_SCOPE,
-        "armed_working_count": len(working),
-        "completion_action": preferred_completion_action(),
-        "network_unavailable_since": None,
-        "targets": [],
-    }
-    write_json(state_path, state)
+        state = {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "demo": False,
+            "run_id": str(uuid.uuid4()),
+            "boot_id": boot_id,
+            "armed_at": iso_now(),
+            "dry_run": dry_run,
+            "poll_seconds": poll_seconds,
+            "quiet_seconds": quiet_seconds,
+            "warning_seconds": warning_seconds,
+            "all_terminal_since": None,
+            "monitoring_scope": LIVE_MONITORING_SCOPE,
+            "armed_working_count": len(working),
+            "completion_action": preferred_completion_action(),
+            "network_unavailable_since": None,
+            "targets": [],
+        }
+        write_json(state_path, state)
     log(
         f"ARMED run={state['run_id']} scope={LIVE_MONITORING_SCOPE} "
         f"working_at_arm={len(working)} completion_action={state['completion_action']} "
@@ -717,27 +784,28 @@ def demo() -> int:
     reset_stale_run_after_restart(current_boot_id=boot_id)
     root, state_path, warning_path, _ = paths()
     root.mkdir(parents=True, exist_ok=True)
-    existing = load_json(state_path)
-    if existing and not existing.get("outcome"):
-        raise RuntimeError("A night watch is already armed. Stop it before starting the demo.")
-    if warning_path.exists():
-        warning_path.unlink()
-    state = {
-        "schema_version": 1,
-        "demo": True,
-        "run_id": str(uuid.uuid4()),
-        "boot_id": boot_id,
-        "armed_at": iso_now(),
-        "dry_run": True,
-        "poll_seconds": 1,
-        "quiet_seconds": 8,
-        "warning_seconds": 15,
-        "all_terminal_since": None,
-        "monitoring_scope": "demo",
-        "completion_action": "shutdown",
-        "targets": [],
-    }
-    write_json(state_path, state)
+    with completion_lock():
+        existing = load_json(state_path)
+        if existing and not existing.get("outcome"):
+            raise RuntimeError("A night watch is already armed. Stop it before starting the demo.")
+        if warning_path.exists():
+            warning_path.unlink()
+        state = {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "demo": True,
+            "run_id": str(uuid.uuid4()),
+            "boot_id": boot_id,
+            "armed_at": iso_now(),
+            "dry_run": True,
+            "poll_seconds": 1,
+            "quiet_seconds": 8,
+            "warning_seconds": 15,
+            "all_terminal_since": None,
+            "monitoring_scope": "demo",
+            "completion_action": "shutdown",
+            "targets": [],
+        }
+        write_json(state_path, state)
     log(f"DEMO ARMED run={state['run_id']} - no Windows shutdown will occur")
     return 0
 
@@ -822,35 +890,14 @@ def schedule_shutdown(state: dict[str, Any], reason: str = "agents_finished") ->
         log(f"Windows sleep will be requested in {warning_seconds} seconds reason={reason}")
         return
     if not shutil.which("powershell.exe"):
-        raise RuntimeError("powershell.exe is unavailable; refusing shutdown.")
-    command = (
-        "$ErrorActionPreference = 'Stop'; "
-        f"& shutdown.exe /s /t {warning_seconds} /d p:4:1 "
-        "/c 'Herdr night watch: no Herdr agents remained working.'"
-    )
-    completed = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
         warning_path.unlink(missing_ok=True)
-        detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
-        raise RuntimeError(f"Windows shutdown could not be scheduled: {detail}")
-    # Persist the request before the watcher enters the long warning wait. A
-    # Windows shutdown can terminate WSL before the watcher reaches the final
-    # bookkeeping branch, which would otherwise lose the only durable record.
-    try:
-        record_completion(warning["completion_action"], reason, state["run_id"])
-    except RuntimeError:
-        # Fail closed: never leave a scheduled shutdown behind without its
-        # durable completion record. The warning remains available if the
-        # Windows abort command itself also fails, so the next watcher pass
-        # can diagnose and retry the cancellation.
-        abort_shutdown_if_ours()
-        raise
-    log(f"Windows shutdown scheduled in {warning_seconds} seconds reason={reason}")
+        raise RuntimeError("powershell.exe is unavailable; refusing shutdown.")
+    # Keep the warning entirely inside the watcher. Starting an equally long
+    # Windows countdown here races the final history write: Windows reaches
+    # its deadline first and can terminate WSL before the CSV is durable.
+    # The final branch records the request and only then asks Windows to shut
+    # down immediately.
+    log(f"Windows shutdown will be requested in {warning_seconds} seconds reason={reason}")
 
 
 def request_windows_sleep() -> None:
@@ -881,9 +928,8 @@ def request_windows_shutdown_now() -> None:
         raise RuntimeError("powershell.exe is unavailable; refusing immediate shutdown.")
     command = (
         "$ErrorActionPreference = 'Stop'; "
-        "& shutdown.exe /a 2>$null; "
         "& shutdown.exe /s /t 0 /d p:4:1 "
-        "/c 'Herdr night watch: confirmed by the user.'"
+        "/c 'Herdr night watch: completion confirmed.'"
     )
     completed = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
@@ -897,38 +943,52 @@ def request_windows_shutdown_now() -> None:
     log("Windows shutdown requested immediately after user confirmation")
 
 
-def abort_shutdown_if_ours() -> bool:
+def abort_shutdown_if_ours(expected_run_id: str | None = None) -> bool | None:
+    """Remove our watcher-owned warning without touching other shutdowns."""
     _, _, warning_path, _ = paths()
-    warning = load_json(warning_path)
+    try:
+        warning = load_json(warning_path)
+    except (OSError, UnicodeError, ValueError) as error:
+        log(f"Watcher shutdown warning could not be read: {error}")
+        return False
     if not warning:
-        return False
-    cancelable_until = parse_time(warning.get("cancelable_until"))
-    if not cancelable_until or utc_now() >= cancelable_until:
-        return False
-    if completion_action(warning.get("completion_action")) == "sleep":
+        return None
+    if expected_run_id and warning.get("run_id") != expected_run_id:
+        log("Watcher shutdown warning belongs to a different run; leaving it untouched")
+        return None
+    try:
         warning_path.unlink(missing_ok=True)
-        log("Windows sleep warning aborted")
-        return True
-    if not shutil.which("powershell.exe"):
-        log("Cannot cancel Windows shutdown: powershell.exe is unavailable")
+    except OSError as error:
+        log(f"Watcher shutdown warning could not be removed: {error}")
         return False
-    completed = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "& shutdown.exe /a"],
-        text=True,
-        capture_output=True,
-        check=False,
+    log(
+        "Windows sleep warning aborted"
+        if completion_action(warning.get("completion_action")) == "sleep"
+        else "Watcher shutdown warning aborted"
     )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
-        log(f"Windows shutdown abort failed: {detail}")
-        return False
-    warning_path.unlink(missing_ok=True)
-    log("Windows shutdown warning aborted")
     return True
 
 
+def abort_shutdown_or_fail(
+    state: dict[str, Any],
+    detail: str,
+    *,
+    require_warning: bool = False,
+) -> bool:
+    """Abort the active warning or finish the run if cancellation is unsafe."""
+    result = abort_shutdown_if_ours(state.get("run_id"))
+    if result is True or (result is None and not require_warning):
+        return True
+    finish(state, "shutdown_abort_failed", detail)
+    return False
+
+
 def confirm_completion() -> int:
-    reset_stale_run_after_restart(force=True)
+    boot_marker_deadline = confirmation_boot_marker_deadline_seconds()
+    if boot_marker_deadline <= 0:
+        raise RuntimeError("The Herdr completion warning is no longer active.")
+    boot_id = wait_for_runtime_boot_id(boot_marker_deadline)
+    reset_stale_run_after_restart(force=True, current_boot_id=boot_id)
     _, _, warning_path, _ = paths()
     with completion_lock():
         state = load_json(paths()[1])
@@ -946,12 +1006,28 @@ def confirm_completion() -> int:
             log("DRY RUN: confirmation accepted without a Windows action")
             return 0
         action = completion_action(warning.get("completion_action"))
-        warning_path.unlink(missing_ok=True)
         outcome = "sleep_confirmed" if action == "sleep" else "shutdown_confirmed"
+        if abort_shutdown_if_ours(state.get("run_id")) is not True:
+            finish(
+                state,
+                "shutdown_abort_failed",
+                "The active completion warning could not be removed before confirmation.",
+            )
+            raise ShutdownAbortError(
+                "The active completion warning could not be removed before confirmation."
+            )
         try:
             # The power action may suspend or terminate Windows immediately.
             # Write the durable request record before invoking that action.
             record_completion(action, "confirmed", state["run_id"])
+        except RuntimeError as error:
+            finish(state, f"{action}_failed", str(error))
+            raise
+        if action == "shutdown":
+            # Persist the terminal state before an immediate shutdown can
+            # terminate WSL. A failed Windows request overwrites it below.
+            finish(state, outcome, "completion confirmed by the user")
+        try:
             if action == "sleep":
                 request_windows_sleep()
             else:
@@ -959,7 +1035,8 @@ def confirm_completion() -> int:
         except RuntimeError as error:
             finish(state, f"{action}_failed", str(error))
             raise
-        finish(state, outcome, "completion confirmed by the user")
+        if action == "sleep":
+            finish(state, outcome, "completion confirmed by the user")
     return 0
 
 
@@ -1086,12 +1163,20 @@ def watch() -> int:
             while utc_now() < deadline:
                 time.sleep(min(5, max(1, state["poll_seconds"])))
                 if not active_run(state["run_id"]):
-                    abort_shutdown_if_ours()
+                    with completion_lock():
+                        if active_run(state["run_id"]):
+                            continue
+                        abort_shutdown_if_ours(state.get("run_id"))
                     log("Completion warning cancelled outside the watcher")
                     return 0
                 if warning_reason == "network_unavailable":
                     if connectivity.refresh(state):
-                        abort_shutdown_if_ours()
+                        if not abort_shutdown_or_fail(
+                            state,
+                            "Internet connectivity returned but the Windows shutdown warning could not be cancelled",
+                            require_warning=True,
+                        ):
+                            return 1
                         state["all_terminal_since"] = None
                         write_json(state_path, state)
                         log("Completion warning cancelled because internet connectivity returned")
@@ -1101,18 +1186,33 @@ def watch() -> int:
                 try:
                     result, statuses = evaluate(state)
                 except RuntimeError as error:
-                    abort_shutdown_if_ours()
+                    if not abort_shutdown_or_fail(
+                        state,
+                        f"Herdr check failed and the Windows shutdown warning could not be cancelled: {error}",
+                        require_warning=True,
+                    ):
+                        return 1
                     state["all_terminal_since"] = None
                     write_json(state_path, state)
                     log(f"Completion warning cancelled because Herdr check failed: {error}")
                     warning_interrupted = True
                     break
                 if result == "refuse":
-                    abort_shutdown_if_ours()
+                    if not abort_shutdown_or_fail(
+                        state,
+                        "Herdr refused completion and the Windows shutdown warning could not be cancelled",
+                        require_warning=True,
+                    ):
+                        return 1
                     finish(state, "refused", ", ".join(statuses))
                     return 0
                 if result == "active":
-                    abort_shutdown_if_ours()
+                    if not abort_shutdown_or_fail(
+                        state,
+                        "Herdr reported active work and the Windows shutdown warning could not be cancelled",
+                        require_warning=True,
+                    ):
+                        return 1
                     state["all_terminal_since"] = None
                     write_json(state_path, state)
                     log("Shutdown warning cancelled because Herdr reports active work again")
@@ -1121,9 +1221,10 @@ def watch() -> int:
             if warning_interrupted:
                 continue
             with completion_lock():
-                state = active_run(state["run_id"])
+                run_id = state["run_id"]
+                state = active_run(run_id)
                 if not state:
-                    abort_shutdown_if_ours()
+                    abort_shutdown_if_ours(run_id)
                     log("Completion action cancelled before execution")
                     return 0
                 warning = load_json(paths()[2])
@@ -1132,7 +1233,12 @@ def watch() -> int:
                     return 0
                 if warning_reason == "network_unavailable":
                     if connectivity.refresh(state):
-                        abort_shutdown_if_ours()
+                        if not abort_shutdown_or_fail(
+                            state,
+                            "Internet connectivity returned but the Windows shutdown warning could not be cancelled",
+                            require_warning=True,
+                        ):
+                            return 1
                         state["all_terminal_since"] = None
                         write_json(state_path, state)
                         log("Completion warning cancelled because internet connectivity returned")
@@ -1141,17 +1247,32 @@ def watch() -> int:
                     try:
                         result, statuses = evaluate(state)
                     except RuntimeError as error:
-                        abort_shutdown_if_ours()
+                        if not abort_shutdown_or_fail(
+                            state,
+                            f"Final Herdr check failed and the Windows shutdown warning could not be cancelled: {error}",
+                            require_warning=True,
+                        ):
+                            return 1
                         state["all_terminal_since"] = None
                         write_json(state_path, state)
                         log(f"Completion warning cancelled because the final Herdr check failed: {error}")
                         continue
                     if result == "refuse":
-                        abort_shutdown_if_ours()
+                        if not abort_shutdown_or_fail(
+                            state,
+                            "Herdr refused completion and the Windows shutdown warning could not be cancelled",
+                            require_warning=True,
+                        ):
+                            return 1
                         finish(state, "refused", ", ".join(statuses))
                         return 0
                     if result != "terminal":
-                        abort_shutdown_if_ours()
+                        if not abort_shutdown_or_fail(
+                            state,
+                            "Herdr reported active work and the Windows shutdown warning could not be cancelled",
+                            require_warning=True,
+                        ):
+                            return 1
                         state["all_terminal_since"] = None
                         write_json(state_path, state)
                         log("Completion warning cancelled because Herdr reports active work again")
@@ -1162,6 +1283,12 @@ def watch() -> int:
                     if warning_reason == "network_unavailable"
                     else "no Herdr agents remained working through the warning"
                 )
+                if not abort_shutdown_or_fail(
+                    state,
+                    "The active completion warning could not be removed before completion",
+                    require_warning=True,
+                ):
+                    return 1
                 if action == "sleep" and not state.get("demo") and not state.get("dry_run"):
                     try:
                         # Sleep can suspend the process before any following
@@ -1179,19 +1306,33 @@ def watch() -> int:
                     if state.get("demo")
                     else completion_detail
                 )
+                if action == "shutdown" and not state.get("demo") and not state.get("dry_run"):
+                    try:
+                        # Record both the request and terminal state before the
+                        # immediate Windows action can terminate WSL.
+                        record_completion(action, warning_reason, state["run_id"])
+                        finish(state, outcome, detail)
+                        request_windows_shutdown_now()
+                    except RuntimeError as error:
+                        finish(state, "shutdown_failed", str(error))
+                        return 1
+                    return 0
                 finish(state, outcome, detail)
                 return 0
 
 
 def cancel(source: str) -> int:
-    reset_stale_run_after_restart(force=True)
+    reset_stale_run_after_restart(
+        force=True,
+        boot_marker_deadline=time.monotonic() + CANCEL_BOOT_MARKER_DEADLINE_SECONDS,
+    )
     _, state_path, _, _ = paths()
     with completion_lock():
         state = load_json(state_path)
         if state and not state.get("outcome"):
             run_id = str(state.get("run_id"))
             finish(state, "cancelled", f"cancelled by {source}")
-            abort_shutdown_if_ours()
+            abort_shutdown_if_ours(run_id)
             try:
                 record_cancellation(source, run_id)
             except (OSError, UnicodeError, csv.Error) as error:
@@ -1206,7 +1347,9 @@ def cancel(source: str) -> int:
 
 
 def status() -> int:
-    reset_stale_run_after_restart()
+    reset_stale_run_after_restart(
+        boot_marker_deadline=time.monotonic() + STATUS_BOOT_MARKER_DEADLINE_SECONDS
+    )
     _, state_path, warning_path, _ = paths()
     state = load_json(state_path)
     warning = load_json(warning_path)

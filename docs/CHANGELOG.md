@@ -1,5 +1,11 @@
 # Changelog - Herdr-Nachtwächter
 
+## [2026-09-01] - Abschlussprotokoll verliert keine Nachtläufe mehr v0.1.28
+
+- **Shutdown erst nach dem Logeintrag** - Der Wächter startet während der sichtbaren Warnfrist keinen parallelen Windows-Countdown mehr. Nach der letzten Sicherheitsprüfung schreibt er zuerst Verlauf und Endzustand und fordert Windows erst danach zum sofortigen Herunterfahren auf.
+- **Fremde Shutdowns bleiben unberührt** - Ein Abbruch entfernt nur die eigene Warnung und ruft nicht mehr pauschal `shutdown.exe /a` auf.
+- **Laufzeit und Repository wieder vereint** - Die tatsächlich eingesetzte Wächterfassung und ihre Sicherheitstests sind wieder die kanonische Repo-Basis.
+
 > Alle wesentlichen Änderungen an dieser Dokumentation.
 > Format: Game-Style mit Fokus auf Leser-Wirkung.
 
