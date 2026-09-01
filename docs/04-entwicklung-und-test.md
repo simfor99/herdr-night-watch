@@ -29,9 +29,11 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - Energiesparmodus darf weder `shutdown.exe /s` noch `shutdown.exe /a` ausführen.
 - Nur eine positive Benutzerbestätigung der eigenen aktiven Warnung darf Energiesparmodus oder Herunterfahren vor Ablauf der Warnfrist auslösen.
 - Internet-Ausfall löst erst nach fünf Minuten und nur über dieselbe sichtbare Warnfrist aus; Rückkehr der Verbindung bricht diese Warnung ab.
-- `completion-history.csv` protokolliert die angeforderten Energieaktionen des WSL-Wächters. Der Datensatz wird vor einer bestätigten Schlaf- oder Shutdown-Aktion dauerhaft geschrieben; bei einem Schreibfehler wird die Aktion abgebrochen beziehungsweise ein bereits geplanter Shutdown nach Möglichkeit wieder aufgehoben. `tray-history.csv` protokolliert erkannte unplanmäßige Tray-Enden. Der Log-Viewer zeigt beide Dateien in getrennten Bereichen und höchstens 30 Einträge je Bereich.
+- `completion-history.csv` protokolliert die angeforderten Energieaktionen des WSL-Wächters. Der Datensatz wird vor einer bestätigten Schlaf- oder Shutdown-Aktion dauerhaft geschrieben; bei einem Schreibfehler wird keine Energieaktion angefordert. `tray-history.csv` protokolliert erkannte unplanmäßige Tray-Enden. Der Log-Viewer zeigt beide Dateien in getrennten Bereichen und höchstens 30 Einträge je Bereich.
 - `cancellation-history.csv` darf höchstens 30 Ereignisse enthalten und muss die konkrete Abbruchquelle speichern.
-- `--cancel` darf nur einen Shutdown abbrechen, für den eine gültige eigene Warnungsdatei existiert.
+- `--cancel` darf nur die eigene Warnung entfernen und niemals einen fremden Windows-Shutdown mit `shutdown.exe /a` beeinflussen.
+- Während der Warnfrist darf noch kein Windows-Shutdown laufen. Erst die letzte erfolgreiche Sicherheitsprüfung schreibt Verlauf und Endzustand und fordert danach Windows zum sofortigen Herunterfahren auf.
+- Lässt sich die eigene Warnung vor einer notwendigen Stornierung oder Energieaktion nicht sicher lesen und entfernen, endet der Lauf mit `shutdown_abort_failed`; Verlauf und Windows-Energieaktion werden dann nicht fortgesetzt.
 - Die Tray-App und ihre Hilfsprozesse dürfen keine sichtbaren Konsolenfenster erzeugen.
 - Solange die Tray-App läuft, muss sie den automatischen Windows-Leerlauf-Energiesparmodus mit `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` verhindern - unabhängig davon, ob ein Nachtlauf aktiv ist. Der Bildschirm und bewusste Energieaktionen bleiben davon unberührt.
 - Lehnt Windows diese Energiesperre beim Start ab, darf die primäre Tray-App nicht weiterlaufen. Ein aktiver oder nicht sicher abfragbarer Nachtlauf wird vorher mit `power_guard_failed` beendet.

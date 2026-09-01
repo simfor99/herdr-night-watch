@@ -19,13 +19,13 @@ Dadurch wird aus einem manuellen Nacht-Ritual eine überprüfbare Automatik. Die
 |---|---|
 | Offene Terminals waren kein brauchbares Signal für fertige Arbeit. | Alle aktuell von Herdr gemeldeten Agenten bestimmen den Nachtlauf. |
 | Ein Shutdown wäre bei einer Unsicherheit riskant gewesen. | Jede Unsicherheit verweigert den Shutdown. |
-| Prüfung und Bedienung erforderten sichtbare Konsolenfenster. | Die Tray-App steuert einen unsichtbaren, vom Task Scheduler überwachten Wächter. |
+| Prüfung und Bedienung erforderten sichtbare Konsolenfenster. | Die Tray-App startet den WSL-Wächter als unsichtbaren Hintergrundprozess. |
 
 ## Was wir gebaut haben
 
-Beim Klick auf „Nachtmodus starten“ ruft die Windows-Tray-App ein PowerShell-Skript auf. Dieses bittet den WSL-Wächter, die aktive Herdr-Arbeit zu erfassen, und startet anschließend den Windows-Task „Herdr Night Watch“. Der Task startet über einen kleinen VBS-Starter den Python-Wächter ohne Konsolenfenster. Dieser prüft Herdr in festen Abständen, führt die Ruhezeit und setzt erst dann den Windows-Shutdown mit einer widerrufbaren Warnfrist an.
+Beim Klick auf „Nachtmodus starten“ erfasst die Windows-Tray-App über WSL die aktive Herdr-Arbeit und startet danach `herdr-night-watch.py --watch` direkt als fensterlosen Hintergrundprozess. Dafür ruft sie `wsl.exe` mit `CREATE_NO_WINDOW` auf. Der Wächter prüft Herdr in festen Abständen, führt die Ruhezeit und danach eine widerrufbare Warnfrist aus. Erst nach deren Ablauf und der letzten Sicherheitsprüfung fordert er Windows zum Herunterfahren auf.
 
-Währenddessen fragt die Tray-App den WSL-Zustand etwa alle fünf Sekunden ab und färbt ihr Mond-Symbol passend ein. In der echten Warnphase erscheint ein Windows-Dialog: „Abbrechen“ ruft den Stopp-Pfad auf und hebt ausschließlich den vom Wächter selbst geplanten Shutdown auf. Die Demo folgt derselben sichtbaren Zustandsfolge, kann aber technisch niemals `shutdown.exe /s` ausführen.
+Währenddessen fragt die Tray-App den WSL-Zustand etwa alle fünf Sekunden ab und färbt ihr Mond-Symbol passend ein. In der echten Warnphase erscheint ein Windows-Dialog: „Abbrechen“ ruft den Stopp-Pfad auf und entfernt die eigene Warnung. Windows wird erst nach Ablauf und letzter Sicherheitsprüfung zum Herunterfahren aufgefordert. Die Demo folgt derselben sichtbaren Zustandsfolge, kann aber technisch niemals `shutdown.exe /s` ausführen.
 
 | Kernpunkt | Wert |
 |---|---|
@@ -33,14 +33,14 @@ Währenddessen fragt die Tray-App den WSL-Zustand etwa alle fünf Sekunden ab un
 | Standard-Prüfintervall | 1 Sekunde |
 | Echte Warnfrist | 300 Sekunden |
 | Demo-Ruhezeit und -Warnfrist | 8 Sekunden und 15 Sekunden |
-| Windows-Task | `Herdr Night Watch` |
+| Hintergrundstart | `wsl.exe` mit `CREATE_NO_WINDOW` und `herdr-night-watch.py --watch` |
 | Sicherheitsprinzip | Bei Zweifel kein Shutdown |
 
 ## Wie es zusammenhängt
 
 Dieses Projekt verbindet sich mit [Herdr](../../../.agents/skills/herdr/SKILL.md), weil der Wächter dessen Agentenstatus und Pane-Prozessdaten als Grundlage für seine Entscheidung verwendet. Ohne einen laufenden, kompatiblen Herdr-Server wird deshalb kein Nachtlauf scharfgestellt. Die Verbindung ist bewusst eng: Shell-Prozesse oder nicht als Herdr-Agent erfasste Arbeit werden nicht geraten oder interpretiert.
 
-Es verbindet sich außerdem mit dem Windows Task Scheduler und WSL. Windows besitzt die Herunterfahr-Funktion, WSL kennt Herdr und führt den Python-Wächter aus. Die VBS-Schicht zwischen Task Scheduler und `wsl.exe` ist kein Komfortdetail: Sie verhindert das früher beobachtete kurze Terminal-Popup. Die Tray-App ist separat, weil sie den Ablauf erklären und abbrechen soll, nicht aber die Sicherheitsentscheidung tragen darf.
+Es verbindet sich außerdem direkt mit WSL. Windows besitzt die Herunterfahr-Funktion, WSL kennt Herdr und führt den Python-Wächter aus. Die Tray-App startet `wsl.exe` mit `CREATE_NO_WINDOW`, damit kein Konsolenfenster erscheint. Die vorhandenen Task-Scheduler- und VBS-Skripte bleiben als manuelle Betriebswerkzeuge erhalten, gehören aber nicht mehr zum normalen Tray-Startpfad. Die Tray-App ist separat, weil sie den Ablauf erklären und abbrechen soll, nicht aber die Sicherheitsentscheidung tragen darf.
 
 ## Schlüsselentscheidungen
 
@@ -68,11 +68,11 @@ Es verbindet sich außerdem mit dem Windows Task Scheduler und WSL. Windows besi
 - (-) Manchmal bleibt der Rechner länger an als unbedingt nötig.
 - (~) Log und Status sind die erste Anlaufstelle, wenn ein Lauf mit `refused` endet.
 
-### Unsichtbarer Task statt sichtbarem WSL-Fenster
+### Unsichtbarer WSL-Prozess statt sichtbarem Terminal
 
-**Kontext:** Ein direkt vom Task Scheduler gestartetes `wsl.exe` erzeugte sichtbare Windows-Terminal-Fenster.
+**Kontext:** Ein normal gestartetes `wsl.exe` kann ein sichtbares Windows-Terminal erzeugen.
 
-**Entscheidung:** Der Task ruft `wscript.exe` mit `Run-HerdrNightWatchHidden.vbs` auf; die Tray-App startet ihre Hilfsprozesse zusätzlich mit `CREATE_NO_WINDOW`.
+**Entscheidung:** Die Tray-App startet den Python-Wächter direkt über `wsl.exe` und setzt dabei `CREATE_NO_WINDOW`.
 
 **Konsequenzen:**
 
