@@ -47,6 +47,17 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // seconds caused the tray opener to kill a healthy process during startup.
 const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// The default cadence only exists so the smoothed second hand glides. While
+// the GPU is heavily loaded, every repaint is a black-flash risk for the
+// OpenGL surface because the compositor is starved for frame budget. Stepping
+// the hand once per second then cuts that risk to a quarter.
+const LIVE_WINDOW_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
+const LIVE_WINDOW_THROTTLED_REPAINT_INTERVAL: Duration = Duration::from_secs(1);
+const LIVE_WINDOW_REPAINT_THROTTLE_GPU_PERCENT: u8 = 80;
+// The PDH GPU-engine counter only books graphics work submitted by Windows
+// processes; WSL CUDA load (the common night-test case) stays invisible
+// there. The card's power draw covers that gap, so throttle on either signal.
+const LIVE_WINDOW_REPAINT_THROTTLE_GPU_POWER_PERCENT: u8 = 60;
 const LIVE_WINDOW_START_ATTEMPTS: usize = 3;
 const LIVE_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
 // eframe keeps the native viewport hidden until it has presented its first
@@ -2000,7 +2011,21 @@ impl eframe::App for LiveStatusApp {
         handle_window_drag(self, ui);
         persist_window_position(self, ui.ctx());
         controls.paint(ui.painter(), self.window_level);
-        ui.ctx().request_repaint_after(Duration::from_millis(250));
+        ui.ctx().request_repaint_after(live_status_repaint_interval(&self.metrics));
+    }
+}
+
+fn live_status_repaint_interval(metrics: &SystemMetrics) -> Duration {
+    let utilization_high = metrics
+        .gpu_percent
+        .is_some_and(|percent| percent >= LIVE_WINDOW_REPAINT_THROTTLE_GPU_PERCENT);
+    let power_high = metrics
+        .gpu_power_percent
+        .is_some_and(|percent| percent >= LIVE_WINDOW_REPAINT_THROTTLE_GPU_POWER_PERCENT);
+    if utilization_high || power_high {
+        LIVE_WINDOW_THROTTLED_REPAINT_INTERVAL
+    } else {
+        LIVE_WINDOW_REPAINT_INTERVAL
     }
 }
 
