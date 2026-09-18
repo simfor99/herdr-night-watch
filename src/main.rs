@@ -4,6 +4,9 @@
 )]
 
 #[cfg(windows)]
+mod quota;
+
+#[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
 mod backend;

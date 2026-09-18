@@ -1,5 +1,13 @@
 # Changelog - Herdr-Nachtwächter
 
+## [2026-09-18] - KI-Limits-Dock, Pacing-Radar & synchrone Vorschau v0.1.34
+
+- **Magnetisches Limits-Satellitendock** - Neues an- und abdockbares Satellitenfenster für KI-Budget-Telemetrie (GLM, AGY, Codex) mit 0-Pixel-Nahtstelle und magnetischem Einrasten.
+- **Duale Kontingentanzeige (5h & Woche)** - Zweizeilige Fortschrittsbalken mit hochkontrastigen Prozentwerten und Reset-Zeitpunkten für rollierende Kurzzeit- und Wochenzyklen.
+- **Pacing & Exhaustion Radar** - Dynamische Verbrauchsgeschwindigkeits-Analyse ($B / A$) mit Ampel-Status (Grün/Gelb/Rot) und exakter Vorhersage des Erschöpfungsdatums bei erhöhtem Burn-Rate.
+- **Synchronisierte bidirektionale Skalierung & Live-Vorschau** - Taktile Größenanpasser an beiden Fenstern mit synchronem halbtransparentem Vorschau-Körper, doppelter Akzentkontur und Echtzeit-Pixelbemaßung.
+- **Vollständige zweisprachige Lokalisierung** - Deutsch und Englisch für alle Status, Tooltips, Kontextmenüs und Pacing-Badges.
+
 ## [2026-09-15] - Aktualisierungsrate gegen den Schwarzblitz v0.1.33
 
 - **Rate im Rechtsklickmenü wählbar** - Die Blitz-Sonde hat gezeigt, dass der Schwarzblitz des Live-Fensters zufällig bei jedem Bildaufbau auftreten kann und nicht von der Grafiklast abhängt. Die lastabhängige Drosselung ist deshalb entfallen. Das Rechtsklickmenü bietet jetzt „Aktualisierungsrate“ mit Flüssig (250 ms), Mittel (500 ms) und Sekündlich (1000 ms); die Wahl bleibt über Neustarts erhalten. Weniger Bildaufbauten bedeuten deutlich seltener einen Blitz.

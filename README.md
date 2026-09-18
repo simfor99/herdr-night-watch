@@ -73,6 +73,16 @@ The dotted timeline gives an immediate playback overview. Hovering previews the 
 
 The moon also shows the current temperature and the real current lunar phase for the selected weather location. Open-Meteo supplies the daily phase value, so the icon shifts between crescent, quarter, gibbous, full, and new moon; the temperature stays centered, with a background-blue outline only on the lit sickle so the digits stay readable. Leipzig is used initially; the small weather control at the lower-right appears on hover and opens a searchable city selector. Weather and moon data are informational only, are refreshed in the background, and fall back to the last value or a local phase estimate when the network is unavailable.
 
+### AI budget limits, dual telemetry, and pacing forecast
+
+A dedicated magnetic satellite dock can be opened directly below the live status dashboard (toggled via the compact `⚡` button in the footer or via the context menu). It displays real-time quotas for the active AI engines (GLM, AGY, and Codex) without overloading the main display:
+
+- **Dual Telemetry Gauges**: 5-hour rolling burst limit and weekly cycle budget with color-coded utilization bars and bold high-contrast percentages.
+- **Pacing & Exhaustion Radar**: Dynamic burn-rate analysis relative to elapsed and remaining cycle days ($B / A$). When runway is ample, it reports available headroom (`Pace 0.4x`, `Reicht locker` / `Ample runway`). When consumption exceeds budget velocity (e.g. 50% consumed on Day 2 of a 7-day cycle), an intelligent forecast algorithm calculates the exact projected exhaustion date (`Schluss: 20.09. (~2 d)` in German, `Empty: 20.09 (~2 d)` in English) and flags an alert chip (`WARN` / `HALT`).
+- **Seamless Magnetic Docking**: Snaps automatically to the bottom edge with a 0-pixel gap. Pulling the satellite away undocks it into a freely floating companion window; dragging it back within range re-engages magnetic lock.
+- **Synchronized Proportional Resizing**: Interactive tactile resize grips in the bottom-right corners of both windows allow continuous scaling up and down with instant size synchronization across both surfaces.
+- **Bilingual Interface**: Full German and English localization for all statuses, tooltips, and pacing badges.
+
 ## Usage
 
 - **Start night mode**: continuously monitors all agents currently reported by Herdr and only shuts down Windows after the configured quiet period.

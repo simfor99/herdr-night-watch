@@ -12,6 +12,10 @@ const LIVE_STATUS_POS_X_VALUE: &str = "LiveStatusPositionX";
 const LIVE_STATUS_POS_Y_VALUE: &str = "LiveStatusPositionY";
 const LIVE_STATUS_SCALE_VALUE: &str = "LiveStatusScale";
 const LIVE_STATUS_REPAINT_VALUE: &str = "LiveStatusRepaintIntervalMs";
+const LIVE_STATUS_QUOTA_OPEN_VALUE: &str = "LiveStatusQuotaOpen";
+const LIVE_STATUS_QUOTA_DOCKED_VALUE: &str = "LiveStatusQuotaDocked";
+const LIVE_STATUS_QUOTA_POS_X_VALUE: &str = "LiveStatusQuotaPositionX";
+const LIVE_STATUS_QUOTA_POS_Y_VALUE: &str = "LiveStatusQuotaPositionY";
 
 pub const OPACITY_VALUES: [u8; 10] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
 // The live-status repaint cadence trades the gliding second hand against
@@ -210,6 +214,38 @@ pub fn clamp_live_status_scale(scale: f32) -> f32 {
     } else {
         DEFAULT_LIVE_STATUS_SCALE
     }
+}
+
+pub fn live_status_quota_open() -> bool {
+    read_bool_setting(LIVE_STATUS_QUOTA_OPEN_VALUE, false)
+}
+
+pub fn set_live_status_quota_open(open: bool) -> anyhow::Result<()> {
+    write_bool_setting(LIVE_STATUS_QUOTA_OPEN_VALUE, open)
+}
+
+pub fn live_status_quota_docked() -> bool {
+    read_bool_setting(LIVE_STATUS_QUOTA_DOCKED_VALUE, true)
+}
+
+pub fn set_live_status_quota_docked(docked: bool) -> anyhow::Result<()> {
+    write_bool_setting(LIVE_STATUS_QUOTA_DOCKED_VALUE, docked)
+}
+
+pub fn live_status_quota_position() -> Option<[f32; 2]> {
+    let key = RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok()?;
+    let x = key.get_value::<u32, _>(LIVE_STATUS_QUOTA_POS_X_VALUE).ok()? as i32;
+    let y = key.get_value::<u32, _>(LIVE_STATUS_QUOTA_POS_Y_VALUE).ok()? as i32;
+    Some([x as f32, y as f32])
+}
+
+pub fn set_live_status_quota_position(position: [f32; 2]) -> anyhow::Result<()> {
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
+    let x = position[0].round() as i32;
+    let y = position[1].round() as i32;
+    key.set_value(LIVE_STATUS_QUOTA_POS_X_VALUE, &(x as u32))?;
+    key.set_value(LIVE_STATUS_QUOTA_POS_Y_VALUE, &(y as u32))?;
+    Ok(())
 }
 
 #[cfg(test)]

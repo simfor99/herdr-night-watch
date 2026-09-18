@@ -20,6 +20,7 @@ def ps(command: str) -> subprocess.CompletedProcess[str]:
         check=False,
         text=True,
         capture_output=True,
+        stdin=subprocess.DEVNULL,
     )
 
 

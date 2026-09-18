@@ -3,6 +3,7 @@ use crate::{
     language::Language,
     log_viewer,
     media::{self, MediaCommand, MediaSnapshot},
+    quota::{PacingHealth, ProviderId, ProviderQuota, QuotaSnapshot},
     system_metrics::{self, SystemMetrics},
     taskbar,
     weather::{self, WeatherLocation, WeatherReading, WeatherSymbol},
@@ -1421,6 +1422,12 @@ struct LiveStatusApp {
     scale: f32,
     last_saved_position: Option<[f32; 2]>,
     owner_pid: Option<u32>,
+    quota_snapshot: QuotaSnapshot,
+    quota_open: bool,
+    quota_docked: bool,
+    quota_pos: Option<[f32; 2]>,
+    quota_drag_active: bool,
+    quota_resize_drag: Option<(egui::Pos2, f32, egui::Vec2)>,
 }
 
 impl Drop for LiveStatusApp {
@@ -1488,6 +1495,12 @@ impl LiveStatusApp {
             scale,
             last_saved_position: window_settings::live_status_position(),
             owner_pid,
+            quota_snapshot: QuotaSnapshot::measured_baseline(),
+            quota_open: window_settings::live_status_quota_open(),
+            quota_docked: window_settings::live_status_quota_docked(),
+            quota_pos: window_settings::live_status_quota_position(),
+            quota_drag_active: false,
+            quota_resize_drag: None,
         }
     }
 
@@ -1767,6 +1780,12 @@ impl eframe::App for LiveStatusApp {
                         .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                             window_chrome::window_level(next_level),
                         ));
+                    if self.quota_open {
+                        ui.ctx().send_viewport_cmd_to(
+                            egui::ViewportId::from_hash_of("live_status_quota_viewport"),
+                            egui::ViewportCommand::WindowLevel(window_chrome::window_level(next_level)),
+                        );
+                    }
                     self.toast = Some(Toast {
                         message: window_level_message(next_level, self.language).into(),
                         color: ACCENT,
@@ -1779,6 +1798,12 @@ impl eframe::App for LiveStatusApp {
         if controls.minimize_clicked {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            if self.quota_open {
+                ui.ctx().send_viewport_cmd_to(
+                    egui::ViewportId::from_hash_of("live_status_quota_viewport"),
+                    egui::ViewportCommand::Minimized(true),
+                );
+            }
         }
         if controls.close_clicked {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1984,11 +2009,21 @@ impl eframe::App for LiveStatusApp {
                 );
                 ui.add_space(KPI_ROW_TOP_GAP);
                 let metrics_text_right = system_metrics_row(ui, self.metrics, self.language);
-                if let Some(media) = &self.media_snapshot {
-                    ui.add_space(4.0);
-                    if let Some(position) = media_info_row(ui, media, metrics_text_right) {
-                        let _ = self.media_command_tx.send(MediaCommand::Seek(position));
-                    }
+                ui.add_space(4.0);
+                let (seek_action, toggle_quota) = media_info_row(
+                    ui,
+                    self.media_snapshot.as_ref(),
+                    metrics_text_right,
+                    &self.quota_snapshot,
+                    self.quota_open,
+                    self.language,
+                );
+                if let Some(position) = seek_action {
+                    let _ = self.media_command_tx.send(MediaCommand::Seek(position));
+                }
+                if toggle_quota {
+                    self.quota_open = !self.quota_open;
+                    let _ = window_settings::set_live_status_quota_open(self.quota_open);
                 }
                 if weather_control_overlay(ui, &self.weather_reading, self.language)
                     && let Err(error) = weather_location::open()
@@ -2002,6 +2037,9 @@ impl eframe::App for LiveStatusApp {
         handle_window_drag(self, ui);
         persist_window_position(self, ui.ctx());
         controls.paint(ui.painter(), self.window_level);
+        if self.quota_open {
+            render_quota_satellite_window(self, ui.ctx());
+        }
         // Each repaint has a small random black-flash chance on the OpenGL
         // surface (see window_settings::REPAINT_INTERVAL_MS_VALUES), so the
         // cadence is a user setting instead of a constant.
@@ -2046,6 +2084,28 @@ fn apply_live_status_scale(
         DESIGN_WIDTH * scale / previous_zoom,
         DESIGN_HEIGHT * scale / previous_zoom,
     )));
+    if app.quota_open {
+        let quota_viewport_id = egui::ViewportId::from_hash_of("live_status_quota_viewport");
+        ctx.send_viewport_cmd_to(
+            quota_viewport_id,
+            egui::ViewportCommand::InnerSize(egui::vec2(
+                DESIGN_WIDTH * scale / previous_zoom,
+                176.0 * scale / previous_zoom,
+            )),
+        );
+        if app.quota_docked {
+            if let Some(main) = ctx.input(|i| i.viewport().outer_rect) {
+                let dock_overlap = (2.5 * scale).round();
+                ctx.send_viewport_cmd_to(
+                    quota_viewport_id,
+                    egui::ViewportCommand::OuterPosition(egui::pos2(
+                        main.min.x,
+                        main.max.y - dock_overlap,
+                    )),
+                );
+            }
+        }
+    }
     if persist {
         let _ = window_settings::set_live_status_scale(scale);
     }
@@ -2117,6 +2177,18 @@ fn handle_window_resize(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
             if should_resize {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::InnerSize(native_preview_size));
+                if app.quota_open {
+                    let quota_viewport_id =
+                        egui::ViewportId::from_hash_of("live_status_quota_viewport");
+                    let sat_native_preview_size = egui::vec2(
+                        native_preview_size.x,
+                        176.0 * (native_preview_size.x / DESIGN_WIDTH),
+                    );
+                    ui.ctx().send_viewport_cmd_to(
+                        quota_viewport_id,
+                        egui::ViewportCommand::InnerSize(sat_native_preview_size),
+                    );
+                }
                 app.resize_preview_window_size = Some(native_preview_size);
             }
         }
@@ -2329,6 +2401,8 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
     let mut clock_visibility_choice = None;
     let mut second_hand_choice = None;
     let mut repaint_interval_choice = None;
+    let mut quota_visibility_choice = None;
+    let mut quota_docked_choice = None;
     let menu = egui::Area::new(egui::Id::new("live_status_context_menu"))
         .order(egui::Order::Foreground)
         .fixed_pos(menu_position + egui::vec2(4.0, 4.0))
@@ -2373,6 +2447,31 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
                     second_hand_choice = Some(show_second_hand);
                 }
                 ui.separator();
+                let mut show_quota = app.quota_open;
+                if ui
+                    .checkbox(
+                        &mut show_quota,
+                        app.language.text("Limits anzeigen", "Show Limits"),
+                    )
+                    .changed()
+                {
+                    quota_visibility_choice = Some(show_quota);
+                }
+                let mut show_docked = app.quota_docked;
+                let docked_changed = ui
+                    .add_enabled_ui(show_quota, |ui| {
+                        ui.checkbox(
+                            &mut show_docked,
+                            app.language
+                                .text("Limits magnetisch andocken", "Dock Limits magnetically"),
+                        )
+                    })
+                    .inner
+                    .changed();
+                if docked_changed {
+                    quota_docked_choice = Some(show_docked);
+                }
+                ui.separator();
                 ui.label(
                     egui::RichText::new(
                         app.language.text("Aktualisierungsrate", "Refresh rate"),
@@ -2397,7 +2496,8 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
         clock_visibility_choice.is_some(),
         second_hand_choice.is_some(),
         repaint_interval_choice.is_some(),
-    );
+    ) || quota_visibility_choice.is_some()
+        || quota_docked_choice.is_some();
     if let Some(show_clock) = clock_visibility_choice {
         match window_settings::set_clock_visible(show_clock) {
             Ok(()) => app.clock_visible = show_clock,
@@ -2407,6 +2507,18 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
     if let Some(show_second_hand) = second_hand_choice {
         match window_settings::set_clock_second_hand_visible(show_second_hand) {
             Ok(()) => app.clock_second_hand_visible = show_second_hand,
+            Err(error) => app.error = Some(error.to_string()),
+        }
+    }
+    if let Some(show_quota) = quota_visibility_choice {
+        match window_settings::set_live_status_quota_open(show_quota) {
+            Ok(()) => app.quota_open = show_quota,
+            Err(error) => app.error = Some(error.to_string()),
+        }
+    }
+    if let Some(docked) = quota_docked_choice {
+        match window_settings::set_live_status_quota_docked(docked) {
+            Ok(()) => app.quota_docked = docked,
             Err(error) => app.error = Some(error.to_string()),
         }
     }
@@ -4179,9 +4291,116 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Langu
 
 fn media_info_row(
     ui: &mut egui::Ui,
-    media: &MediaSnapshot,
+    media: Option<&MediaSnapshot>,
     metrics_text_right: f32,
-) -> Option<i64> {
+    quota_snapshot: &QuotaSnapshot,
+    quota_open: bool,
+    language: Language,
+) -> (Option<i64>, bool) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
+    let painter = ui.painter();
+
+    // 1. Quota toggle compact button on the far left: [ · ⚡ ]
+    let quota_btn_width = 28.0;
+    let quota_btn_rect =
+        egui::Rect::from_min_size(rect.min, egui::vec2(quota_btn_width, rect.height()));
+    let quota_response = ui.interact(
+        quota_btn_rect,
+        ui.make_persistent_id("quota_toggle_media_button"),
+        egui::Sense::click(),
+    );
+    let quota_hovered = quota_response.hovered();
+    if quota_hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let toggle_clicked = quota_response.clicked();
+
+    let btn_bg = if quota_open {
+        egui::Color32::from_rgb(26, 38, 62)
+    } else if quota_hovered {
+        egui::Color32::from_rgb(22, 32, 54)
+    } else {
+        WINDOW_CONTROL_HOOD_FILL
+    };
+    let btn_stroke_color = if quota_open {
+        egui::Color32::from_rgba_unmultiplied(96, 165, 250, 200)
+    } else if quota_hovered {
+        egui::Color32::from_rgba_unmultiplied(120, 140, 180, 150)
+    } else {
+        WINDOW_CONTROL_HOOD_STROKE
+    };
+    painter.rect_filled(quota_btn_rect, egui::CornerRadius::same(5), btn_bg);
+    painter.rect_stroke(
+        quota_btn_rect,
+        egui::CornerRadius::same(5),
+        egui::Stroke::new(1.0, btn_stroke_color),
+        egui::StrokeKind::Inside,
+    );
+    window_chrome::glass_sheen(painter, quota_btn_rect);
+
+    // Micro-LED beacon:
+    let beacon_center = egui::pos2(quota_btn_rect.left() + 8.0, quota_btn_rect.center().y);
+    let beacon_color = if quota_snapshot.has_throttle {
+        egui::Color32::from_rgb(248, 113, 113)
+    } else {
+        egui::Color32::from_rgb(74, 222, 128)
+    };
+    let halo_color = if quota_snapshot.has_throttle {
+        egui::Color32::from_rgba_unmultiplied(248, 113, 113, 60)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(74, 222, 128, 45)
+    };
+    painter.circle_filled(beacon_center, 4.0, halo_color);
+    painter.circle_filled(beacon_center, 2.2, beacon_color);
+
+    // Bolt icon:
+    let bolt_galley = painter.layout_no_wrap(
+        "⚡".into(),
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_rgb(251, 191, 36),
+    );
+    let bolt_pos = egui::pos2(
+        quota_btn_rect.left() + 14.0,
+        quota_btn_rect.center().y - bolt_galley.size().y / 2.0,
+    );
+    painter.galley(bolt_pos, bolt_galley, egui::Color32::from_rgb(251, 191, 36));
+
+    let tooltip = if quota_snapshot.has_throttle {
+        language.text(
+            "⚡ Limits: 1 Anbieter gedrosselt (Codex)\nKlicken zum Ein-/Ausblenden",
+            "⚡ Limits: 1 provider throttled (Codex)\nClick to toggle",
+        )
+    } else {
+        language.text(
+            "⚡ Limits: Alle Anbieter aktiv\nKlicken zum Ein-/Ausblenden",
+            "⚡ Limits: All providers active\nClick to toggle",
+        )
+    };
+    quota_response.on_hover_text(tooltip);
+
+    // 2. Media details or placeholder to the right:
+    let media_start_x = quota_btn_rect.right() + 6.0;
+    let Some(media) = media else {
+        let idle_galley = painter.layout_no_wrap(
+            language
+                .text("Keine Medienwiedergabe", "No media playback")
+                .into(),
+            egui::FontId::proportional(9.5),
+            egui::Color32::from_rgba_unmultiplied(148, 163, 184, 90),
+        );
+        let idle_pos = egui::pos2(
+            media_start_x + 4.0,
+            rect.center().y - idle_galley.size().y / 2.0,
+        );
+        painter.galley(
+            idle_pos,
+            idle_galley,
+            egui::Color32::from_rgba_unmultiplied(148, 163, 184, 90),
+        );
+        return (None, toggle_clicked);
+    };
+
     let (artist_color, _, title_color, _) = media_colors(media);
     let artist = if media.artist.trim().is_empty() {
         "Unbekannter Interpret".to_string()
@@ -4189,20 +4408,17 @@ fn media_info_row(
         media.artist.clone()
     };
     let timeline_reserve = 110.0;
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
     let text_rect = egui::Rect::from_min_max(
-        rect.min,
+        egui::pos2(media_start_x, rect.top()),
         egui::pos2(
-            (rect.right() - timeline_reserve - 6.0).max(rect.left()),
+            (rect.right() - timeline_reserve - 6.0).max(media_start_x),
             rect.bottom(),
         ),
     );
-    let max_chars = (text_rect.width() / 6.2).floor().max(18.0) as usize;
+    let max_chars = (text_rect.width() / 6.2).floor().max(14.0) as usize;
     let artist_part = truncate_media_text(&artist, (max_chars as f32 * 0.68) as usize);
     let title_budget = max_chars.saturating_sub(artist_part.chars().count()).max(8);
     let title_part = truncate_media_text(&media.title, title_budget);
-    let painter = ui.painter();
     let artist_galley =
         painter.layout_no_wrap(artist_part, egui::FontId::proportional(10.5), artist_color);
     let title_galley =
@@ -4283,9 +4499,6 @@ fn media_info_row(
         None
     };
     let hover_dots = hover_progress.map(|value| ((DOT_COUNT - 1) as f32 * value).round() as usize);
-    // The played portion transitions from the artist pill's color to the
-    // title pill's color. Lower alpha keeps the gradient pleasantly quiet
-    // against the dark background while preserving the visual distinction.
     let preview_color = egui::Color32::from_rgba_unmultiplied(
         title_color.r(),
         title_color.g(),
@@ -4316,12 +4529,911 @@ fn media_info_row(
             );
         }
     }
-    if !timeline_response.clicked() || !media.seek_enabled || duration <= 0 {
-        return None;
+    let seek_action = if timeline_response.clicked() && media.seek_enabled && duration > 0 {
+        let pointer_x = timeline_response
+            .interact_pointer_pos()
+            .map(|p| p.x)
+            .unwrap_or(track_left);
+        let ratio = ((pointer_x - track_left) / track_width).clamp(0.0, 1.0);
+        Some(media.start_100ns + (duration as f32 * ratio) as i64)
+    } else {
+        None
+    };
+
+    (seek_action, toggle_clicked)
+}
+
+fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
+    let quota_viewport_id = egui::ViewportId::from_hash_of("live_status_quota_viewport");
+    let title = match app.language {
+        Language::German => "Herdr-Nachtwächter - Limits",
+        Language::English => "Herdr Night Watch - Limits",
+    };
+
+    let scale = app.scale;
+    let quota_width = DESIGN_WIDTH * scale;
+    let quota_height = 176.0 * scale;
+
+    let dock_overlap = (2.5 * scale).round();
+    let main_outer_rect = ctx.input(|i| i.viewport().outer_rect);
+    let target_pos = if app.quota_docked {
+        main_outer_rect.map(|main| egui::pos2(main.min.x, main.max.y - dock_overlap))
+    } else {
+        app.quota_pos.map(|p| egui::pos2(p[0], p[1])).or_else(|| {
+            main_outer_rect.map(|main| egui::pos2(main.min.x, main.max.y + 35.0 * scale))
+        })
+    };
+
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_inner_size([quota_width, quota_height])
+        .with_min_inner_size([
+            DESIGN_WIDTH * window_settings::MIN_LIVE_STATUS_SCALE,
+            176.0 * window_settings::MIN_LIVE_STATUS_SCALE,
+        ])
+        .with_max_inner_size([
+            DESIGN_WIDTH * window_settings::MAX_LIVE_STATUS_SCALE,
+            176.0 * window_settings::MAX_LIVE_STATUS_SCALE,
+        ])
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_window_level(window_chrome::window_level(app.window_level));
+
+    if let Some(pos) = target_pos {
+        if app.quota_docked && !app.quota_drag_active {
+            builder = builder.with_position(pos);
+        }
     }
-    let pointer_x = timeline_response.interact_pointer_pos()?.x;
-    let ratio = ((pointer_x - track_left) / track_width).clamp(0.0, 1.0);
-    Some(media.start_100ns + (duration as f32 * ratio) as i64)
+
+    let is_docked = app.quota_docked;
+    let language = app.language;
+    let quota_snapshot = app.quota_snapshot.clone();
+
+    let mut user_toggled_dock = false;
+    let mut user_closed_window = false;
+    let mut user_drag_started = false;
+    let mut user_drag_stopped = false;
+    let mut detected_dock_change = None;
+    let mut detected_new_pos = None;
+    let mut detected_scale_change = None;
+
+    ctx.show_viewport_immediate(quota_viewport_id, builder, |sat_ctx, class| {
+        if class != egui::ViewportClass::Immediate {
+            return;
+        }
+        sat_ctx.set_zoom_factor(scale);
+
+        // Auto-reconcile inner size: ensure satellite window matches exact design dimensions
+        let expected_size = egui::vec2(DESIGN_WIDTH, 176.0);
+        if let Some(current_size) = sat_ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) {
+            if (current_size.x - expected_size.x).abs() > 2.0
+                || (current_size.y - expected_size.y).abs() > 2.0
+            {
+                sat_ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(expected_size));
+            }
+        }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(egui::Color32::TRANSPARENT))
+            .show(sat_ctx, |ui| {
+                let rect = ui.max_rect();
+                let painter = ui.painter();
+
+                // 1:1 Gehäuse-Hintergrund und Rand
+                window_chrome::paint_gradient(painter, rect, BG_TOP, BG_BOTTOM);
+                window_chrome::glass_sheen(painter, rect);
+
+                let border_stroke_color =
+                    egui::Color32::from_rgba_unmultiplied(120, 140, 180, 56);
+                let corner_radius = if is_docked {
+                    egui::CornerRadius {
+                        nw: 0,
+                        ne: 0,
+                        sw: 10,
+                        se: 10,
+                    }
+                } else {
+                    egui::CornerRadius::same(10)
+                };
+                painter.rect_stroke(
+                    rect,
+                    corner_radius,
+                    egui::Stroke::new(1.0, border_stroke_color),
+                    egui::StrokeKind::Inside,
+                );
+
+                if is_docked {
+                    // Top seam line between the two docked windows
+                    painter.line_segment(
+                        [rect.left_top(), rect.right_top()],
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(80, 100, 140, 130),
+                        ),
+                    );
+                }
+
+                // Titelleiste
+                let titlebar_height = 26.0;
+                let titlebar_rect = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(rect.width(), titlebar_height),
+                );
+                let tb_corners = if is_docked {
+                    egui::CornerRadius::ZERO
+                } else {
+                    egui::CornerRadius {
+                        nw: 9,
+                        ne: 9,
+                        sw: 0,
+                        se: 0,
+                    }
+                };
+                painter.rect_filled(titlebar_rect, tb_corners, WINDOW_CONTROL_HOOD_FILL);
+                painter.line_segment(
+                    [titlebar_rect.left_bottom(), titlebar_rect.right_bottom()],
+                    egui::Stroke::new(1.0, WINDOW_CONTROL_HOOD_STROKE),
+                );
+
+                // Procedural Grip Dots (no missing emoji glyphs)
+                let grip_dot_color = egui::Color32::from_rgb(100, 116, 139);
+                for col in 0..2 {
+                    let dot_x = titlebar_rect.left() + 9.0 + col as f32 * 4.0;
+                    for row in 0..3 {
+                        let dot_y = titlebar_rect.center().y - 4.5 + row as f32 * 4.5;
+                        painter.circle_filled(egui::pos2(dot_x, dot_y), 1.3, grip_dot_color);
+                    }
+                }
+
+                // Clean title: LIMITS
+                let title_galley = painter.layout_no_wrap(
+                    language.text("LIMITS", "LIMITS").into(),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_rgb(253, 186, 116),
+                );
+                painter.galley(
+                    egui::pos2(
+                        titlebar_rect.left() + 22.0,
+                        titlebar_rect.center().y - title_galley.size().y / 2.0,
+                    ),
+                    title_galley,
+                    egui::Color32::from_rgb(253, 186, 116),
+                );
+
+                // Controls on the right:
+                // Close button:
+                let close_size = 18.0;
+                let close_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        titlebar_rect.right() - close_size - 5.0,
+                        titlebar_rect.center().y - close_size / 2.0,
+                    ),
+                    egui::vec2(close_size, close_size),
+                );
+                let close_resp = ui
+                    .interact(
+                        close_rect,
+                        ui.make_persistent_id("sat_close_btn"),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_text(language.text("Schließen", "Close"));
+                if close_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    painter.rect_filled(
+                        close_rect,
+                        egui::CornerRadius::same(4),
+                        egui::Color32::from_rgb(190, 65, 78),
+                    );
+                }
+                // Procedural X: two lines, never breaks or shows tofu boxes
+                let c = close_rect.center();
+                let r = 4.0;
+                let x_color = if close_resp.hovered() {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::from_rgb(203, 213, 225)
+                };
+                painter.line_segment(
+                    [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
+                    egui::Stroke::new(1.5, x_color),
+                );
+                painter.line_segment(
+                    [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
+                    egui::Stroke::new(1.5, x_color),
+                );
+                if close_resp.clicked() {
+                    user_closed_window = true;
+                }
+
+                // Action button: compact vector icon button for dock/undock
+                let action_size = 20.0;
+                let action_btn_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        close_rect.left() - action_size - 4.0,
+                        titlebar_rect.center().y - action_size / 2.0,
+                    ),
+                    egui::vec2(action_size, action_size),
+                );
+                let action_resp = ui
+                    .interact(
+                        action_btn_rect,
+                        ui.make_persistent_id("sat_action_btn"),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_text(if is_docked {
+                        language.text("Abdocken / Lösen", "Detach")
+                    } else {
+                        language.text("Magnetisch andocken", "Dock")
+                    });
+                let action_hovered = action_resp.hovered();
+                if action_hovered {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    painter.rect_filled(
+                        action_btn_rect,
+                        egui::CornerRadius::same(4),
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25),
+                    );
+                }
+                let icon_color = if action_hovered {
+                    egui::Color32::WHITE
+                } else if is_docked {
+                    egui::Color32::from_rgb(56, 189, 248)
+                } else {
+                    egui::Color32::from_rgb(74, 222, 128)
+                };
+                let stroke = egui::Stroke::new(1.4, icon_color);
+                let ac = action_btn_rect.center();
+                if is_docked {
+                    // Detach: horizontal bar at top + arrow pointing down away from it
+                    painter.line_segment(
+                        [egui::pos2(ac.x - 4.5, ac.y - 4.5), egui::pos2(ac.x + 4.5, ac.y - 4.5)],
+                        stroke,
+                    );
+                    painter.line_segment([egui::pos2(ac.x, ac.y - 1.5), egui::pos2(ac.x, ac.y + 4.5)], stroke);
+                    painter.line_segment([egui::pos2(ac.x - 2.5, ac.y + 2.0), egui::pos2(ac.x, ac.y + 4.5)], stroke);
+                    painter.line_segment([egui::pos2(ac.x + 2.5, ac.y + 2.0), egui::pos2(ac.x, ac.y + 4.5)], stroke);
+                } else {
+                    // Dock: horizontal bar at top + arrow pointing up into it
+                    painter.line_segment(
+                        [egui::pos2(ac.x - 4.5, ac.y - 4.5), egui::pos2(ac.x + 4.5, ac.y - 4.5)],
+                        stroke,
+                    );
+                    painter.line_segment([egui::pos2(ac.x, ac.y + 4.5), egui::pos2(ac.x, ac.y - 1.5)], stroke);
+                    painter.line_segment([egui::pos2(ac.x - 2.5, ac.y + 1.0), egui::pos2(ac.x, ac.y - 1.5)], stroke);
+                    painter.line_segment([egui::pos2(ac.x + 2.5, ac.y + 1.0), egui::pos2(ac.x, ac.y - 1.5)], stroke);
+                }
+                if action_resp.clicked() {
+                    user_toggled_dock = true;
+                }
+
+                // Titlebar Drag handle interaction (no redundant 0px badge):
+                let drag_handle_rect = egui::Rect::from_min_max(
+                    titlebar_rect.min,
+                    egui::pos2(action_btn_rect.left() - 4.0, titlebar_rect.bottom()),
+                );
+                let drag_resp = ui.interact(
+                    drag_handle_rect,
+                    ui.make_persistent_id("sat_titlebar_drag_handle"),
+                    egui::Sense::drag(),
+                );
+                if drag_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if drag_resp.drag_started() {
+                    if is_docked {
+                        // Immediately undock on pull away
+                        detected_dock_change = Some(false);
+                    }
+                    user_drag_started = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                // Provider Rows (GLM, AGI, Codex) - no filler text
+                let rows_top = titlebar_rect.bottom() + 4.0;
+                let row_height = 42.0;
+                let row_gap = 4.0;
+
+                for (idx, quota) in quota_snapshot.providers.iter().enumerate() {
+                    let y = rows_top + idx as f32 * (row_height + row_gap);
+                    let row_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + 8.0, y),
+                        egui::vec2(rect.width() - 16.0, row_height),
+                    );
+                    draw_provider_row(painter, row_rect, quota, language);
+                }
+
+                // Interactive proportional resize grip in the bottom-right corner:
+                let sat_grip = resize_grip_rect(rect);
+                let sat_grip_resp = ui
+                    .interact(
+                        sat_grip,
+                        ui.make_persistent_id("sat_window_resize_grip"),
+                        egui::Sense::drag(),
+                    )
+                    .on_hover_text(language.text("Größe anpassen", "Resize"));
+                if sat_grip_resp.drag_started() {
+                    let pointer = ui
+                        .ctx()
+                        .input(|input| input.pointer.interact_pos())
+                        .unwrap_or(sat_grip.right_bottom());
+                    let initial_window_size = ui
+                        .ctx()
+                        .input(|input| input.viewport().inner_rect.map(|rect| rect.size()))
+                        .unwrap_or_else(|| rect.size());
+                    app.quota_resize_drag = Some((
+                        physical_pointer(ui.ctx(), pointer),
+                        app.scale,
+                        initial_window_size,
+                    ));
+                    app.resize_preview_scale = Some(app.scale);
+                    app.resize_preview_window_size = None;
+                }
+                if let Some((start_pointer, initial_scale, initial_window_size)) = app.quota_resize_drag {
+                    let primary_down = ui.ctx().input(|input| input.pointer.primary_down());
+                    if primary_down
+                        && let Some(pointer) = ui.ctx().input(|input| input.pointer.interact_pos())
+                    {
+                        let pointer = physical_pointer(ui.ctx(), pointer);
+                        let delta = pointer.x - start_pointer.x;
+                        let native_pixels_per_point =
+                            ui.ctx().native_pixels_per_point().unwrap_or(1.0);
+                        let scale_delta = delta / (DESIGN_WIDTH * native_pixels_per_point);
+                        let requested_scale = initial_scale + scale_delta;
+                        let preview_scale =
+                            window_settings::clamp_live_status_scale(requested_scale);
+                        app.resize_preview_scale = Some(preview_scale);
+
+                        let preview_window_size =
+                            initial_window_size * (preview_scale / initial_scale.max(f32::EPSILON));
+                        let native_preview_size =
+                            resize_drag_native_size(initial_window_size, preview_window_size);
+                        let should_resize = app.resize_preview_window_size.is_none_or(|last| {
+                            (last.x - native_preview_size.x).abs() > 1.0
+                                || (last.y - native_preview_size.y).abs() > 1.0
+                        });
+                        if should_resize {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::InnerSize(native_preview_size));
+                            let main_native_preview_size = egui::vec2(
+                                native_preview_size.x,
+                                DESIGN_HEIGHT * (native_preview_size.x / DESIGN_WIDTH),
+                            );
+                            ui.ctx().send_viewport_cmd_to(
+                                egui::ViewportId::ROOT,
+                                egui::ViewportCommand::InnerSize(main_native_preview_size),
+                            );
+                            app.resize_preview_window_size = Some(native_preview_size);
+                        }
+                    }
+                    if sat_grip_resp.drag_stopped() || !primary_down {
+                        if let Some(preview_scale) = app.resize_preview_scale {
+                            detected_scale_change = Some(preview_scale);
+                        }
+                        app.quota_resize_drag = None;
+                        app.resize_preview_scale = None;
+                        app.resize_preview_window_size = None;
+                        app.window_drag_started = true;
+                    }
+                }
+                if sat_grip_resp.hovered() || sat_grip_resp.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                }
+                let grip_color = if sat_grip_resp.hovered() || sat_grip_resp.dragged() {
+                    egui::Color32::from_rgba_unmultiplied(226, 232, 240, 180)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(148, 163, 184, 80)
+                };
+                for offset in [0.0, 5.0, 10.0] {
+                    painter.line_segment(
+                        [
+                            egui::pos2(sat_grip.right() - 4.0 - offset, sat_grip.bottom() - 1.0),
+                            egui::pos2(sat_grip.right() - 1.0, sat_grip.bottom() - 4.0 - offset),
+                        ],
+                        egui::Stroke::new(1.0, grip_color),
+                    );
+                }
+                if let Some(preview_scale) = app.resize_preview_scale {
+                    let preview_rect = resize_preview_target_rect(rect, app.scale, preview_scale);
+                    let preview_color = egui::Color32::from_rgba_unmultiplied(147, 197, 253, 230);
+                    let preview_fill = egui::Color32::from_rgba_unmultiplied(15, 31, 56, 128);
+
+                    let (corner_radius, inner_corner_radius) = if is_docked {
+                        (
+                            egui::CornerRadius {
+                                nw: 0,
+                                ne: 0,
+                                sw: 8,
+                                se: 8,
+                            },
+                            egui::CornerRadius {
+                                nw: 0,
+                                ne: 0,
+                                sw: 6,
+                                se: 6,
+                            },
+                        )
+                    } else {
+                        (egui::CornerRadius::same(8), egui::CornerRadius::same(6))
+                    };
+
+                    painter.rect_filled(preview_rect, corner_radius, preview_fill);
+                    painter.rect_stroke(
+                        preview_rect,
+                        corner_radius,
+                        egui::Stroke::new(1.0, preview_color),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.rect_stroke(
+                        preview_rect.shrink(4.0),
+                        inner_corner_radius,
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(226, 232, 240, 65),
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+
+                    let target_width = (DESIGN_WIDTH * preview_scale).round() as u32;
+                    let target_height = (176.0 * preview_scale).round() as u32;
+                    let label = format!(
+                        "{:.0} % · {} × {} px",
+                        preview_scale * 100.0,
+                        target_width,
+                        target_height
+                    );
+                    let galley = painter.layout_no_wrap(label, egui::FontId::proportional(10.0), TEXT);
+                    let label_rect = resize_preview_label_rect(rect, preview_rect, galley.size());
+                    painter.rect_filled(
+                        label_rect,
+                        egui::CornerRadius::same(5),
+                        egui::Color32::from_rgba_unmultiplied(15, 23, 42, 225),
+                    );
+                    painter.rect_stroke(
+                        label_rect,
+                        egui::CornerRadius::same(5),
+                        egui::Stroke::new(1.0, preview_color),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.galley(label_rect.center() - galley.size() / 2.0, galley, TEXT);
+                }
+
+                // Handle magnetic snapping and position tracking:
+                let sat_outer = ui.ctx().input(|i| i.viewport().outer_rect);
+                let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+                if !primary_down {
+                    if app.quota_drag_active {
+                        user_drag_stopped = true;
+                    }
+                    if let Some(sat) = sat_outer
+                        && let Some(main) = main_outer_rect
+                    {
+                        let dock_target = egui::pos2(main.min.x, main.max.y - dock_overlap);
+                        let delta_x = (sat.min.x - dock_target.x).abs();
+                        let delta_y = (sat.min.y - dock_target.y).abs();
+                        if is_docked {
+                            if delta_x > 1.0 || delta_y > 1.0 {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                    dock_target,
+                                ));
+                            }
+                        } else if delta_x <= 35.0 && delta_y <= 35.0 {
+                            // User dragged it close: Magnetic Snap!
+                            detected_dock_change = Some(true);
+                            detected_new_pos = Some([dock_target.x, dock_target.y]);
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                dock_target,
+                            ));
+                        } else {
+                            detected_new_pos = Some([sat.min.x, sat.min.y]);
+                        }
+                    }
+                }
+            });
+    });
+
+    // Apply state changes from the viewport:
+    if user_closed_window {
+        app.quota_open = false;
+        let _ = window_settings::set_live_status_quota_open(false);
+    }
+    if user_drag_started {
+        app.quota_drag_active = true;
+    }
+    if user_drag_stopped {
+        app.quota_drag_active = false;
+    }
+    if user_toggled_dock {
+        app.quota_docked = !app.quota_docked;
+        let _ = window_settings::set_live_status_quota_docked(app.quota_docked);
+        if !app.quota_docked {
+            // Abschieben: move down by 35px
+            if let Some(main) = main_outer_rect {
+                let detached_pos = [main.min.x, main.max.y + 35.0 * scale];
+                app.quota_pos = Some(detached_pos);
+                let _ = window_settings::set_live_status_quota_position(detached_pos);
+                ctx.send_viewport_cmd_to(
+                    quota_viewport_id,
+                    egui::ViewportCommand::OuterPosition(egui::pos2(
+                        detached_pos[0],
+                        detached_pos[1],
+                    )),
+                );
+            }
+        } else if let Some(main) = main_outer_rect {
+            // Andocken: snap back to seamless 0px gap
+            let docked_pos = [main.min.x, main.max.y - dock_overlap];
+            app.quota_pos = Some(docked_pos);
+            let _ = window_settings::set_live_status_quota_position(docked_pos);
+            ctx.send_viewport_cmd_to(
+                quota_viewport_id,
+                egui::ViewportCommand::OuterPosition(egui::pos2(
+                    docked_pos[0],
+                    docked_pos[1],
+                )),
+            );
+        }
+    }
+    if let Some(docked) = detected_dock_change {
+        app.quota_docked = docked;
+        let _ = window_settings::set_live_status_quota_docked(docked);
+    }
+    if let Some(pos) = detected_new_pos {
+        app.quota_pos = Some(pos);
+        let _ = window_settings::set_live_status_quota_position(pos);
+    }
+    if let Some(new_scale) = detected_scale_change {
+        apply_live_status_scale(app, ctx, new_scale, true);
+    }
+}
+
+fn draw_provider_row(
+    painter: &egui::Painter,
+    row_rect: egui::Rect,
+    quota: &ProviderQuota,
+    language: Language,
+) {
+    // Row card background
+    painter.rect_filled(
+        row_rect,
+        egui::CornerRadius::same(6),
+        egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140),
+    );
+    painter.rect_stroke(
+        row_rect,
+        egui::CornerRadius::same(6),
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 90)),
+        egui::StrokeKind::Inside,
+    );
+
+    // Single crisp pill on the left: GLM, AGI, Codex (no redundant subtitle pill)
+    let (pill_title_bg, pill_title_stroke, pill_title_color) = match quota.id {
+        ProviderId::Glm => (
+            egui::Color32::from_rgba_unmultiplied(251, 146, 60, 32),
+            egui::Color32::from_rgba_unmultiplied(251, 146, 60, 140),
+            egui::Color32::from_rgb(253, 186, 116),
+        ),
+        ProviderId::Agy => (
+            egui::Color32::from_rgba_unmultiplied(192, 132, 252, 32),
+            egui::Color32::from_rgba_unmultiplied(192, 132, 252, 140),
+            egui::Color32::from_rgb(216, 180, 254),
+        ),
+        ProviderId::Codex => (
+            egui::Color32::from_rgba_unmultiplied(248, 113, 113, 35),
+            egui::Color32::from_rgba_unmultiplied(248, 113, 113, 140),
+            egui::Color32::from_rgb(252, 165, 165),
+        ),
+    };
+
+    let title_pill_rect = egui::Rect::from_min_size(
+        egui::pos2(row_rect.left() + 7.0, row_rect.center().y - 12.0),
+        egui::vec2(46.0, 24.0),
+    );
+    painter.rect_filled(title_pill_rect, egui::CornerRadius::same(4), pill_title_bg);
+    painter.rect_stroke(
+        title_pill_rect,
+        egui::CornerRadius::same(4),
+        egui::Stroke::new(1.0, pill_title_stroke),
+        egui::StrokeKind::Inside,
+    );
+    let title_galley = painter.layout_no_wrap(
+        quota.title.into(),
+        egui::FontId::proportional(12.5),
+        pill_title_color,
+    );
+    painter.galley(
+        egui::pos2(
+            title_pill_rect.center().x - title_galley.size().x / 2.0,
+            title_pill_rect.center().y - title_galley.size().y / 2.0,
+        ),
+        title_galley,
+        pill_title_color,
+    );
+
+    // Dual Gauges (5h & Wk) in the center column:
+    let gauge_col_left = row_rect.left() + 59.0;
+    let gauge_line_width = 44.0;
+
+    // Line 1: 5h
+    let y_5h = row_rect.top() + 7.0;
+    let tag_5h_galley = painter.layout_no_wrap(
+        "5h".into(),
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_rgb(148, 163, 184),
+    );
+    painter.galley(
+        egui::pos2(gauge_col_left, y_5h),
+        tag_5h_galley,
+        egui::Color32::from_rgb(148, 163, 184),
+    );
+
+    let track_rect_5h = egui::Rect::from_min_size(
+        egui::pos2(gauge_col_left + 20.0, y_5h + 3.5),
+        egui::vec2(gauge_line_width, 6.0),
+    );
+    painter.rect_filled(
+        track_rect_5h,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_rgb(15, 20, 32),
+    );
+
+    if let Some(pct) = quota.five_hour_percent {
+        let fill_width = (gauge_line_width * (pct as f32 / 100.0)).clamp(0.0, gauge_line_width);
+        let fill_color = if pct < 20 {
+            RED
+        } else if quota.id == ProviderId::Agy {
+            egui::Color32::from_rgb(56, 189, 248)
+        } else {
+            egui::Color32::from_rgb(52, 211, 153)
+        };
+        painter.rect_filled(
+            egui::Rect::from_min_size(track_rect_5h.min, egui::vec2(fill_width, 6.0)),
+            egui::CornerRadius::same(3),
+            fill_color,
+        );
+
+        // High-contrast BOLD pure white percentage
+        let pct_color = if pct < 20 {
+            egui::Color32::from_rgb(254, 202, 202)
+        } else {
+            egui::Color32::WHITE
+        };
+        let pct_galley = painter.layout_no_wrap(
+            format!("{pct}%"),
+            egui::FontId::proportional(12.5),
+            pct_color,
+        );
+        painter.galley(
+            egui::pos2(track_rect_5h.right() + 5.0, y_5h - 1.0),
+            pct_galley,
+            pct_color,
+        );
+
+        if let Some(reset) = &quota.five_hour_reset {
+            let reset_galley = painter.layout_no_wrap(
+                reset.clone(),
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_rgb(148, 163, 184),
+            );
+            painter.galley(
+                egui::pos2(track_rect_5h.right() + 38.0, y_5h + 0.5),
+                reset_galley,
+                egui::Color32::from_rgb(148, 163, 184),
+            );
+        }
+    } else {
+        let none_galley =
+            painter.layout_no_wrap("—".into(), egui::FontId::proportional(11.5), GRAY);
+        painter.galley(
+            egui::pos2(track_rect_5h.right() + 5.0, y_5h - 1.0),
+            none_galley,
+            GRAY,
+        );
+        let no_limit_galley = painter.layout_no_wrap(
+            language.text("kein Limit", "no limit").into(),
+            egui::FontId::proportional(9.0),
+            GRAY,
+        );
+        painter.galley(
+            egui::pos2(track_rect_5h.right() + 20.0, y_5h + 1.0),
+            no_limit_galley,
+            GRAY,
+        );
+    }
+
+    // Line 2: Wk
+    let y_wk = row_rect.top() + 23.0;
+    let tag_wk_galley = painter.layout_no_wrap(
+        "Wk".into(),
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_rgb(148, 163, 184),
+    );
+    painter.galley(
+        egui::pos2(gauge_col_left, y_wk),
+        tag_wk_galley,
+        egui::Color32::from_rgb(148, 163, 184),
+    );
+
+    let track_rect_wk = egui::Rect::from_min_size(
+        egui::pos2(gauge_col_left + 20.0, y_wk + 3.5),
+        egui::vec2(gauge_line_width, 6.0),
+    );
+    painter.rect_filled(
+        track_rect_wk,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_rgb(15, 20, 32),
+    );
+
+    if let Some(pct) = quota.week_percent {
+        let fill_width = (gauge_line_width * (pct as f32 / 100.0)).clamp(0.0, gauge_line_width);
+        let fill_color = if pct == 0 || quota.is_throttled {
+            RED
+        } else if quota.id == ProviderId::Agy {
+            egui::Color32::from_rgb(56, 189, 248)
+        } else {
+            egui::Color32::from_rgb(52, 211, 153)
+        };
+        if fill_width > 0.0 {
+            painter.rect_filled(
+                egui::Rect::from_min_size(track_rect_wk.min, egui::vec2(fill_width, 6.0)),
+                egui::CornerRadius::same(3),
+                fill_color,
+            );
+        }
+
+        // High-contrast BOLD percentage
+        let pct_color = if pct == 0 || quota.is_throttled {
+            egui::Color32::from_rgb(254, 202, 202)
+        } else {
+            egui::Color32::WHITE
+        };
+        let pct_galley = painter.layout_no_wrap(
+            format!("{pct}%"),
+            egui::FontId::proportional(12.5),
+            pct_color,
+        );
+        painter.galley(
+            egui::pos2(track_rect_wk.right() + 5.0, y_wk - 1.0),
+            pct_galley,
+            pct_color,
+        );
+
+        if let Some(reset) = &quota.week_reset {
+            let reset_color = if quota.is_throttled {
+                egui::Color32::from_rgb(252, 165, 165)
+            } else {
+                egui::Color32::from_rgb(148, 163, 184)
+            };
+            let reset_galley = painter.layout_no_wrap(
+                reset.clone(),
+                egui::FontId::proportional(10.0),
+                reset_color,
+            );
+            painter.galley(
+                egui::pos2(track_rect_wk.right() + 38.0, y_wk + 0.5),
+                reset_galley,
+                reset_color,
+            );
+        }
+    }
+
+    // Pacing & Forecast Radar Card on the right:
+    let forecast = quota.pacing_forecast();
+    let card_left = row_rect.left() + 204.0;
+    let card_right = row_rect.right() - 6.0;
+    let card_rect = egui::Rect::from_min_max(
+        egui::pos2(card_left, row_rect.center().y - 15.0),
+        egui::pos2(card_right, row_rect.center().y + 15.0),
+    );
+
+    let (card_bg, card_border, led_color, badge_color, summary_color, status_chip_text) = match forecast.health {
+        PacingHealth::Surplus => (
+            egui::Color32::from_rgba_unmultiplied(16, 42, 32, 180),
+            egui::Color32::from_rgba_unmultiplied(34, 197, 94, 90),
+            egui::Color32::from_rgb(34, 197, 94),
+            egui::Color32::from_rgb(187, 247, 208),
+            egui::Color32::from_rgb(160, 180, 205),
+            "OK",
+        ),
+        PacingHealth::OnTrack => (
+            egui::Color32::from_rgba_unmultiplied(16, 38, 48, 180),
+            egui::Color32::from_rgba_unmultiplied(56, 189, 248, 90),
+            egui::Color32::from_rgb(56, 189, 248),
+            egui::Color32::from_rgb(186, 230, 253),
+            egui::Color32::from_rgb(160, 180, 205),
+            "OK",
+        ),
+        PacingHealth::Tight => (
+            egui::Color32::from_rgba_unmultiplied(54, 34, 14, 180),
+            egui::Color32::from_rgba_unmultiplied(245, 158, 11, 140),
+            egui::Color32::from_rgb(245, 158, 11),
+            egui::Color32::from_rgb(254, 215, 170),
+            egui::Color32::from_rgb(253, 186, 116),
+            "WARN",
+        ),
+        PacingHealth::Throttled => (
+            egui::Color32::from_rgba_unmultiplied(54, 20, 24, 180),
+            egui::Color32::from_rgba_unmultiplied(239, 68, 68, 140),
+            egui::Color32::from_rgb(239, 68, 68),
+            egui::Color32::from_rgb(254, 202, 202),
+            egui::Color32::from_rgb(248, 113, 113),
+            "HALT",
+        ),
+    };
+
+    painter.rect_filled(card_rect, egui::CornerRadius::same(4), card_bg);
+    painter.rect_stroke(
+        card_rect,
+        egui::CornerRadius::same(4),
+        egui::Stroke::new(1.0, card_border),
+        egui::StrokeKind::Inside,
+    );
+
+    // Procedural Hardware Micro-LED
+    let led_center = egui::pos2(card_rect.left() + 9.0, card_rect.top() + 8.5);
+    painter.circle_filled(
+        led_center,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(led_color.r(), led_color.g(), led_color.b(), 55),
+    );
+    painter.circle_filled(led_center, 2.2, led_color);
+
+    // Upper line: Pacing badge text (bold)
+    let badge_galley = painter.layout_no_wrap(
+        forecast.localized_badge_text(language).into(),
+        egui::FontId::proportional(11.0),
+        badge_color,
+    );
+    painter.galley(
+        egui::pos2(card_rect.left() + 17.0, card_rect.top() + 2.5),
+        badge_galley,
+        badge_color,
+    );
+
+    // Lower line: Forecast runway / reset text
+    let summary_galley = painter.layout_no_wrap(
+        forecast.localized_summary_text(language).into(),
+        egui::FontId::proportional(10.0),
+        summary_color,
+    );
+    painter.galley(
+        egui::pos2(card_rect.left() + 17.0, card_rect.top() + 15.5),
+        summary_galley,
+        summary_color,
+    );
+
+    // Chip tag on far right (OK, WARN, HALT)
+    let chip_width = 28.0;
+    let chip_rect = egui::Rect::from_min_size(
+        egui::pos2(card_rect.right() - chip_width - 4.0, card_rect.center().y - 8.0),
+        egui::vec2(chip_width, 16.0),
+    );
+    painter.rect_filled(
+        chip_rect,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_rgba_unmultiplied(led_color.r(), led_color.g(), led_color.b(), 25),
+    );
+    painter.rect_stroke(
+        chip_rect,
+        egui::CornerRadius::same(3),
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(led_color.r(), led_color.g(), led_color.b(), 90),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let chip_galley = painter.layout_no_wrap(
+        status_chip_text.into(),
+        egui::FontId::proportional(9.0),
+        badge_color,
+    );
+    painter.galley(
+        egui::pos2(
+            chip_rect.center().x - chip_galley.size().x / 2.0,
+            chip_rect.center().y - chip_galley.size().y / 2.0,
+        ),
+        chip_galley,
+        badge_color,
+    );
 }
 
 fn blend_media_colors(
