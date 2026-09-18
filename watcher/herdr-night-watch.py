@@ -195,6 +195,8 @@ def windows_boot_id(deadline: float | None = None) -> str | None:
                     "powershell.exe",
                     "-NoProfile",
                     "-NonInteractive",
+                    "-WindowStyle",
+                    "Hidden",
                     "-Command",
                     query,
                 ],
@@ -912,7 +914,7 @@ def request_windows_sleep() -> None:
         "throw 'Windows could not enter sleep mode.' }"
     )
     completed = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", command],
         text=True,
         capture_output=True,
         check=False,
@@ -932,7 +934,7 @@ def request_windows_shutdown_now() -> None:
         "/c 'Herdr night watch: completion confirmed.'"
     )
     completed = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", command],
         text=True,
         capture_output=True,
         check=False,
