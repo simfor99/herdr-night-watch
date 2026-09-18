@@ -1,6 +1,6 @@
 # Herdr Night Watch
 
-A small Windows tray app, live Herdr dashboard, lightweight Windows system monitor, and media-session companion for the existing fail-closed Herdr night watcher.
+A small Windows tray app, live Herdr dashboard, magnetic AI budget limits dock with pacing radar, lightweight Windows system monitor, and media-session companion for the existing fail-closed Herdr night watcher.
 
 The app controls the robust WSL background watcher; it does not replace it.
 
@@ -10,9 +10,9 @@ This repository contains the Rust tray app, the Python watcher, Windows scripts,
 
 We often let Herdr run overnight because Compound Engineering plans can become very large. Once such a plan starts, several agents may continue working autonomously for hours. The computer does not need to stay on all night, though: when all work is complete, Windows should reliably enter sleep mode or shut down.
 
-That handoff between “Herdr is finished” and “Windows may go to sleep” was not reliably solved before. Herdr Night Watch closes that gap: it monitors the agents fail-closed, makes the current state visible, and performs the selected power action only after a configurable warning period. The same compact window is also a useful “what is my computer doing right now?” surface: it shows the Herdr workload, CPU/RAM/GPU/VRAM and GPU power telemetry, weather for a chosen place, and the music that Windows currently considers active.
+That handoff between “Herdr is finished” and “Windows may go to sleep” was not reliably solved before. Herdr Night Watch closes that gap: it monitors the agents fail-closed, makes the current state visible, and performs the selected power action only after a configurable warning period. The same compact window is also a useful “what is my computer doing right now?” surface: it shows the Herdr workload, real-time AI quota budgets (GLM, AGY, Codex) with dynamic pacing radar, CPU/RAM/GPU/VRAM and GPU power telemetry, weather for a chosen place, and the music that Windows currently considers active.
 
-The interface supports Deutsch and English. Change the language from the tray right-click menu under “Sprache / Language”. The live window also provides a compact system monitor for CPU, RAM, GPU, occupied VRAM, and NVIDIA GPU power use.
+The interface supports Deutsch and English. Change the language from the tray right-click menu under “Sprache / Language”. The live window also provides an attachable magnetic satellite dock for AI rate limits, bidirectional scaling with live size preview, and a compact system monitor for CPU, RAM, GPU, occupied VRAM, and NVIDIA GPU power use.
 
 ## Agent support and setup
 
@@ -59,9 +59,9 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 
 ## Live status
 
-![Herdr Night Watch live status in German](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.20/live-status-de.png)
+![Herdr Night Watch live status in German](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.34/live-status-de.png)
 
-![Herdr Night Watch live status in English](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.20/live-status-en.png)
+![Herdr Night Watch live status in English](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.34/live-status-en.png)
 
 The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer turns it into a quick system monitor without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed. The small upper-right control hood opens the last 30 completion actions and cycles the window between normal, always-on-top, and always-in-background modes. Its glass surfaces use a subtle top reflection to keep the dashboard calm but tactile. The tray menu lets you choose window opacity from 100% down to 10%.
 
@@ -91,6 +91,8 @@ A dedicated magnetic satellite dock can be opened directly below the live status
 - **Stop and cancel shutdown**: ends the run and removes only the watcher's own warning; Windows is not asked to shut down until the warning has completed.
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.
 - **Open live status**: opens a freely movable status window that can be closed at any time. Left-clicking the tray icon opens it; right-clicking shows the menu.
+- **AI budget limits and pacing forecast**: click the `⚡` lightning toggle in the live-status footer or right-click to attach/detach the AI limits satellite dock. It displays real-time 5-hour burst limits and weekly usage for GLM, AGY, and Codex, dynamic burn-rate analysis relative to cycle time, and exact depletion forecasts (`Schluss: DD.MM.` / `Empty: DD.MM.`).
+- **Synchronized live resize preview**: dragging the tactile grip on either window smoothly displays a translucent blue preview rectangle with real-time scaling percentage and exact dimensions (`{scale}% · {W} × {H} px`), keeping both windows perfectly in sync.
 - **Reliable live window**: opening the live status again restores and focuses the existing window instead of creating a duplicate. Its last desktop position is stored locally and reused after the next start.
 - **Proportional live-window scaling**: drag the subtle handle in the lower-right corner to enlarge or shrink the complete live window freely. Text, moon, KPI cards, metrics, media pills, and timeline stay proportional. The selected scale is stored locally; right-click an empty area and choose **Reset to 100%** whenever you want to return to the default size.
 - **Finished-agent glow**: when Herdr reports completed work, the finished count turns green with the previous warm yellow halo. The light contour around the digit stays one screen pixel thick, even when the live window is scaled up.
