@@ -1,5 +1,10 @@
 # Changelog - Herdr-Nachtwächter
 
+## [2026-09-15] - Aktualisierungsrate gegen den Schwarzblitz v0.1.33
+
+- **Rate im Rechtsklickmenü wählbar** - Die Blitz-Sonde hat gezeigt, dass der Schwarzblitz des Live-Fensters zufällig bei jedem Bildaufbau auftreten kann und nicht von der Grafiklast abhängt. Die lastabhängige Drosselung ist deshalb entfallen. Das Rechtsklickmenü bietet jetzt „Aktualisierungsrate“ mit Flüssig (250 ms), Mittel (500 ms) und Sekündlich (1000 ms); die Wahl bleibt über Neustarts erhalten. Weniger Bildaufbauten bedeuten deutlich seltener einen Blitz.
+- **PowerShell bleibt unsichtbar** - Boot-Abfrage, Energiesparmodus und Herunterfahren des Wächters öffnen keine PowerShell-Konsole mehr auf dem Bildschirm.
+
 ## [2026-09-01] - Abschlussprotokoll verliert keine Nachtläufe mehr v0.1.28
 
 - **Shutdown erst nach dem Logeintrag** - Der Wächter startet während der sichtbaren Warnfrist keinen parallelen Windows-Countdown mehr. Nach der letzten Sicherheitsprüfung schreibt er zuerst Verlauf und Endzustand und fordert Windows erst danach zum sofortigen Herunterfahren auf.
