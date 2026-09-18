@@ -47,17 +47,6 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // seconds caused the tray opener to kill a healthy process during startup.
 const LIVE_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
-// The default cadence only exists so the smoothed second hand glides. While
-// the GPU is heavily loaded, every repaint is a black-flash risk for the
-// OpenGL surface because the compositor is starved for frame budget. Stepping
-// the hand once per second then cuts that risk to a quarter.
-const LIVE_WINDOW_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
-const LIVE_WINDOW_THROTTLED_REPAINT_INTERVAL: Duration = Duration::from_secs(1);
-const LIVE_WINDOW_REPAINT_THROTTLE_GPU_PERCENT: u8 = 80;
-// The PDH GPU-engine counter only books graphics work submitted by Windows
-// processes; WSL CUDA load (the common night-test case) stays invisible
-// there. The card's power draw covers that gap, so throttle on either signal.
-const LIVE_WINDOW_REPAINT_THROTTLE_GPU_POWER_PERCENT: u8 = 60;
 const LIVE_WINDOW_START_ATTEMPTS: usize = 3;
 const LIVE_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
 // eframe keeps the native viewport hidden until it has presented its first
@@ -1428,6 +1417,7 @@ struct LiveStatusApp {
     context_menu_pos: Option<egui::Pos2>,
     clock_visible: bool,
     clock_second_hand_visible: bool,
+    repaint_interval_ms: u32,
     scale: f32,
     last_saved_position: Option<[f32; 2]>,
     owner_pid: Option<u32>,
@@ -1494,6 +1484,7 @@ impl LiveStatusApp {
             context_menu_pos: None,
             clock_visible: window_settings::clock_visible(),
             clock_second_hand_visible: window_settings::clock_second_hand_visible(),
+            repaint_interval_ms: window_settings::live_status_repaint_interval_ms(),
             scale,
             last_saved_position: window_settings::live_status_position(),
             owner_pid,
@@ -2011,21 +2002,12 @@ impl eframe::App for LiveStatusApp {
         handle_window_drag(self, ui);
         persist_window_position(self, ui.ctx());
         controls.paint(ui.painter(), self.window_level);
-        ui.ctx().request_repaint_after(live_status_repaint_interval(&self.metrics));
-    }
-}
-
-fn live_status_repaint_interval(metrics: &SystemMetrics) -> Duration {
-    let utilization_high = metrics
-        .gpu_percent
-        .is_some_and(|percent| percent >= LIVE_WINDOW_REPAINT_THROTTLE_GPU_PERCENT);
-    let power_high = metrics
-        .gpu_power_percent
-        .is_some_and(|percent| percent >= LIVE_WINDOW_REPAINT_THROTTLE_GPU_POWER_PERCENT);
-    if utilization_high || power_high {
-        LIVE_WINDOW_THROTTLED_REPAINT_INTERVAL
-    } else {
-        LIVE_WINDOW_REPAINT_INTERVAL
+        // Each repaint has a small random black-flash chance on the OpenGL
+        // surface (see window_settings::REPAINT_INTERVAL_MS_VALUES), so the
+        // cadence is a user setting instead of a constant.
+        ui.ctx().request_repaint_after(Duration::from_millis(u64::from(
+            self.repaint_interval_ms,
+        )));
     }
 }
 
@@ -2307,12 +2289,21 @@ fn is_live_context_menu_position(rect: egui::Rect, position: egui::Pos2) -> bool
         && !resize_grip_rect(rect).contains(position)
 }
 
+// Radio entries for the context menu; the interval values must stay in
+// sync with window_settings::REPAINT_INTERVAL_MS_VALUES.
+const REPAINT_INTERVAL_CHOICES: [(u32, &str, &str); 3] = [
+    (250, "Flüssig (250 ms)", "Smooth (250 ms)"),
+    (500, "Mittel (500 ms)", "Medium (500 ms)"),
+    (1000, "Sekündlich (1000 ms)", "Once per second (1000 ms)"),
+];
+
 fn context_menu_should_close_after_selection(
     reset_requested: bool,
     clock_visibility_changed: bool,
     second_hand_changed: bool,
+    repaint_interval_changed: bool,
 ) -> bool {
-    reset_requested || clock_visibility_changed || second_hand_changed
+    reset_requested || clock_visibility_changed || second_hand_changed || repaint_interval_changed
 }
 
 fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
@@ -2337,6 +2328,7 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
     let mut reset_requested = false;
     let mut clock_visibility_choice = None;
     let mut second_hand_choice = None;
+    let mut repaint_interval_choice = None;
     let menu = egui::Area::new(egui::Id::new("live_status_context_menu"))
         .order(egui::Order::Foreground)
         .fixed_pos(menu_position + egui::vec2(4.0, 4.0))
@@ -2380,12 +2372,31 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
                 if second_hand_changed {
                     second_hand_choice = Some(show_second_hand);
                 }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
+                        app.language.text("Aktualisierungsrate", "Refresh rate"),
+                    )
+                    .color(GRAY),
+                );
+                for (interval, text_de, text_en) in REPAINT_INTERVAL_CHOICES {
+                    if ui
+                        .radio(
+                            app.repaint_interval_ms == interval,
+                            app.language.text(text_de, text_en),
+                        )
+                        .clicked()
+                    {
+                        repaint_interval_choice = Some(interval);
+                    }
+                }
             });
         });
     let close_after_selection = context_menu_should_close_after_selection(
         reset_requested,
         clock_visibility_choice.is_some(),
         second_hand_choice.is_some(),
+        repaint_interval_choice.is_some(),
     );
     if let Some(show_clock) = clock_visibility_choice {
         match window_settings::set_clock_visible(show_clock) {
@@ -2396,6 +2407,12 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
     if let Some(show_second_hand) = second_hand_choice {
         match window_settings::set_clock_second_hand_visible(show_second_hand) {
             Ok(()) => app.clock_second_hand_visible = show_second_hand,
+            Err(error) => app.error = Some(error.to_string()),
+        }
+    }
+    if let Some(interval) = repaint_interval_choice {
+        match window_settings::set_live_status_repaint_interval_ms(interval) {
+            Ok(()) => app.repaint_interval_ms = interval,
             Err(error) => app.error = Some(error.to_string()),
         }
     }
@@ -5065,16 +5082,19 @@ mod tests {
     #[test]
     fn context_menu_closes_after_every_setting_selection() {
         assert!(context_menu_should_close_after_selection(
-            true, false, false
+            true, false, false, false
         ));
         assert!(context_menu_should_close_after_selection(
-            false, true, false
+            false, true, false, false
         ));
         assert!(context_menu_should_close_after_selection(
-            false, false, true
+            false, false, true, false
+        ));
+        assert!(context_menu_should_close_after_selection(
+            false, false, false, true
         ));
         assert!(!context_menu_should_close_after_selection(
-            false, false, false
+            false, false, false, false
         ));
     }
 

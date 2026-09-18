@@ -11,8 +11,14 @@ const CLOCK_SECOND_HAND_VALUE: &str = "ShowClockSecondHand";
 const LIVE_STATUS_POS_X_VALUE: &str = "LiveStatusPositionX";
 const LIVE_STATUS_POS_Y_VALUE: &str = "LiveStatusPositionY";
 const LIVE_STATUS_SCALE_VALUE: &str = "LiveStatusScale";
+const LIVE_STATUS_REPAINT_VALUE: &str = "LiveStatusRepaintIntervalMs";
 
 pub const OPACITY_VALUES: [u8; 10] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
+// The live-status repaint cadence trades the gliding second hand against
+// the OpenGL black-flash risk: every present has a small random chance to
+// drop the frame, so fewer repaints mean fewer flashes.
+pub const REPAINT_INTERVAL_MS_VALUES: [u32; 3] = [250, 500, 1000];
+pub const DEFAULT_REPAINT_INTERVAL_MS: u32 = 250;
 pub const DEFAULT_LIVE_STATUS_SCALE: f32 = 1.0;
 pub const MIN_LIVE_STATUS_SCALE: f32 = 0.75;
 // This is a safety stop for corrupted settings or an accidental runaway
@@ -131,6 +137,32 @@ pub fn clock_second_hand_visible() -> bool {
     read_bool_setting(CLOCK_SECOND_HAND_VALUE, true)
 }
 
+pub fn live_status_repaint_interval_ms() -> u32 {
+    clamp_repaint_interval_ms(
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(KEY)
+            .and_then(|key| key.get_value::<u32, _>(LIVE_STATUS_REPAINT_VALUE))
+            .ok(),
+    )
+}
+
+pub fn set_live_status_repaint_interval_ms(value: u32) -> anyhow::Result<()> {
+    // Validate instead of clamping: the context menu only offers the three
+    // supported intervals, so anything else is a caller bug worth surfacing.
+    if !REPAINT_INTERVAL_MS_VALUES.contains(&value) {
+        anyhow::bail!("unsupported repaint interval: {value} ms");
+    }
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
+    key.set_value(LIVE_STATUS_REPAINT_VALUE, &value)?;
+    Ok(())
+}
+
+fn clamp_repaint_interval_ms(value: Option<u32>) -> u32 {
+    value
+        .filter(|value| REPAINT_INTERVAL_MS_VALUES.contains(value))
+        .unwrap_or(DEFAULT_REPAINT_INTERVAL_MS)
+}
+
 pub fn set_clock_second_hand_visible(show: bool) -> anyhow::Result<()> {
     write_bool_setting(CLOCK_SECOND_HAND_VALUE, show)
 }
@@ -201,5 +233,21 @@ mod tests {
         assert!(bool_setting_value(None, true));
         assert!(!bool_setting_value(Some(0), true));
         assert!(bool_setting_value(Some(1), true));
+    }
+
+    #[test]
+    fn repaint_interval_accepts_only_the_offered_choices() {
+        assert_eq!(clamp_repaint_interval_ms(None), DEFAULT_REPAINT_INTERVAL_MS);
+        assert_eq!(
+            clamp_repaint_interval_ms(Some(0)),
+            DEFAULT_REPAINT_INTERVAL_MS
+        );
+        assert_eq!(
+            clamp_repaint_interval_ms(Some(333)),
+            DEFAULT_REPAINT_INTERVAL_MS
+        );
+        assert_eq!(clamp_repaint_interval_ms(Some(250)), 250);
+        assert_eq!(clamp_repaint_interval_ms(Some(500)), 500);
+        assert_eq!(clamp_repaint_interval_ms(Some(1000)), 1000);
     }
 }

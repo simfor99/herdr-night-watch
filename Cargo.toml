@@ -1,6 +1,6 @@
 [package]
 name = "herdr-night-watch"
-version = "0.1.29"
+version = "0.1.33"
 edition = "2024"
 description = "Windows tray app and fail-closed watcher for Herdr agent work"
 license = "MIT"
