@@ -53,6 +53,22 @@ const RPC_E_CHANGED_MODE: HRESULT = -2147417850;
 /// Shows or hides the live window's taskbar tab without changing its native
 /// frame, decoration, size, or position.
 pub fn set_visible(hwnd: HWND, visible: bool) -> bool {
+    set_tab_visible(hwnd, visible)
+}
+
+pub fn is_taskbar_style_synced(_hwnd: HWND, _visible: bool) -> bool {
+    true
+}
+
+pub fn is_satellite_exempt_synced(_sat_hwnd: HWND) -> bool {
+    true
+}
+
+pub fn set_satellite_exempt(sat_hwnd: HWND, _owner_hwnd: Option<HWND>) -> bool {
+    set_tab_visible(sat_hwnd, false)
+}
+
+fn set_tab_visible(hwnd: HWND, visible: bool) -> bool {
     unsafe {
         let init_hr = CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32);
         if init_hr < 0 && init_hr != RPC_E_CHANGED_MODE {
@@ -98,3 +114,5 @@ unsafe fn set_visible_inner(hwnd: HWND, visible: bool) -> bool {
     release(taskbar.cast());
     changed
 }
+
+
