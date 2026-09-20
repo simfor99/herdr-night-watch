@@ -18,7 +18,7 @@ WM_USER_TRAYICON = 6002
 
 
 def dump() -> dict:
-    raw = subprocess.check_output(["python.exe", str(DUMP)], text=True)
+    raw = subprocess.check_output(["python.exe", str(DUMP)], text=True, encoding="utf-8", errors="replace")
     return json.loads(raw)
 
 
@@ -67,11 +67,11 @@ def click_tray(payload: dict, double: bool) -> int | None:
 def main() -> int:
     before = dump()
     if live_windows(before):
-        print(json.dumps({"ok": False, "reason": "live_already_open", "before": before}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "reason": "live_already_open", "before": before}, ensure_ascii=True))
         return 2
     hwnd = click_tray(before, double="--double" in sys.argv)
     if hwnd is None:
-        print(json.dumps({"ok": False, "reason": "no_tray_helper", "before": before}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "reason": "no_tray_helper", "before": before}, ensure_ascii=True))
         return 3
     deadline = time.time() + 20
     after = before
@@ -88,7 +88,7 @@ def main() -> int:
                         "live": found,
                         "process_count": len(after.get("processes", [])),
                     },
-                    ensure_ascii=False,
+                    ensure_ascii=True,
                 )
             )
             return 0
@@ -100,7 +100,7 @@ def main() -> int:
                 "clicked_hwnd": hwnd,
                 "after": after,
             },
-            ensure_ascii=False,
+            ensure_ascii=True,
         )
     )
     return 1
