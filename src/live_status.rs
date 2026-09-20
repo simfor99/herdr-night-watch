@@ -7498,7 +7498,7 @@ fn render_quota_tooltip(
                             let h = (delta as f32 / 60.0).round() as i32;
                             format!("+{}h {}", h, language.text("über Reset hinaus", "beyond reset"))
                         } else {
-                            language.text(">24h Puffer stabil", ">24h buffer stable").to_string()
+                            language.text("+>24h Puffer", "+>24h buffer").to_string()
                         };
                         ui.colored_label(egui::Color32::from_rgb(157, 196, 118), buf_text);
                     }
@@ -7572,7 +7572,7 @@ fn render_quota_tooltip(
                         (format!("+{} {}", delta, language.text("Tage Puffer", "days buffer")), egui::Color32::from_rgb(157, 196, 118))
                     }
                 } else {
-                    (language.text("Puffer stabil", "Buffer stable").to_string(), egui::Color32::from_rgb(157, 196, 118))
+                    (language.text("+>30 Tage Puffer", "+>30 days buffer").to_string(), egui::Color32::from_rgb(157, 196, 118))
                 };
                 ui.colored_label(buf_color, status_buf);
                 ui.end_row();

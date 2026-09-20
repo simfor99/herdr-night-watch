@@ -320,7 +320,7 @@ impl PacingForecast {
                     format!("{} ~{mins}m", language.text("Reicht noch", "Lasts"))
                 }
             } else {
-                language.text("Puffer stabil", "Buffer stable").to_string()
+                language.text("Reicht >24h", "Lasts >24h").to_string()
             }
         } else {
             language.text("Kein Limit", "No limit").to_string()
@@ -360,7 +360,7 @@ impl PacingForecast {
                 }
             }
         } else {
-            language.text("Puffer stabil", "Buffer stable").to_string()
+            language.text("Reicht >30 Tage", "Lasts >30 days").to_string()
         }
     }
 
@@ -554,10 +554,10 @@ pub fn calculate_five_hour_forecast(
     // If diff_mins > 300, the recorded reset timestamp is from an earlier cycle that has already completed and reset!
     if diff_mins > 300 {
         return Some(FiveHourForecast {
-            burn_rate: 0.05,
-            pace_ratio: 0.1,
-            runway_minutes: None,
-            delta_minutes: None,
+            burn_rate: 0.0,
+            pace_ratio: 0.0,
+            runway_minutes: Some(1440),
+            delta_minutes: Some(1440),
             exhaustion_time: None,
             reset_time: (reset_h, reset_m),
             is_exhausted_before_reset: false,
@@ -572,12 +572,12 @@ pub fn calculate_five_hour_forecast(
     let allowed_rate = 100.0 / 300.0;
     let pace_ratio = burn_rate / allowed_rate;
 
-    if consumed_pct <= 2.0 || burn_rate <= 0.02 {
+    if consumed_pct <= 0.0 || burn_rate <= 0.0001 {
         return Some(FiveHourForecast {
-            burn_rate,
-            pace_ratio: 0.1,
-            runway_minutes: None,
-            delta_minutes: None,
+            burn_rate: 0.0,
+            pace_ratio: 0.0,
+            runway_minutes: Some(1440),
+            delta_minutes: Some(1440),
             exhaustion_time: None,
             reset_time: (reset_h, reset_m),
             is_exhausted_before_reset: false,
@@ -717,10 +717,24 @@ pub fn pacing_forecast_for(
             PacingHealth::Surplus
         };
 
+        let runway_days = if burn_rate > 0.001 {
+            Some((rem_pct as f32) / burn_rate)
+        } else {
+            Some(30.0)
+        };
+
+        let pace = if burn_rate > 0.001 {
+            pace_ratio
+        } else {
+            0.0
+        };
+
+        let delta_days = runway_days.map(|rw| (rw - remaining_days).round() as i32);
+
         let mut fc = PacingForecast {
-            pace_ratio: Some(0.1),
-            runway_days: None,
-            delta_days: None,
+            pace_ratio: Some(pace),
+            runway_days,
+            delta_days,
             remaining_days,
             health,
             badge_text: String::new(),
@@ -1354,5 +1368,49 @@ mod tests {
         assert!(pace_de.starts_with("Pace: "), "Got: {pace_de}");
         assert!(pace_en.starts_with("Pace: "), "Got: {pace_en}");
         assert!(pace_de.contains("x · "), "Got: {pace_de}");
+    }
+
+    #[test]
+    fn test_five_hour_forecast_slow_usage_simon_scenario() {
+        // Simon's exact scenario: 98% remaining (2% consumed), reset in 4h 51m (21:12), now 16:21
+        // Elapsed = 10 mins, burn rate = 2.0 / 10 = 0.20%/min
+        // Runway = 98.0 / 0.20 = 490 mins (~8.16 hours)
+        // Must display concrete runway "Reicht noch ~8h", NEVER vague "Puffer stabil"!
+        let today = (2026, 9, 20);
+        let now = (16, 21);
+        let fc = pacing_forecast_for(
+            false,
+            Some(76),
+            Some("25.09."),
+            Some(98),
+            Some("21:12"),
+            Some(today),
+            Some(now),
+        );
+        let runway_de = fc.five_hour_runway_text(Language::German);
+        let runway_en = fc.five_hour_runway_text(Language::English);
+        assert_eq!(runway_de, "Reicht noch ~8h");
+        assert_eq!(runway_en, "Lasts ~8h");
+        assert!(!runway_de.contains("Puffer stabil"));
+    }
+
+    #[test]
+    fn test_five_hour_forecast_zero_consumption() {
+        // 100% remaining, 0% consumed -> runway >24h
+        let today = (2026, 9, 20);
+        let now = (14, 0);
+        let fc = pacing_forecast_for(
+            false,
+            Some(100),
+            Some("25.09."),
+            Some(100),
+            Some("19:00"),
+            Some(today),
+            Some(now),
+        );
+        assert_eq!(fc.five_hour_runway_text(Language::German), "Reicht >24h");
+        assert_eq!(fc.five_hour_runway_text(Language::English), "Lasts >24h");
+        assert_eq!(fc.week_runway_text(Language::German), "Reicht >30 Tage");
+        assert_eq!(fc.week_runway_text(Language::English), "Lasts >30 days");
     }
 }

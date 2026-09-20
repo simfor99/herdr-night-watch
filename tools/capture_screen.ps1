@@ -39,7 +39,7 @@ public class Win32 {
 
 [Win32]::SetProcessDPIAware()
 
-$proc = Get-Process -Name 'Herdr-Nachtwaechter' | Where-Object { $_.MainWindowTitle -like '*Live*Status*' } | Select-Object -First 1
+$proc = Get-Process -Name 'Herdr-Nachtwaechter' | Where-Object { $_.MainWindowTitle -like '*Limits*' -or $_.MainWindowTitle -like '*Live*Status*' } | Select-Object -First 1
 if ($proc) {
     $rect = New-Object RECT
     [Win32]::GetWindowRect($proc.MainWindowHandle, [ref]$rect)

@@ -13,7 +13,7 @@ def callback(hwnd, extra):
         length = user32.GetWindowTextLengthW(hwnd)
         title = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, title, length + 1)
-        if 'Live-Status' in title.value:
+        if any(keyword in title.value for keyword in ['Limits', 'Live-Status', 'Nachtwächter', 'Night Watch']):
             found.append((hwnd, title.value))
     return True
 
