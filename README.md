@@ -59,9 +59,9 @@ For a checkout of this repository, the path normally looks like `/home/your-name
 
 ## Live status
 
-![Herdr Night Watch live status in German](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.34/live-status-de.png)
+![Herdr Night Watch live status in German](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.35/live-status-de.png)
 
-![Herdr Night Watch live status in English](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.34/live-status-en.png)
+![Herdr Night Watch live status in English](https://github.com/simfor99/herdr-night-watch/releases/download/v0.1.35/live-status-en.png)
 
 The live window is intentionally compact: Herdr counts and the night-mode controls remain in the main panel, while the equal-width footer turns it into a quick system monitor without affecting the watcher. CPU, RAM, GPU, VRAM utilization, and NVIDIA GPU power use a soft traffic-light palette: green for normal load, pastel yellow for medium load, and pastel red for high load. Missing hardware telemetry is shown as `—` rather than guessed. The small upper-right control hood opens the last 30 completion actions and cycles the window between normal, always-on-top, and always-in-background modes. Its glass surfaces use a subtle top reflection to keep the dashboard calm but tactile. The tray menu lets you choose window opacity from 100% down to 10%.
 
@@ -75,10 +75,15 @@ The moon also shows the current temperature and the real current lunar phase for
 
 ### AI budget limits, dual telemetry, and pacing forecast
 
-A dedicated magnetic satellite dock can be opened directly below the live status dashboard (toggled via the compact `⚡` button in the footer or via the context menu). It displays real-time quotas for the active AI engines (GLM, AGY, and Codex) without overloading the main display:
+A dedicated magnetic satellite dock can be opened directly below the live status dashboard (toggled via the compact `⚡` button in the footer or via the context menu). It displays real-time quotas for the active AI engines (GLM, AGY, Codex, Claude) without overloading the main display:
 
 - **Dual Telemetry Gauges**: 5-hour rolling burst limit and weekly cycle budget with color-coded utilization bars and bold high-contrast percentages.
-- **Pacing & Exhaustion Radar**: Dynamic burn-rate analysis relative to elapsed and remaining cycle days ($B / A$). When runway is ample, it reports available headroom (`Pace 0.4x`, `Reicht locker` / `Ample runway`). When consumption exceeds budget velocity (e.g. 50% consumed on Day 2 of a 7-day cycle), an intelligent forecast algorithm calculates the exact projected exhaustion date (`Schluss: 20.09. (~2 d)` in German, `Empty: 20.09 (~2 d)` in English) and flags an alert chip (`WARN` / `HALT`).
+- **Pacing & Concrete Exhaustion Radar**: Dual-window dynamic forecast replacing vague estimates with exact surplus/deficit offsets relative to reset time, rendered with independent green/red line coloring. For the **5-hour burst window**, it reports the exact delta and clock time (e.g. `+5 Stunden (20:34)` / `+5 hours (20:34)` in green when lasting beyond reset, `+>24 Stunden` when consumption is minimal, or `-1 Stunde (14:05)` / `-1 hour (14:05)` in red during rapid depletion). For the **weekly/monthly cycle**, it reports day delta and date (e.g. `+2 Tage (27.09.)` / `+2 days (27.09.)` in green when safe, or `-3 Tage (20.09.)` / `-3 days (20.09.)` in red when burning too fast). Micro-LED status beacons and dynamic alert chips (`OK`, `WARN`, `HALT`) flag health instantly.
+- **In-Dock Configurator & Settings Panel**: Clicking the gear (`⚙`) icon in the satellite dock expands the window into an integrated 3-tab settings hub:
+  - **⚡ Limits**: Toggle individual AI providers (GLM, AGY, Codex, Claude) on/off and customize brand badge pastel colors via interactive 9-color swatches.
+  - **⊞ Fenster**: Configure window corner radius presets (0px square to 18px), window opacity (100% to 70%), window level (Normal, On Top, In Background), taskbar visibility, and magnetic docking mode.
+  - **⚙ System**: Control Windows autostart, startup window opening, analog clock & second hand visibility, telemetry refresh cadence (250ms, 500ms, 1000ms), language switch (Deutsch / English), and direct dialog shortcuts (Location, Log, Setup).
+- **Pixel-Perfect Borderless Chrome**: Completely eliminates non-client border artifacts and white 1px lines via custom `WM_NCCALCSIZE` subclassing and GPU mesh gradient background.
 - **Seamless Magnetic Docking**: Snaps automatically to the bottom edge with a 0-pixel gap. Pulling the satellite away undocks it into a freely floating companion window; dragging it back within range re-engages magnetic lock.
 - **Synchronized Proportional Resizing**: Interactive tactile resize grips in the bottom-right corners of both windows allow continuous scaling up and down with instant size synchronization across both surfaces.
 - **Bilingual Interface**: Full German and English localization for all statuses, tooltips, and pacing badges.
@@ -91,7 +96,7 @@ A dedicated magnetic satellite dock can be opened directly below the live status
 - **Stop and cancel shutdown**: ends the run and removes only the watcher's own warning; Windows is not asked to shut down until the warning has completed.
 - **Demo: simulate completion**: shows the quiet period and shutdown warning within a few seconds. It can never shut down Windows.
 - **Open live status**: opens a freely movable status window that can be closed at any time. Left-clicking the tray icon opens it; right-clicking shows the menu.
-- **AI budget limits and pacing forecast**: click the `⚡` lightning toggle in the live-status footer or right-click to attach/detach the AI limits satellite dock. It displays real-time 5-hour burst limits and weekly usage for GLM, AGY, and Codex, dynamic burn-rate analysis relative to cycle time, and exact depletion forecasts (`Schluss: DD.MM.` / `Empty: DD.MM.`).
+- **AI budget limits and pacing forecast**: click the `⚡` lightning toggle in the live-status footer or right-click to attach/detach the AI limits satellite dock. It displays real-time 5-hour burst limits and weekly cycle usage for GLM, AGY, and Codex, with concrete velocity-based delta forecasts (`+5 Stunden (HH:MM)`, `+2 Tage (DD.MM.)`) and rich interactive hover tooltips.
 - **Synchronized live resize preview**: dragging the tactile grip on either window smoothly displays a translucent blue preview rectangle with real-time scaling percentage and exact dimensions (`{scale}% · {W} × {H} px`), keeping both windows perfectly in sync.
 - **Reliable live window**: opening the live status again restores and focuses the existing window instead of creating a duplicate. Its last desktop position is stored locally and reused after the next start.
 - **Proportional live-window scaling**: drag the subtle handle in the lower-right corner to enlarge or shrink the complete live window freely. Text, moon, KPI cards, metrics, media pills, and timeline stay proportional. The selected scale is stored locally; right-click an empty area and choose **Reset to 100%** whenever you want to return to the default size.
