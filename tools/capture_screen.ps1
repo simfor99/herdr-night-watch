@@ -25,6 +25,15 @@ public class Win32 {
 
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetDC(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+    [DllImport("gdi32.dll")]
+    public static extern bool BitBlt(IntPtr hdcDest, int nXDest, int nYDest, int nWidth, int nHeight, IntPtr hdcSrc, int nXSrc, int nYSrc, int dwRop);
 }
 '@
 
@@ -37,14 +46,18 @@ if ($proc) {
     Write-Output "MainWindow Rect (DPI Aware): $($rect.Left), $($rect.Top), $($rect.Right), $($rect.Bottom)"
 
     $pad = 12
-    $x = $rect.Left - $pad
-    $y = $rect.Top - $pad
+    $x = [Math]::Max(0, $rect.Left - $pad)
+    $y = [Math]::Max(0, $rect.Top - $pad)
     $w = ($rect.Right - $rect.Left) + ($pad * 2)
     $h = [Math]::Min(1400, ($rect.Bottom - $rect.Top) + 400)
 
     $bmp = New-Object System.Drawing.Bitmap($w, $h)
     $graphics = [System.Drawing.Graphics]::FromImage($bmp)
-    $graphics.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size($w, $h)))
+    $hdcDest = $graphics.GetHdc()
+    $hdcSrc = [Win32]::GetDC([IntPtr]::Zero)
+    [Win32]::BitBlt($hdcDest, 0, 0, $w, $h, $hdcSrc, $x, $y, 0x40CC0020)
+    [Win32]::ReleaseDC([IntPtr]::Zero, $hdcSrc)
+    $graphics.ReleaseHdc($hdcDest)
 
     $outDir = "C:\Users\Simon\Desktop\temp"
     if (!(Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir }

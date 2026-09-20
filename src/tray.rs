@@ -20,6 +20,10 @@ const ID_START: &str = "start";
 const ID_OBSERVE: &str = "observe";
 const ID_STOP: &str = "stop";
 const ID_LOG: &str = "log";
+const ID_QUOTA_SHOW_GLM: &str = "quota_show_glm";
+const ID_QUOTA_SHOW_AGI: &str = "quota_show_agi";
+const ID_QUOTA_SHOW_CODEX: &str = "quota_show_codex";
+const ID_QUOTA_SHOW_CLAUDE: &str = "quota_show_claude";
 const ID_LIVE_STATUS: &str = "live_status";
 const ID_WEATHER_LOCATION: &str = "weather_location";
 const ID_LIVE_STATUS_ON_START: &str = "live_status_on_start";
@@ -34,6 +38,7 @@ const ID_WINDOW_OPACITY_PREFIX: &str = "window_opacity_";
 const ID_WINDOW_LEVEL_NORMAL: &str = "window_level_normal";
 const ID_WINDOW_LEVEL_TOP: &str = "window_level_top";
 const ID_WINDOW_LEVEL_BOTTOM: &str = "window_level_bottom";
+const ID_WINDOW_CORNER_RADIUS_PREFIX: &str = "window_corner_radius_";
 const TRAY_INSTANCE_MUTEX: &str = "Local\\HerdrNachtwaechter.Tray";
 const SECOND_INSTANCE_HANDOFF: Duration = Duration::from_millis(400);
 // After a fresh boot the graphics driver and the desktop compositor are still
@@ -145,7 +150,9 @@ pub fn run() -> Result<()> {
         status: initial,
         message: None,
         last_view: String::new(),
-        refresh_at: Instant::now() - Duration::from_secs(10),
+        refresh_at: Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now),
         checking: false,
         result_rx,
         result_tx,
@@ -284,7 +291,9 @@ impl App {
                                     }
                                 }
                             };
-                            self.refresh_at = Instant::now() - Duration::from_secs(10);
+                            self.refresh_at = Instant::now()
+                                .checked_sub(Duration::from_secs(10))
+                                .unwrap_or_else(Instant::now);
                         } else if demo {
                             let _ = notify::completion_notice(
                                 self.language,
@@ -364,6 +373,22 @@ impl App {
             ID_OBSERVE => backend::start(true),
             ID_STOP => backend::stop("tray_menu"),
             ID_LOG => backend::open_log(),
+            ID_QUOTA_SHOW_GLM => {
+                let show = !window_settings::live_status_quota_show_glm();
+                window_settings::set_live_status_quota_show_glm(show)
+            }
+            ID_QUOTA_SHOW_AGI => {
+                let show = !window_settings::live_status_quota_show_agi();
+                window_settings::set_live_status_quota_show_agi(show)
+            }
+            ID_QUOTA_SHOW_CODEX => {
+                let show = !window_settings::live_status_quota_show_codex();
+                window_settings::set_live_status_quota_show_codex(show)
+            }
+            ID_QUOTA_SHOW_CLAUDE => {
+                let show = !window_settings::live_status_quota_show_claude();
+                window_settings::set_live_status_quota_show_claude(show)
+            }
             ID_LIVE_STATUS => live_status::open(),
             ID_WEATHER_LOCATION => weather_location::open(),
             ID_LIVE_STATUS_ON_START => {
@@ -387,6 +412,11 @@ impl App {
                 .parse::<u8>()
                 .map_err(|error| anyhow::anyhow!("invalid opacity value: {error}"))
                 .and_then(window_settings::set_opacity),
+            action if action.starts_with(ID_WINDOW_CORNER_RADIUS_PREFIX) => action
+                .trim_start_matches(ID_WINDOW_CORNER_RADIUS_PREFIX)
+                .parse::<u8>()
+                .map_err(|error| anyhow::anyhow!("invalid corner radius value: {error}"))
+                .and_then(window_settings::set_live_status_corner_radius),
             ID_QUIT => {
                 if night_watch_is_active(&self.status) {
                     // The tray owns the guaranteed foreground warning. Do not leave a
@@ -408,6 +438,22 @@ impl App {
                 ID_OBSERVE => "Beobachtung gestartet - kein Shutdown".into(),
                 ID_STOP => "Nachtmodus gestoppt".into(),
                 ID_LOG => "Protokoll geöffnet".into(),
+                ID_QUOTA_SHOW_GLM => self
+                    .language
+                    .text("GLM-Anzeige geändert", "GLM display setting changed")
+                    .into(),
+                ID_QUOTA_SHOW_AGI => self
+                    .language
+                    .text("AGI-Anzeige geändert", "AGI display setting changed")
+                    .into(),
+                ID_QUOTA_SHOW_CODEX => self
+                    .language
+                    .text("Codex-Anzeige geändert", "Codex display setting changed")
+                    .into(),
+                ID_QUOTA_SHOW_CLAUDE => self
+                    .language
+                    .text("Claude-Anzeige geändert", "Claude display setting changed")
+                    .into(),
                 ID_LIVE_STATUS => "Live-Status geöffnet".into(),
                 ID_WEATHER_LOCATION => self
                     .language
@@ -455,6 +501,14 @@ impl App {
                         format!("Window opacity set to {value}%")
                     }
                 }
+                action if action.starts_with(ID_WINDOW_CORNER_RADIUS_PREFIX) => {
+                    let value = action.trim_start_matches(ID_WINDOW_CORNER_RADIUS_PREFIX);
+                    if self.language == Language::German {
+                        format!("Eckenrundung auf {value} px gesetzt")
+                    } else {
+                        format!("Corner radius set to {value} px")
+                    }
+                }
                 _ => String::new(),
             }),
             Err(error) => Some(format!("Fehler: {error}")),
@@ -468,7 +522,9 @@ impl App {
         if action == ID_LANGUAGE_EN {
             self.language = Language::English;
         }
-        self.refresh_at = Instant::now() - Duration::from_secs(10);
+        self.refresh_at = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
     }
 
     fn tick(&mut self, event_loop: &ActiveEventLoop) {
@@ -627,6 +683,26 @@ fn menu_for(
         None,
     ));
     let _ = window_submenu.append(&level_submenu);
+    let corner_submenu = Submenu::new(language.text("Eckenrundung", "Corner radius"), true);
+    let current_radius = window_settings::live_status_corner_radius();
+    for &value in &window_settings::CORNER_RADIUS_PRESETS {
+        let id = format!("{ID_WINDOW_CORNER_RADIUS_PREFIX}{value}");
+        let label = if value == 0 {
+            language.text("0 px (Eckig)", "0 px (Square)").to_string()
+        } else if value == window_settings::DEFAULT_LIVE_STATUS_CORNER_RADIUS {
+            format!("{value} px ({})", language.text("Standard", "Default"))
+        } else {
+            format!("{value} px")
+        };
+        let _ = corner_submenu.append(&CheckMenuItem::with_id(
+            id,
+            label,
+            true,
+            value == current_radius,
+            None,
+        ));
+    }
+    let _ = window_submenu.append(&corner_submenu);
     let _ = window_submenu.append(&CheckMenuItem::with_id(
         ID_LIVE_STATUS_TASKBAR,
         language.text(
@@ -644,6 +720,39 @@ fn menu_for(
         true,
         None,
     ));
+    let quota_setup_submenu = Submenu::new(
+        language.text("KI-Limits (Setup)", "AI limits (setup)"),
+        true,
+    );
+    let _ = quota_setup_submenu.append(&CheckMenuItem::with_id(
+        ID_QUOTA_SHOW_GLM,
+        "GLM (Z.ai)",
+        true,
+        window_settings::live_status_quota_show_glm(),
+        None,
+    ));
+    let _ = quota_setup_submenu.append(&CheckMenuItem::with_id(
+        ID_QUOTA_SHOW_AGI,
+        "AGI (Antigravity)",
+        true,
+        window_settings::live_status_quota_show_agi(),
+        None,
+    ));
+    let _ = quota_setup_submenu.append(&CheckMenuItem::with_id(
+        ID_QUOTA_SHOW_CODEX,
+        "Codex (OpenAI)",
+        true,
+        window_settings::live_status_quota_show_codex(),
+        None,
+    ));
+    let _ = quota_setup_submenu.append(&CheckMenuItem::with_id(
+        ID_QUOTA_SHOW_CLAUDE,
+        "Claude (Anthropic)",
+        true,
+        window_settings::live_status_quota_show_claude(),
+        None,
+    ));
+    let _ = menu.append(&quota_setup_submenu);
     let _ = menu.append(&CheckMenuItem::with_id(
         ID_AUTOSTART,
         language.text("Mit Windows starten", "Start with Windows"),
@@ -946,5 +1055,17 @@ mod tests {
         ]));
         assert!(should_open_live_on_launch(true, true));
         assert!(!should_open_live_on_launch(true, false));
+    }
+
+    #[test]
+    fn quota_provider_tray_ids_are_distinct() {
+        let ids = [
+            super::ID_QUOTA_SHOW_GLM,
+            super::ID_QUOTA_SHOW_AGI,
+            super::ID_QUOTA_SHOW_CODEX,
+            super::ID_QUOTA_SHOW_CLAUDE,
+        ];
+        let set: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(set.len(), 4);
     }
 }

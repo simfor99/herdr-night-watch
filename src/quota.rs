@@ -11,6 +11,7 @@ pub enum ProviderId {
     Glm,
     Agy,
     Codex,
+    Claude,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,12 +61,28 @@ impl ProviderQuota {
         }
     }
 
+    pub fn cycle_label(&self) -> &'static str {
+        if self.id == ProviderId::Glm {
+            "Mo"
+        } else if let Some(reset) = &self.week_reset {
+            if reset.starts_with("01.") {
+                "Mo"
+            } else {
+                "Wk"
+            }
+        } else {
+            "Wk"
+        }
+    }
+
     pub fn pacing_forecast(&self) -> PacingForecast {
         pacing_forecast_for(
             self.is_throttled,
             self.week_percent,
             self.week_reset.as_deref(),
             self.five_hour_percent,
+            self.five_hour_reset.as_deref(),
+            None,
             None,
         )
     }
@@ -80,64 +97,285 @@ pub enum PacingHealth {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct FiveHourForecast {
+    pub burn_rate: f32, // % per minute
+    pub pace_ratio: f32,
+    pub runway_minutes: Option<u32>,
+    pub delta_minutes: Option<i32>,
+    pub exhaustion_time: Option<(u32, u32)>, // (HH, MM)
+    pub reset_time: (u32, u32),              // (HH, MM)
+    pub is_exhausted_before_reset: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct PacingForecast {
     pub pace_ratio: Option<f32>,
     pub runway_days: Option<f32>,
+    pub delta_days: Option<i32>,
     pub remaining_days: f32,
     pub health: PacingHealth,
     pub badge_text: String,
     pub summary_text: String,
+    pub five_hour_forecast: Option<FiveHourForecast>,
+    pub week_exhaustion_date: Option<(u32, u32)>, // (month, day)
     pub reset_str: Option<String>,
     pub today: (i32, u32, u32),
 }
 
 impl PacingForecast {
-    pub fn localized_badge_text(&self, language: Language) -> String {
-        match self.health {
-            PacingHealth::Throttled => language.text("Gedrosselt", "Throttled").to_string(),
-            _ => format!("Pace {:.1}x", self.pace_ratio.unwrap_or(0.1)),
+    #[allow(dead_code)]
+    pub fn five_hour_is_deficit(&self) -> bool {
+        if self.health == PacingHealth::Throttled {
+            return true;
+        }
+        self.five_hour_forecast
+            .as_ref()
+            .map(|fh| fh.is_exhausted_before_reset)
+            .unwrap_or(false)
+    }
+
+    #[allow(dead_code)]
+    pub fn week_is_deficit(&self) -> bool {
+        if self.health == PacingHealth::Throttled {
+            return true;
+        }
+        self.delta_days.map(|d| d < 0).unwrap_or_else(|| {
+            self.runway_days.unwrap_or(self.remaining_days) < self.remaining_days
+        })
+    }
+
+    pub fn localized_upper_line(&self, language: Language) -> String {
+        if self.health == PacingHealth::Throttled {
+            return language.text("Gedrosselt", "Throttled").to_string();
+        }
+
+        if let Some(fh) = &self.five_hour_forecast {
+            if fh.is_exhausted_before_reset {
+                let (h, m) = fh.exhaustion_time.unwrap_or((0, 0));
+                let def_mins = fh.delta_minutes.map(|d| (-d).max(1)).unwrap_or(30);
+                if def_mins < 60 {
+                    match language {
+                        Language::German => format!("-{} Min. ({:02}:{:02})", def_mins, h, m),
+                        Language::English => format!("-{} min ({:02}:{:02})", def_mins, h, m),
+                    }
+                } else {
+                    let hours = (def_mins as f32 / 60.0).round() as i32;
+                    let unit = if hours == 1 {
+                        language.text("Stunde", "hour")
+                    } else {
+                        language.text("Stunden", "hours")
+                    };
+                    format!("-{} {} ({:02}:{:02})", hours, unit, h, m)
+                }
+            } else if let Some((h, m)) = fh.exhaustion_time {
+                if let Some(delta) = fh.delta_minutes {
+                    if fh.runway_minutes.unwrap_or(0) >= 1440 || delta >= 1440 {
+                        match language {
+                            Language::German => "+>24 Stunden".to_string(),
+                            Language::English => "+>24 hours".to_string(),
+                        }
+                    } else if delta > 300 {
+                        match language {
+                            Language::German => "+>5 Stunden (Puffer)".to_string(),
+                            Language::English => "+>5 hours (Buffer)".to_string(),
+                        }
+                    } else if delta >= 60 {
+                        let hours = (delta as f32 / 60.0).round() as i32;
+                        let unit = if hours == 1 {
+                            language.text("Stunde", "hour")
+                        } else {
+                            language.text("Stunden", "hours")
+                        };
+                        format!("+{} {} ({:02}:{:02})", hours, unit, h, m)
+                    } else if delta > 0 {
+                        match language {
+                            Language::German => format!("+{} Min. ({:02}:{:02})", delta, h, m),
+                            Language::English => format!("+{} min ({:02}:{:02})", delta, h, m),
+                        }
+                    } else {
+                        format!("±0 Min. ({:02}:{:02})", h, m)
+                    }
+                } else {
+                    match language {
+                        Language::German => "+>24 Stunden".to_string(),
+                        Language::English => "+>24 hours".to_string(),
+                    }
+                }
+            } else {
+                match language {
+                    Language::German => "+>24 Stunden".to_string(),
+                    Language::English => "+>24 hours".to_string(),
+                }
+            }
+        } else if let Some(ratio) = self.pace_ratio {
+            format!("Pace {:.1}x", ratio)
+        } else {
+            language.text("Bereit", "Ready").to_string()
         }
     }
 
-    pub fn localized_summary_text(&self, language: Language) -> String {
-        match self.health {
-            PacingHealth::Throttled => {
-                let reset = self.reset_str.as_deref().unwrap_or(language.text("bald", "soon"));
-                format!("Reset {reset}")
-            }
-            PacingHealth::Surplus => {
-                if self.runway_days.is_none() {
-                    language.text("Voller Puffer", "Full buffer").to_string()
+    pub fn localized_lower_line(&self, language: Language) -> String {
+        if self.health == PacingHealth::Throttled {
+            let reset = self.reset_str.as_deref().unwrap_or(language.text("bald", "soon"));
+            return format!("Reset {reset}");
+        }
+
+        if let Some(delta) = self.delta_days {
+            if delta < 0 {
+                let days = (-delta).max(1);
+                let unit = if days == 1 {
+                    language.text("Tag", "day")
                 } else {
-                    language.text("Reicht locker", "Ample runway").to_string()
+                    language.text("Tage", "days")
+                };
+                if let Some((m, d)) = self.week_exhaustion_date {
+                    let date_str = match language {
+                        Language::German => format!("{:02}.{:02}.", d, m),
+                        Language::English => format!("{:02}.{:02}", d, m),
+                    };
+                    format!("-{} {} ({})", days, unit, date_str)
+                } else {
+                    format!("-{} {}", days, unit)
                 }
-            }
-            PacingHealth::OnTrack => {
-                let days = self.runway_days.unwrap_or(self.remaining_days).min(self.remaining_days + 7.0);
+            } else if delta == 0 {
+                let reset = self.reset_str.as_deref().unwrap_or("—");
                 match language {
-                    Language::German => format!("Reicht ~{:.1} d", days),
-                    Language::English => format!("Lasts ~{:.1} d", days),
+                    Language::German => format!("±0 Tage ({reset})"),
+                    Language::English => format!("±0 days ({reset})"),
                 }
-            }
-            PacingHealth::Tight => {
-                let days = self.runway_days.unwrap_or(self.remaining_days);
-                let today_days = ymd_to_days(self.today.0, self.today.1, self.today.2);
-                let add_days = days.round() as i64;
-                if add_days <= 0 {
-                    let hours = (days * 24.0).max(1.0).round() as u32;
-                    match language {
-                        Language::German => format!("Schluss: heute (~{hours} h)"),
-                        Language::English => format!("Empty: today (~{hours} h)"),
-                    }
+            } else if delta > 14 {
+                match language {
+                    Language::German => "+>30 Tage (Puffer)".to_string(),
+                    Language::English => "+>30 days (Buffer)".to_string(),
+                }
+            } else if delta > 7 {
+                match language {
+                    Language::German => "+>7 Tage (Puffer)".to_string(),
+                    Language::English => "+>7 days (Buffer)".to_string(),
+                }
+            } else {
+                let days = delta;
+                let unit = if days == 1 {
+                    language.text("Tag", "day")
                 } else {
-                    let empty_days = today_days + add_days;
-                    let (_y, m, d) = days_to_ymd(empty_days);
-                    match language {
-                        Language::German => format!("Schluss: {:02}.{:02}. (~{:.0} d)", d, m, days.round()),
-                        Language::English => format!("Empty: {:02}.{:02} (~{:.0} d)", d, m, days.round()),
-                    }
+                    language.text("Tage", "days")
+                };
+                if let Some((m, d)) = self.week_exhaustion_date {
+                    let date_str = match language {
+                        Language::German => format!("{:02}.{:02}.", d, m),
+                        Language::English => format!("{:02}.{:02}", d, m),
+                    };
+                    format!("+{} {} ({})", days, unit, date_str)
+                } else {
+                    format!("+{} {}", days, unit)
                 }
             }
+        } else if let Some((m, d)) = self.week_exhaustion_date {
+            let date_str = match language {
+                Language::German => format!("{:02}.{:02}.", d, m),
+                Language::English => format!("{:02}.{:02}", d, m),
+            };
+            match language {
+                Language::German => format!("+Puffer ({})", date_str),
+                Language::English => format!("+Buffer ({})", date_str),
+            }
+        } else if self.delta_days.is_none() && self.reset_str.is_none() && self.runway_days.is_none() {
+            language.text("Telemetrie ausstehend", "Telemetry pending").to_string()
+        } else {
+            match language {
+                Language::German => "+>30 Tage (Puffer)".to_string(),
+                Language::English => "+>30 days (Buffer)".to_string(),
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn localized_badge_text(&self, language: Language) -> String {
+        self.localized_upper_line(language)
+    }
+
+    #[allow(dead_code)]
+    pub fn localized_summary_text(&self, language: Language) -> String {
+        self.localized_lower_line(language)
+    }
+
+    pub fn five_hour_runway_text(&self, language: Language) -> String {
+        if let Some(fh) = &self.five_hour_forecast {
+            if fh.is_exhausted_before_reset {
+                let mins = fh.runway_minutes.unwrap_or(0);
+                if mins >= 60 {
+                    let h = mins / 60;
+                    let m = mins % 60;
+                    format!("{}: ~{h}h {m}m", language.text("Leer in", "Empty in"))
+                } else {
+                    format!("{}: ~{mins}m", language.text("Leer in", "Empty in"))
+                }
+            } else if let Some(mins) = fh.runway_minutes {
+                if mins >= 1440 {
+                    language.text("Reicht >24h", "Lasts >24h").to_string()
+                } else if mins >= 60 {
+                    let h = (mins as f32 / 60.0).round() as u32;
+                    format!("{} ~{h}h", language.text("Reicht noch", "Lasts"))
+                } else {
+                    format!("{} ~{mins}m", language.text("Reicht noch", "Lasts"))
+                }
+            } else {
+                language.text("Puffer stabil", "Buffer stable").to_string()
+            }
+        } else {
+            language.text("Kein Limit", "No limit").to_string()
+        }
+    }
+
+    pub fn five_hour_pace_text(&self, language: Language) -> String {
+        if let Some(fh) = &self.five_hour_forecast {
+            let ratio = fh.pace_ratio;
+            let qualifier = if ratio < 0.85 {
+                language.text("Puffer", "buffer")
+            } else if ratio <= 1.20 {
+                language.text("Ausgeglichen", "on track")
+            } else {
+                language.text("Erhöht", "elevated")
+            };
+            format!("Pace: {:.2}x · {}", ratio, qualifier)
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn week_runway_text(&self, language: Language) -> String {
+        if let Some(days) = self.runway_days {
+            if days >= 30.0 {
+                language.text("Reicht >30 Tage", "Lasts >30 days").to_string()
+            } else if days >= 1.0 {
+                match language {
+                    Language::German => format!("Reicht noch {:.1} Tage", days),
+                    Language::English => format!("Lasts {:.1} days", days),
+                }
+            } else {
+                let hours = (days * 24.0).round() as u32;
+                match language {
+                    Language::German => format!("Reicht noch ~{}h", hours),
+                    Language::English => format!("Lasts ~{}h", hours),
+                }
+            }
+        } else {
+            language.text("Puffer stabil", "Buffer stable").to_string()
+        }
+    }
+
+    pub fn week_pace_text(&self, language: Language) -> String {
+        if let Some(ratio) = self.pace_ratio {
+            let qualifier = if ratio < 0.85 {
+                language.text("Puffer", "buffer")
+            } else if ratio <= 1.20 {
+                language.text("Ausgeglichen", "on track")
+            } else {
+                language.text("Erhöht", "elevated")
+            };
+            format!("Pace: {:.2}x · {}", ratio, qualifier)
+        } else {
+            String::new()
         }
     }
 }
@@ -174,6 +412,195 @@ pub fn current_ymd() -> (i32, u32, u32) {
         .as_secs();
     let days = (secs / 86400) as i64;
     days_to_ymd(days)
+}
+
+pub fn current_hm() -> (u32, u32) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut st = SYSTEMTIME {
+            wYear: 0,
+            wMonth: 0,
+            wDayOfWeek: 0,
+            wDay: 0,
+            wHour: 0,
+            wMinute: 0,
+            wSecond: 0,
+            wMilliseconds: 0,
+        };
+        unsafe { GetLocalTime(&mut st) };
+        (st.wHour as u32, st.wMinute as u32)
+    }
+    #[cfg(not(windows))]
+    {
+        let now = std::time::SystemTime::now();
+        let secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let hour = ((secs % 86400) / 3600) as u32;
+        let minute = ((secs % 3600) / 60) as u32;
+        (hour, minute)
+    }
+}
+
+#[cfg(windows)]
+pub fn local_timezone_offset_minutes() -> i32 {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
+    let mut local = SYSTEMTIME {
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    let mut utc = SYSTEMTIME {
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    unsafe {
+        GetLocalTime(&mut local);
+        GetSystemTime(&mut utc);
+    }
+    let local_mins = local.wHour as i32 * 60 + local.wMinute as i32;
+    let utc_mins = utc.wHour as i32 * 60 + utc.wMinute as i32;
+    let mut diff = local_mins - utc_mins;
+    if local.wDay != utc.wDay {
+        if local.wDay > utc.wDay || (local.wDay == 1 && utc.wDay > 25) {
+            diff += 24 * 60;
+        } else {
+            diff -= 24 * 60;
+        }
+    }
+    diff
+}
+
+#[cfg(not(windows))]
+pub fn local_timezone_offset_minutes() -> i32 {
+    120
+}
+
+pub fn iso_utc_to_local_hm(iso_str: &str) -> Option<(u32, u32)> {
+    let raw = iso_str.trim();
+    let time_part = if let Some(t_idx) = raw.find('T') {
+        &raw[t_idx + 1..]
+    } else {
+        raw
+    };
+    let is_utc = time_part.ends_with('Z') || raw.ends_with('Z');
+    let clean = time_part.trim_end_matches('Z');
+    let parts: Vec<&str> = clean.split(':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let h: u32 = parts[0].trim().parse().ok()?;
+    let m: u32 = parts[1].trim().parse().ok()?;
+
+    if is_utc {
+        let offset = local_timezone_offset_minutes();
+        let total_mins = (h as i32 * 60 + m as i32 + offset).rem_euclid(24 * 60);
+        let local_h = (total_mins / 60) as u32;
+        let local_m = (total_mins % 60) as u32;
+        Some((local_h, local_m))
+    } else {
+        Some((h, m))
+    }
+}
+
+pub fn parse_hm(time_str: Option<&str>) -> Option<(u32, u32)> {
+    let raw = time_str?.trim();
+    if raw.contains('T') || raw.ends_with('Z') {
+        iso_utc_to_local_hm(raw)
+    } else {
+        let parts: Vec<&str> = raw.split(':').collect();
+        if parts.len() >= 2 {
+            let h: u32 = parts[0].trim().parse().ok()?;
+            let m: u32 = parts[1].trim().parse().ok()?;
+            Some((h, m))
+        } else {
+            None
+        }
+    }
+}
+
+pub fn calculate_five_hour_forecast(
+    five_hour_percent: Option<u8>,
+    five_hour_reset: Option<&str>,
+    now_hm: (u32, u32),
+) -> Option<FiveHourForecast> {
+    let rem_pct = five_hour_percent?;
+    let (reset_h, reset_m) = parse_hm(five_hour_reset)?;
+
+    let curr_mins = now_hm.0 * 60 + now_hm.1;
+    let reset_mins = reset_h * 60 + reset_m;
+
+    let mut diff_mins = reset_mins as i32 - curr_mins as i32;
+    if diff_mins <= 0 {
+        diff_mins += 24 * 60;
+    }
+
+    // A rolling 5-hour window has a maximum cycle duration of 300 minutes.
+    // If diff_mins > 300, the recorded reset timestamp is from an earlier cycle that has already completed and reset!
+    if diff_mins > 300 {
+        return Some(FiveHourForecast {
+            burn_rate: 0.05,
+            pace_ratio: 0.1,
+            runway_minutes: None,
+            delta_minutes: None,
+            exhaustion_time: None,
+            reset_time: (reset_h, reset_m),
+            is_exhausted_before_reset: false,
+        });
+    }
+
+    let remaining_mins = (diff_mins as u32).min(300).max(1);
+    let elapsed_mins = (300u32.saturating_sub(remaining_mins)).max(10);
+
+    let consumed_pct = (100u8.saturating_sub(rem_pct)) as f32;
+    let burn_rate = consumed_pct / (elapsed_mins as f32);
+    let allowed_rate = 100.0 / 300.0;
+    let pace_ratio = burn_rate / allowed_rate;
+
+    if consumed_pct <= 2.0 || burn_rate <= 0.02 {
+        return Some(FiveHourForecast {
+            burn_rate,
+            pace_ratio: 0.1,
+            runway_minutes: None,
+            delta_minutes: None,
+            exhaustion_time: None,
+            reset_time: (reset_h, reset_m),
+            is_exhausted_before_reset: false,
+        });
+    }
+
+    let runway_mins = ((rem_pct as f32) / burn_rate).round() as u32;
+    let is_exhausted_before_reset = runway_mins < remaining_mins;
+    let delta_minutes = Some(runway_mins as i32 - remaining_mins as i32);
+
+    let empty_mins = curr_mins + runway_mins;
+    let ex_h = (empty_mins / 60) % 24;
+    let ex_m = empty_mins % 60;
+
+    Some(FiveHourForecast {
+        burn_rate,
+        pace_ratio,
+        runway_minutes: Some(runway_mins),
+        delta_minutes,
+        exhaustion_time: Some((ex_h, ex_m)),
+        reset_time: (reset_h, reset_m),
+        is_exhausted_before_reset,
+    })
 }
 
 pub fn parse_remaining_days(reset_str: Option<&str>, today: (i32, u32, u32)) -> Option<f32> {
@@ -218,25 +645,55 @@ pub fn pacing_forecast_for(
     week_percent: Option<u8>,
     week_reset: Option<&str>,
     five_hour_percent: Option<u8>,
+    five_hour_reset: Option<&str>,
     custom_today: Option<(i32, u32, u32)>,
+    custom_time: Option<(u32, u32)>,
 ) -> PacingForecast {
     let today = custom_today.unwrap_or_else(current_ymd);
-    let rem_pct = week_percent.or(five_hour_percent).unwrap_or(100);
+    let now_hm = custom_time.unwrap_or_else(current_hm);
 
+    let five_hour_forecast = calculate_five_hour_forecast(five_hour_percent, five_hour_reset, now_hm);
+
+    let rem_pct = week_percent.or(five_hour_percent).unwrap_or(100);
     let saved_reset = week_reset.map(|s| s.to_string());
 
+    if week_percent.is_none() && five_hour_percent.is_none() {
+        let mut fc = PacingForecast {
+            pace_ratio: None,
+            runway_days: None,
+            delta_days: None,
+            remaining_days: 0.0,
+            health: PacingHealth::Surplus,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast: None,
+            week_exhaustion_date: None,
+            reset_str: None,
+            today,
+        };
+        fc.badge_text = fc.localized_upper_line(Language::German);
+        fc.summary_text = fc.localized_lower_line(Language::German);
+        return fc;
+    }
+
     if is_throttled || rem_pct == 0 {
-        let reset_str = week_reset.unwrap_or("bald");
-        return PacingForecast {
+        let rem_days = parse_remaining_days(week_reset, today).unwrap_or(5.0);
+        let mut fc = PacingForecast {
             pace_ratio: None,
             runway_days: Some(0.0),
-            remaining_days: parse_remaining_days(week_reset, today).unwrap_or(5.0),
+            delta_days: Some(-(rem_days.round() as i32)),
+            remaining_days: rem_days,
             health: PacingHealth::Throttled,
-            badge_text: "Gedrosselt".to_string(),
-            summary_text: format!("Reset {reset_str}"),
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast,
+            week_exhaustion_date: None,
             reset_str: saved_reset,
             today,
         };
+        fc.badge_text = fc.localized_upper_line(Language::German);
+        fc.summary_text = fc.localized_lower_line(Language::German);
+        return fc;
     }
 
     let remaining_days = parse_remaining_days(week_reset, today).unwrap_or(7.0).max(0.1);
@@ -248,67 +705,73 @@ pub fn pacing_forecast_for(
     let burn_rate = consumed_pct / elapsed_days;
     let pace_ratio = burn_rate / allowed_rate;
 
+    let five_h_tight = five_hour_forecast
+        .as_ref()
+        .map(|fh| fh.is_exhausted_before_reset)
+        .unwrap_or(false);
+
     if consumed_pct <= 2.0 || burn_rate <= 0.05 {
-        return PacingForecast {
+        let health = if five_h_tight {
+            PacingHealth::Tight
+        } else {
+            PacingHealth::Surplus
+        };
+
+        let mut fc = PacingForecast {
             pace_ratio: Some(0.1),
             runway_days: None,
+            delta_days: None,
             remaining_days,
-            health: PacingHealth::Surplus,
-            badge_text: "Pace 0.1x".to_string(),
-            summary_text: "Voller Puffer".to_string(),
+            health,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast,
+            week_exhaustion_date: None,
             reset_str: saved_reset,
             today,
         };
+        fc.badge_text = fc.localized_upper_line(Language::German);
+        fc.summary_text = fc.localized_lower_line(Language::German);
+        return fc;
     }
 
     let runway_days = (rem_pct as f32) / burn_rate;
+    let today_days = ymd_to_days(today.0, today.1, today.2);
+    let add_days = runway_days.round() as i64;
+    let (_y, ex_m, ex_d) = days_to_ymd(today_days + add_days);
+    let week_exhaustion_date = Some((ex_m, ex_d));
+    let delta_days = Some((runway_days - remaining_days).round() as i32);
 
-    if runway_days >= remaining_days {
-        if pace_ratio < 0.85 {
-            PacingForecast {
-                pace_ratio: Some(pace_ratio),
-                runway_days: Some(runway_days),
-                remaining_days,
-                health: PacingHealth::Surplus,
-                badge_text: format!("Pace {:.1}x", pace_ratio),
-                summary_text: "Reicht locker".to_string(),
-                reset_str: saved_reset,
-                today,
-            }
-        } else {
-            PacingForecast {
-                pace_ratio: Some(pace_ratio),
-                runway_days: Some(runway_days),
-                remaining_days,
-                health: PacingHealth::OnTrack,
-                badge_text: format!("Pace {:.1}x", pace_ratio),
-                summary_text: format!("Reicht ~{:.1} d", runway_days.min(remaining_days + 7.0)),
-                reset_str: saved_reset,
-                today,
-            }
-        }
+    let week_tight = if rem_pct >= 50 && pace_ratio <= 1.25 {
+        // Protection shield: high remaining quota with moderate pace is never tight!
+        false
     } else {
-        let today_days = ymd_to_days(today.0, today.1, today.2);
-        let add_days = runway_days.round() as i64;
-        let summary_text = if add_days <= 0 {
-            let hours = (runway_days * 24.0).max(1.0).round() as u32;
-            format!("Schluss: heute (~{hours} h)")
-        } else {
-            let (_y, m, d) = days_to_ymd(today_days + add_days);
-            format!("Schluss: {:02}.{:02}. (~{:.0} d)", d, m, runway_days.round())
-        };
+        runway_days < remaining_days * 0.80 || rem_pct < 20
+    };
+    let health = if week_tight || five_h_tight {
+        PacingHealth::Tight
+    } else if pace_ratio < 0.90 || rem_pct >= 80 {
+        PacingHealth::Surplus
+    } else {
+        PacingHealth::OnTrack
+    };
 
-        PacingForecast {
-            pace_ratio: Some(pace_ratio),
-            runway_days: Some(runway_days),
-            remaining_days,
-            health: PacingHealth::Tight,
-            badge_text: format!("Pace {:.1}x", pace_ratio),
-            summary_text,
-            reset_str: saved_reset,
-            today,
-        }
-    }
+    let mut fc = PacingForecast {
+        pace_ratio: Some(pace_ratio),
+        runway_days: Some(runway_days),
+        delta_days,
+        remaining_days,
+        health,
+        badge_text: String::new(),
+        summary_text: String::new(),
+        five_hour_forecast,
+        week_exhaustion_date,
+        reset_str: saved_reset,
+        today,
+    };
+    fc.badge_text = fc.localized_upper_line(Language::German);
+    fc.summary_text = fc.localized_lower_line(Language::German);
+    fc
 }
 
 #[derive(Clone, Debug)]
@@ -355,6 +818,15 @@ impl QuotaSnapshot {
                 None,
                 Some(0),
                 Some("23.09.".into()),
+            ),
+            ProviderQuota::new(
+                ProviderId::Claude,
+                "Claude",
+                "Anthropic",
+                None,
+                None,
+                None,
+                None,
             ),
         ];
         let has_throttle = providers.iter().any(|p| p.is_throttled);
@@ -443,6 +915,159 @@ pub fn parse_codex_rate_limits(json_str: &str) -> Option<(Option<u8>, Option<u8>
     Some((five_hour, week))
 }
 
+pub fn update_snapshot_with_agy_tsv(snapshot: &mut QuotaSnapshot, tsv: &str) {
+    if let Some(agy) = snapshot.providers.iter_mut().find(|p| p.id == ProviderId::Agy) {
+        for line in tsv.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 4 {
+                continue;
+            }
+            let group = parts[0].trim();
+            let limit_type = parts[1].trim();
+            let pct_str = parts[2].trim().trim_end_matches('%');
+            let reset_raw = parts[3].trim();
+
+            if group.contains("Gemini") {
+                if let Ok(pct) = pct_str.parse::<u8>() {
+                    if limit_type.contains("Five Hour") {
+                        agy.five_hour_percent = Some(pct);
+                        if let Some((h, m)) = iso_utc_to_local_hm(reset_raw) {
+                            agy.five_hour_reset = Some(format!("{:02}:{:02}", h, m));
+                        }
+                    } else if limit_type.contains("Weekly") {
+                        agy.week_percent = Some(pct);
+                        if let Some(date_part) = reset_raw.split('T').next() {
+                            let date_pieces: Vec<&str> = date_part.split('-').collect();
+                            if date_pieces.len() >= 3 {
+                                let m = date_pieces[1];
+                                let d = date_pieces[2];
+                                agy.week_reset = Some(format!("{d}.{m}."));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        agy.is_throttled = agy.week_percent.unwrap_or(100) == 0 || agy.five_hour_percent.unwrap_or(100) == 0;
+    }
+    snapshot.has_throttle = snapshot.providers.iter().any(|p| p.is_throttled);
+    snapshot.last_updated = Some(Instant::now());
+}
+
+pub fn update_snapshot_with_glm_json(snapshot: &mut QuotaSnapshot, json_str: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return;
+    };
+    let Some(limits) = value.get("data").and_then(|d| d.get("limits")).and_then(|l| l.as_array()) else {
+        return;
+    };
+
+    if let Some(glm) = snapshot.providers.iter_mut().find(|p| p.id == ProviderId::Glm) {
+        for item in limits {
+            let Some(limit_type) = item.get("type").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            let used_pct = item.get("percentage").and_then(|p| p.as_f64()).map(|f| f as u8).unwrap_or(0);
+            let remaining_pct = 100u8.saturating_sub(used_pct);
+            let next_reset_ms = item.get("nextResetTime").and_then(|t| t.as_i64());
+
+            if limit_type == "TOKENS_LIMIT" {
+                glm.five_hour_percent = Some(remaining_pct);
+                if let Some(ms) = next_reset_ms {
+                    let secs = ms / 1000;
+                    let offset_mins = local_timezone_offset_minutes() as i64;
+                    let local_secs = secs + offset_mins * 60;
+                    let day_secs = local_secs.rem_euclid(86400);
+                    let h = (day_secs / 3600) as u32;
+                    let m = ((day_secs % 3600) / 60) as u32;
+                    glm.five_hour_reset = Some(format!("{h:02}:{m:02}"));
+                }
+            } else if limit_type == "TIME_LIMIT" {
+                glm.week_percent = Some(remaining_pct);
+                if let Some(ms) = next_reset_ms {
+                    let secs = ms / 1000;
+                    let offset_mins = local_timezone_offset_minutes() as i64;
+                    let local_secs = secs + offset_mins * 60;
+                    let days = local_secs / 86400;
+                    let (_y, m, d) = days_to_ymd(days);
+                    glm.week_reset = Some(format!("{d:02}.{m:02}."));
+                }
+            }
+        }
+        glm.is_throttled = glm.week_percent.unwrap_or(100) == 0 || glm.five_hour_percent.unwrap_or(100) == 0;
+    }
+    snapshot.has_throttle = snapshot.providers.iter().any(|p| p.is_throttled);
+    snapshot.last_updated = Some(Instant::now());
+}
+
+#[cfg(windows)]
+pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut updated = current.clone();
+
+    let distro = crate::configuration::load().distro;
+
+    // 1. Fetch AGY
+    let mut agy_cmd = Command::new("wsl.exe");
+    agy_cmd.creation_flags(CREATE_NO_WINDOW)
+        .arg("-d")
+        .arg(&distro)
+        .arg("--exec")
+        .arg("/home/simon/.local/bin/agy")
+        .arg("-p")
+        .arg("/usage");
+
+    if let Ok(output) = agy_cmd.output() {
+        if output.status.success() {
+            let tsv = String::from_utf8_lossy(&output.stdout);
+            update_snapshot_with_agy_tsv(&mut updated, &tsv);
+        }
+    }
+
+    // 2. Fetch GLM
+    let mut glm_cmd = Command::new("wsl.exe");
+    glm_cmd.creation_flags(CREATE_NO_WINDOW)
+        .arg("-d")
+        .arg(&distro)
+        .arg("--exec")
+        .arg("/home/simon/projects/herdr-night-watch/tools/fetch_glm.sh");
+
+    if let Ok(output) = glm_cmd.output() {
+        if output.status.success() {
+            let json = String::from_utf8_lossy(&output.stdout);
+            update_snapshot_with_glm_json(&mut updated, &json);
+        }
+    }
+
+    updated
+}
+
+#[cfg(not(windows))]
+pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
+    let mut updated = current.clone();
+    if let Ok(output) = std::process::Command::new("/home/simon/.local/bin/agy")
+        .args(["-p", "/usage"])
+        .output()
+    {
+        if output.status.success() {
+            let tsv = String::from_utf8_lossy(&output.stdout);
+            update_snapshot_with_agy_tsv(&mut updated, &tsv);
+        }
+    }
+    if let Ok(output) = std::process::Command::new("/home/simon/projects/herdr-night-watch/tools/fetch_glm.sh")
+        .output()
+    {
+        if output.status.success() {
+            let json = String::from_utf8_lossy(&output.stdout);
+            update_snapshot_with_glm_json(&mut updated, &json);
+        }
+    }
+    updated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,7 +1075,7 @@ mod tests {
     #[test]
     fn test_quota_snapshot_baseline() {
         let snapshot = QuotaSnapshot::measured_baseline();
-        assert_eq!(snapshot.providers.len(), 3);
+        assert_eq!(snapshot.providers.len(), 4);
         assert!(snapshot.has_throttle);
 
         let glm = snapshot.get(ProviderId::Glm).expect("GLM present");
@@ -463,6 +1088,16 @@ mod tests {
         assert_eq!(codex.five_hour_percent, None);
         assert!(codex.is_throttled);
         assert_eq!(codex.status_text(), "Drossel aktiv");
+
+        let claude = snapshot.get(ProviderId::Claude).expect("Claude present");
+        assert_eq!(claude.week_percent, None);
+        assert_eq!(claude.five_hour_percent, None);
+        assert!(!claude.is_throttled);
+        assert_eq!(claude.title, "Claude");
+        assert_eq!(claude.author, "Anthropic");
+        let claude_fc = claude.pacing_forecast();
+        assert_eq!(claude_fc.localized_badge_text(Language::German), "Bereit");
+        assert_eq!(claude_fc.localized_summary_text(Language::German), "Telemetrie ausstehend");
     }
 
     #[test]
@@ -504,21 +1139,48 @@ mod tests {
     #[test]
     fn test_pacing_forecast_baseline() {
         let today = (2026, 9, 18);
+        let now = (14, 0);
 
         // GLM: 75% remaining, reset 01.10 (13 days away, 17 days elapsed of 30) -> Surplus
-        let glm_fc = pacing_forecast_for(false, Some(75), Some("01.10."), Some(76), Some(today));
+        // 5h: 76% remaining, reset 16:41 (161 mins away, 139 mins elapsed) -> lasts until 21:20 (+5 Stunden)
+        let glm_fc = pacing_forecast_for(
+            false,
+            Some(75),
+            Some("01.10."),
+            Some(76),
+            Some("16:41"),
+            Some(today),
+            Some(now),
+        );
         assert_eq!(glm_fc.health, PacingHealth::Surplus);
         assert!(glm_fc.pace_ratio.unwrap() < 0.6);
-        assert_eq!(glm_fc.summary_text, "Reicht locker");
+        assert_eq!(glm_fc.badge_text, "+5 Stunden (21:20)");
+        assert_eq!(glm_fc.summary_text, "+>30 Tage (Puffer)");
 
-        // AGI: 100% remaining, reset 25.09 (7 days away, 0 consumed) -> Surplus / Voller Puffer
-        let agi_fc = pacing_forecast_for(false, Some(100), Some("25.09."), Some(98), Some(today));
+        // AGI: 100% remaining, reset 25.09 (7 days away, 0 consumed) -> Surplus / buffer
+        let agi_fc = pacing_forecast_for(
+            false,
+            Some(100),
+            Some("25.09."),
+            Some(98),
+            Some("17:53"),
+            Some(today),
+            Some(now),
+        );
         assert_eq!(agi_fc.health, PacingHealth::Surplus);
-        assert_eq!(agi_fc.badge_text, "Pace 0.1x");
-        assert_eq!(agi_fc.summary_text, "Voller Puffer");
+        assert_eq!(agi_fc.badge_text, "+>24 Stunden");
+        assert_eq!(agi_fc.summary_text, "+>30 Tage (Puffer)");
 
         // Codex: Throttled (0% remaining, reset 23.09) -> Throttled
-        let codex_fc = pacing_forecast_for(true, Some(0), Some("23.09."), None, Some(today));
+        let codex_fc = pacing_forecast_for(
+            true,
+            Some(0),
+            Some("23.09."),
+            None,
+            None,
+            Some(today),
+            Some(now),
+        );
         assert_eq!(codex_fc.health, PacingHealth::Throttled);
         assert_eq!(codex_fc.badge_text, "Gedrosselt");
         assert_eq!(codex_fc.summary_text, "Reset 23.09.");
@@ -527,39 +1189,170 @@ mod tests {
     #[test]
     fn test_pacing_forecast_simon_scenario_tight() {
         // Simon's scenario: 50% consumed on Day 2 of 7-day week (5 days remaining)
-        // Reset in 5 days -> 2026-09-23 if today is 2026-09-18
+        // Reset in 5 days -> 2026-09-23 if today is 2026-09-18. Runway = 1.8 days -> -3 Tage (20.09.)
         let today = (2026, 9, 18);
-        let fc = pacing_forecast_for(false, Some(50), Some("23.09."), None, Some(today));
+        let now = (14, 0);
+        let fc = pacing_forecast_for(
+            false,
+            Some(50),
+            Some("23.09."),
+            None,
+            None,
+            Some(today),
+            Some(now),
+        );
         assert_eq!(fc.health, PacingHealth::Tight);
         assert!(fc.pace_ratio.unwrap() >= 1.6);
-        assert_eq!(fc.badge_text, "Pace 1.8x");
-        assert_eq!(fc.summary_text, "Schluss: 20.09. (~2 d)");
+        assert_eq!(fc.summary_text, "-3 Tage (20.09.)");
+    }
+
+    #[test]
+    fn test_five_hour_forecast_burst_exhaustion() {
+        // Rapid 5h burst: 70% consumed in 79 minutes (30% remaining, reset at 16:41, now 13:00)
+        // Burn rate = 70 / 79 = 0.886%/min -> runway = 30 / 0.886 = 34 mins -> empty at 13:34
+        // Delta from reset (221 mins away) = 34 - 221 = -187 mins -> -3 Stunden
+        let today = (2026, 9, 18);
+        let now = (13, 0);
+        let fc = pacing_forecast_for(
+            false,
+            Some(80),
+            Some("01.10."),
+            Some(30),
+            Some("16:41"),
+            Some(today),
+            Some(now),
+        );
+        assert_eq!(fc.health, PacingHealth::Tight);
+        assert!(fc.five_hour_forecast.as_ref().unwrap().is_exhausted_before_reset);
+        assert_eq!(fc.localized_upper_line(Language::German), "-3 Stunden (13:34)");
+        assert_eq!(fc.localized_upper_line(Language::English), "-3 hours (13:34)");
     }
 
     #[test]
     fn test_pacing_forecast_localization_en_de() {
         let today = (2026, 9, 18);
+        let now = (14, 0);
 
         // Throttled: DE = "Gedrosselt", EN = "Throttled"
-        let codex_fc = pacing_forecast_for(true, Some(0), Some("23.09."), None, Some(today));
+        let codex_fc = pacing_forecast_for(
+            true,
+            Some(0),
+            Some("23.09."),
+            None,
+            None,
+            Some(today),
+            Some(now),
+        );
         assert_eq!(codex_fc.localized_badge_text(Language::German), "Gedrosselt");
         assert_eq!(codex_fc.localized_badge_text(Language::English), "Throttled");
         assert_eq!(codex_fc.localized_summary_text(Language::German), "Reset 23.09.");
         assert_eq!(codex_fc.localized_summary_text(Language::English), "Reset 23.09.");
 
-        // Surplus ample runway: DE = "Reicht locker", EN = "Ample runway"
-        let glm_fc = pacing_forecast_for(false, Some(75), Some("01.10."), Some(76), Some(today));
-        assert_eq!(glm_fc.localized_summary_text(Language::German), "Reicht locker");
-        assert_eq!(glm_fc.localized_summary_text(Language::English), "Ample runway");
+        // GLM surplus: >14 days delta maps to +>30 Tage (Puffer) / +>30 days (Buffer)
+        let glm_fc = pacing_forecast_for(
+            false,
+            Some(75),
+            Some("01.10."),
+            Some(76),
+            Some("16:41"),
+            Some(today),
+            Some(now),
+        );
+        assert_eq!(glm_fc.localized_upper_line(Language::German), "+5 Stunden (21:20)");
+        assert_eq!(glm_fc.localized_upper_line(Language::English), "+5 hours (21:20)");
+        assert_eq!(glm_fc.localized_lower_line(Language::German), "+>30 Tage (Puffer)");
+        assert_eq!(glm_fc.localized_lower_line(Language::English), "+>30 days (Buffer)");
 
-        // Surplus full buffer: DE = "Voller Puffer", EN = "Full buffer"
-        let agi_fc = pacing_forecast_for(false, Some(100), Some("25.09."), Some(98), Some(today));
-        assert_eq!(agi_fc.localized_summary_text(Language::German), "Voller Puffer");
-        assert_eq!(agi_fc.localized_summary_text(Language::English), "Full buffer");
+        // AGI surplus: minimal burn DE = "+>30 Tage (Puffer)", EN = "+>30 days (Buffer)"
+        let agi_fc = pacing_forecast_for(
+            false,
+            Some(100),
+            Some("25.09."),
+            Some(98),
+            Some("17:53"),
+            Some(today),
+            Some(now),
+        );
+        assert_eq!(agi_fc.localized_upper_line(Language::German), "+>24 Stunden");
+        assert_eq!(agi_fc.localized_upper_line(Language::English), "+>24 hours");
+        assert_eq!(agi_fc.localized_lower_line(Language::German), "+>30 Tage (Puffer)");
+        assert_eq!(agi_fc.localized_lower_line(Language::English), "+>30 days (Buffer)");
 
-        // Tight: DE = "Schluss: 20.09. (~2 d)", EN = "Empty: 20.09 (~2 d)"
-        let tight_fc = pacing_forecast_for(false, Some(50), Some("23.09."), None, Some(today));
-        assert_eq!(tight_fc.localized_summary_text(Language::German), "Schluss: 20.09. (~2 d)");
-        assert_eq!(tight_fc.localized_summary_text(Language::English), "Empty: 20.09 (~2 d)");
+        // Tight: DE = "-3 Tage (20.09.)", EN = "-3 days (20.09)"
+        let tight_fc = pacing_forecast_for(
+            false,
+            Some(50),
+            Some("23.09."),
+            None,
+            None,
+            Some(today),
+            Some(now),
+        );
+        assert_eq!(tight_fc.localized_lower_line(Language::German), "-3 Tage (20.09.)");
+        assert_eq!(tight_fc.localized_lower_line(Language::English), "-3 days (20.09)");
+    }
+
+    #[test]
+    fn test_simon_glm_2218_past_cycle_scenario() {
+        // Simon's exact scenario: current time is 22:18, GLM has 76% remaining, reset was 16:41.
+        // 16:41 was 5.6 hours ago (>300 mins diff). It must NOT calculate false burst rate or trigger WARN!
+        let today = (2026, 9, 18);
+        let now = (22, 18);
+        let fc = pacing_forecast_for(
+            false,
+            Some(75),
+            Some("01.10."),
+            Some(76),
+            Some("16:41"),
+            Some(today),
+            Some(now),
+        );
+        assert_eq!(fc.health, PacingHealth::Surplus);
+        assert_eq!(fc.localized_upper_line(Language::English), "+>24 hours");
+        assert_eq!(fc.localized_upper_line(Language::German), "+>24 Stunden");
+        assert_eq!(fc.localized_lower_line(Language::English), "+>30 days (Buffer)");
+    }
+
+    #[test]
+    fn test_update_snapshot_with_agy_tsv() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        let tsv = "Gemini Models\tFive Hour Limit Remaining\t92%\t2026-09-19T13:05:01Z\nGemini Models\tWeekly Limit Remaining\t89%\t2026-09-25T10:53:16Z\nClaude and GPT models\tWeekly Limit Remaining\t100%\t2026-09-26T08:25:40Z\nClaude and GPT models\tFive Hour Limit Remaining\t100%\t2026-09-19T13:25:40Z";
+        update_snapshot_with_agy_tsv(&mut snapshot, tsv);
+        let agi = snapshot.get(ProviderId::Agy).expect("AGI exists");
+        assert_eq!(agi.five_hour_percent, Some(92));
+        assert_eq!(agi.week_percent, Some(89));
+        assert_eq!(agi.week_reset, Some("25.09.".to_string()));
+        assert!(agi.five_hour_reset.is_some());
+    }
+
+    #[test]
+    fn test_update_snapshot_with_glm_json() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        let json = r#"{"code":200,"msg":"Operation successful","data":{"limits":[{"type":"TIME_LIMIT","unit":5,"number":1,"usage":4000,"currentValue":1039,"remaining":2961,"percentage":25,"nextResetTime":1790868874997,"usageDetails":[]},{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":7,"nextResetTime":1789822910132}],"level":"max"},"success":true}"#;
+        update_snapshot_with_glm_json(&mut snapshot, json);
+        let glm = snapshot.get(ProviderId::Glm).expect("GLM exists");
+        assert_eq!(glm.five_hour_percent, Some(93)); // 100 - 7 = 93
+        assert_eq!(glm.week_percent, Some(75)); // 100 - 25 = 75
+        assert_eq!(glm.week_reset, Some("01.10.".to_string()));
+        assert!(glm.five_hour_reset.is_some());
+        assert_eq!(glm.cycle_label(), "Mo");
+    }
+
+    #[test]
+    fn test_five_hour_pace_text_ratio() {
+        let fc = pacing_forecast_for(
+            false,
+            Some(80),
+            Some("25.09."),
+            Some(96),
+            Some("19:45"),
+            Some((2026, 9, 19)),
+            Some((15, 0)),
+        );
+        let pace_de = fc.five_hour_pace_text(Language::German);
+        let pace_en = fc.five_hour_pace_text(Language::English);
+        assert!(pace_de.starts_with("Pace: "), "Got: {pace_de}");
+        assert!(pace_en.starts_with("Pace: "), "Got: {pace_en}");
+        assert!(pace_de.contains("x · "), "Got: {pace_de}");
     }
 }

@@ -1,9 +1,11 @@
 use crate::{
+    autostart,
     backend::{self, AgentSummary, CompletionAction, WatchStatus},
     language::Language,
     log_viewer,
     media::{self, MediaCommand, MediaSnapshot},
-    quota::{PacingHealth, ProviderId, ProviderQuota, QuotaSnapshot},
+    quota::{PacingForecast, PacingHealth, ProviderId, ProviderQuota, QuotaSnapshot},
+    settings,
     system_metrics::{self, SystemMetrics},
     taskbar,
     weather::{self, WeatherLocation, WeatherReading, WeatherSymbol},
@@ -82,6 +84,72 @@ const WINDOW_CONTROL_HOOD_STROKE: egui::Color32 = egui::Color32::from_rgb(66, 74
 const WINDOW_DRAG_THRESHOLD_SQUARED: f32 = 4.0;
 const DESIGN_WIDTH: f32 = 393.0;
 const DESIGN_HEIGHT: f32 = 190.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderColorDef {
+    pub name_de: &'static str,
+    pub name_en: &'static str,
+    pub color: egui::Color32,
+}
+
+pub const PROVIDER_PASTEL_PALETTE: [ProviderColorDef; 10] = [
+    ProviderColorDef {
+        name_de: "Flieder",
+        name_en: "Lavender",
+        color: egui::Color32::from_rgb(213, 162, 250), // Hue 275 (AGI default)
+    },
+    ProviderColorDef {
+        name_de: "Himmelblau",
+        name_en: "Sky Blue",
+        color: egui::Color32::from_rgb(162, 206, 250), // Hue 210
+    },
+    ProviderColorDef {
+        name_de: "Aquamarin",
+        name_en: "Teal",
+        color: egui::Color32::from_rgb(162, 250, 250), // Hue 180
+    },
+    ProviderColorDef {
+        name_de: "Whisper Jade",
+        name_en: "Mint",
+        color: egui::Color32::from_rgb(162, 250, 199), // Hue 145 (Codex default)
+    },
+    ProviderColorDef {
+        name_de: "Pistazie",
+        name_en: "Lime",
+        color: egui::Color32::from_rgb(213, 250, 162), // Hue 85
+    },
+    ProviderColorDef {
+        name_de: "Goldgelb",
+        name_en: "Butter Gold",
+        color: egui::Color32::from_rgb(250, 232, 162), // Hue 48
+    },
+    ProviderColorDef {
+        name_de: "Aprikose",
+        name_en: "Warm Amber",
+        color: egui::Color32::from_rgb(250, 203, 162), // Hue 28 (GLM / Claude default)
+    },
+    ProviderColorDef {
+        name_de: "Pastellkorall",
+        name_en: "Coral",
+        color: egui::Color32::from_rgb(250, 171, 162), // Hue 6
+    },
+    ProviderColorDef {
+        name_de: "Flamingo",
+        name_en: "Rose",
+        color: egui::Color32::from_rgb(250, 162, 206), // Hue 330
+    },
+    ProviderColorDef {
+        name_de: "Blaulila",
+        name_en: "Soft Indigo",
+        color: egui::Color32::from_rgb(170, 162, 250), // Hue 245
+    },
+];
+
+pub fn provider_palette_color(index: u8) -> egui::Color32 {
+    let idx = (index as usize) % PROVIDER_PASTEL_PALETTE.len();
+    PROVIDER_PASTEL_PALETTE[idx].color
+}
+
 // Five screen pixels at the standard 150 % Windows scaling.
 const KPI_ROW_TOP_GAP: f32 = 9.3;
 const RESIZE_GRIP_SIZE: f32 = 16.0;
@@ -621,6 +689,108 @@ fn is_live_window_title(title: &str) -> bool {
     title == "Herdr-Nachtwächter - Live-Status" || title == "Herdr Night Watch - Live Status"
 }
 
+fn is_satellite_window_title(title: &str) -> bool {
+    title == "Herdr-Nachtwächter - Limits" || title == "Herdr Night Watch - Limits"
+}
+
+fn find_satellite_window() -> Option<HWND> {
+    pick_satellite_window(None, None)
+}
+
+fn find_satellite_window_for_pid(pid: u32) -> Option<HWND> {
+    pick_satellite_window(Some(pid), None)
+}
+
+fn pick_satellite_window(required_pid: Option<u32>, exclude_pid: Option<u32>) -> Option<HWND> {
+    let mut search = SatelliteWindowQuery {
+        required_pid,
+        exclude_pid,
+        pick: LiveWindowPick::default(),
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(find_satellite_window_callback),
+            &mut search as *mut _ as LPARAM,
+        );
+    }
+    search.pick.hwnd
+}
+
+struct SatelliteWindowQuery {
+    required_pid: Option<u32>,
+    exclude_pid: Option<u32>,
+    pick: LiveWindowPick,
+}
+
+unsafe extern "system" fn find_satellite_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    unsafe {
+        let search = &mut *(lparam as *mut SatelliteWindowQuery);
+        if let Some((score, area)) =
+            score_satellite_window(hwnd, search.required_pid, search.exclude_pid)
+            && (score > search.pick.score
+                || (score == search.pick.score && area > search.pick.area))
+        {
+            search.pick.hwnd = Some(hwnd);
+            search.pick.score = score;
+            search.pick.area = area;
+        }
+    }
+    1
+}
+
+fn score_satellite_window(
+    hwnd: HWND,
+    required_pid: Option<u32>,
+    exclude_pid: Option<u32>,
+) -> Option<(i32, i64)> {
+    let mut window_pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut window_pid);
+    }
+    if required_pid.is_none() && !process_image_is_this_app(window_pid) {
+        return None;
+    }
+    let (visible, minimized, width, height) = live_window_metrics(hwnd);
+    score_satellite_window_facts(
+        &LiveWindowFacts {
+            title: window_title(hwnd),
+            class: window_class(hwnd),
+            visible,
+            minimized,
+            width,
+            height,
+            pid: window_pid,
+        },
+        required_pid,
+        exclude_pid,
+    )
+}
+
+fn score_satellite_window_facts(
+    facts: &LiveWindowFacts,
+    required_pid: Option<u32>,
+    exclude_pid: Option<u32>,
+) -> Option<(i32, i64)> {
+    if is_helper_window_class(&facts.class) {
+        return None;
+    }
+    if let Some(required_pid) = required_pid
+        && facts.pid != required_pid
+    {
+        return None;
+    }
+    if let Some(exclude_pid) = exclude_pid
+        && facts.pid == exclude_pid
+    {
+        return None;
+    }
+    if !is_satellite_window_title(&facts.title) {
+        return None;
+    }
+    let area = i64::from(facts.width.max(1)) * i64::from(facts.height.max(1));
+    Some((100, area))
+}
+
 fn window_title(hwnd: HWND) -> String {
     unsafe {
         let length = GetWindowTextLengthW(hwnd);
@@ -1052,13 +1222,21 @@ fn refresh_is_due(last: Option<Instant>, interval: Duration, now: Instant) -> bo
 
 fn apply_taskbar_visibility(hwnd: HWND) {
     let _ = taskbar::set_visible(hwnd, window_settings::live_status_in_taskbar());
+    if let Some(sat_hwnd) = find_satellite_window() {
+        taskbar::set_satellite_exempt(sat_hwnd, Some(hwnd));
+    }
 }
 
 pub fn apply_taskbar_setting() -> Result<()> {
-    if let Some(hwnd) = find_live_window()
-        && !taskbar::set_visible(hwnd, window_settings::live_status_in_taskbar())
+    let show = window_settings::live_status_in_taskbar();
+    let main_hwnd = find_live_window();
+    if let Some(hwnd) = main_hwnd
+        && !taskbar::set_visible(hwnd, show)
     {
         anyhow::bail!("Windows konnte die Taskleistenanzeige nicht ändern");
+    }
+    if let Some(sat_hwnd) = find_satellite_window() {
+        taskbar::set_satellite_exempt(sat_hwnd, main_hwnd);
     }
     Ok(())
 }
@@ -1423,11 +1601,50 @@ struct LiveStatusApp {
     last_saved_position: Option<[f32; 2]>,
     owner_pid: Option<u32>,
     quota_snapshot: QuotaSnapshot,
+    quota_rx: Receiver<QuotaSnapshot>,
+    quota_tx: Sender<QuotaSnapshot>,
+    quota_checking: bool,
+    last_quota_fetch: Option<Instant>,
     quota_open: bool,
     quota_docked: bool,
     quota_pos: Option<[f32; 2]>,
     quota_drag_active: bool,
     quota_resize_drag: Option<(egui::Pos2, f32, egui::Vec2)>,
+    satellite_configured_hwnd: Option<HWND>,
+    quota_show_glm: bool,
+    quota_show_agi: bool,
+    quota_show_codex: bool,
+    quota_show_claude: bool,
+    quota_color_glm: u8,
+    quota_color_agi: u8,
+    quota_color_codex: u8,
+    quota_color_claude: u8,
+    quota_settings_open: bool,
+    config_tab: ConfigTab,
+    corner_radius: u8,
+    pomodoro_total_seconds: f32,
+    pomodoro_remaining_seconds: f32,
+    pomodoro_running: bool,
+    pomodoro_last_tick: Option<Instant>,
+    pomodoro_drag_active: bool,
+    main_hwnd: Option<HWND>,
+    satellite_hwnd: Option<HWND>,
+    last_position_persist: Option<Instant>,
+    pending_persist_position: Option<[f32; 2]>,
+    last_settings_poll: Option<Instant>,
+    last_docked_state: Option<bool>,
+    last_synced_radius: Option<u8>,
+    first_frame_painted: bool,
+    satellite_frames_painted: usize,
+    satellite_opacity_applied: Option<(HWND, u8)>,
+    last_synced_sat_height: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigTab {
+    Providers,
+    Window,
+    System,
 }
 
 impl Drop for LiveStatusApp {
@@ -1443,6 +1660,7 @@ impl LiveStatusApp {
         let (metrics_tx, metrics_rx) = mpsc::channel();
         let (media_command_tx, media_rx) = media::spawn_worker();
         let (weather_tx, weather_rx) = mpsc::channel();
+        let (quota_tx, quota_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut sampler = system_metrics::Sampler::new();
             loop {
@@ -1496,11 +1714,118 @@ impl LiveStatusApp {
             last_saved_position: window_settings::live_status_position(),
             owner_pid,
             quota_snapshot: QuotaSnapshot::measured_baseline(),
+            quota_rx,
+            quota_tx,
+            quota_checking: false,
+            last_quota_fetch: None,
             quota_open: window_settings::live_status_quota_open(),
             quota_docked: window_settings::live_status_quota_docked(),
             quota_pos: window_settings::live_status_quota_position(),
             quota_drag_active: false,
             quota_resize_drag: None,
+            satellite_configured_hwnd: None,
+            quota_show_glm: window_settings::live_status_quota_show_glm(),
+            quota_show_agi: window_settings::live_status_quota_show_agi(),
+            quota_show_codex: window_settings::live_status_quota_show_codex(),
+            quota_show_claude: window_settings::live_status_quota_show_claude(),
+            quota_color_glm: window_settings::live_status_quota_color_glm(),
+            quota_color_agi: window_settings::live_status_quota_color_agi(),
+            quota_color_codex: window_settings::live_status_quota_color_codex(),
+            quota_color_claude: window_settings::live_status_quota_color_claude(),
+            quota_settings_open: window_settings::live_status_quota_settings_open(),
+            config_tab: ConfigTab::Window,
+            corner_radius: window_settings::live_status_corner_radius(),
+            pomodoro_total_seconds: 0.0,
+            pomodoro_remaining_seconds: 0.0,
+            pomodoro_running: false,
+            pomodoro_last_tick: None,
+            pomodoro_drag_active: false,
+            main_hwnd: None,
+            satellite_hwnd: None,
+            last_position_persist: None,
+            pending_persist_position: None,
+            last_settings_poll: None,
+            last_docked_state: None,
+            last_synced_radius: None,
+            first_frame_painted: false,
+            satellite_frames_painted: 0,
+            satellite_opacity_applied: None,
+            last_synced_sat_height: None,
+        }
+    }
+
+    pub fn sync_corner_regions(&self) {
+        let is_docked = self.quota_open && self.quota_docked;
+        let r = self.corner_radius;
+        let scale = self.scale;
+        if let Some(main_hwnd) = self.main_hwnd {
+            window_chrome::apply_corner_preference(main_hwnd, r, false, is_docked, scale);
+        }
+        if let Some(sat_hwnd) = self.satellite_hwnd {
+            let sat_h = self.last_synced_sat_height.unwrap_or(314.0);
+            window_chrome::sync_satellite_size(sat_hwnd, sat_h, self.main_hwnd, r, is_docked);
+        }
+    }
+
+    pub fn set_corner_radius(&mut self, radius: u8) {
+        let r = window_settings::clamp_corner_radius(radius);
+        self.corner_radius = r;
+        let _ = window_settings::set_live_status_corner_radius(r);
+        self.sync_corner_regions();
+    }
+
+    pub fn apply_opacity(&mut self, opacity: u8) {
+        self.opacity = Some(opacity);
+        self.satellite_opacity_applied = None;
+        let _ = window_settings::set_opacity(opacity);
+        if let Some(main_hwnd) = self.main_hwnd {
+            window_chrome::apply_window_opacity_hwnd(main_hwnd, opacity);
+        } else {
+            window_chrome::apply_window_opacity(opacity, live_title(self.language));
+        }
+        if let Some(sat_hwnd) = self.satellite_hwnd {
+            window_chrome::apply_window_opacity_hwnd(sat_hwnd, opacity);
+        } else {
+            let sat_title = match self.language {
+                Language::German => "Herdr-Nachtwächter - Limits",
+                Language::English => "Herdr Night Watch - Limits",
+            };
+            window_chrome::apply_window_opacity(opacity, sat_title);
+        }
+    }
+
+    pub fn provider_color_idx(&self, id: ProviderId) -> u8 {
+        match id {
+            ProviderId::Glm => self.quota_color_glm,
+            ProviderId::Agy => self.quota_color_agi,
+            ProviderId::Codex => self.quota_color_codex,
+            ProviderId::Claude => self.quota_color_claude,
+        }
+    }
+
+    pub fn provider_color(&self, id: ProviderId) -> egui::Color32 {
+        provider_palette_color(self.provider_color_idx(id))
+    }
+
+    pub fn set_provider_color(&mut self, id: ProviderId, color_idx: u8) {
+        let idx = color_idx.min(9);
+        match id {
+            ProviderId::Glm => {
+                self.quota_color_glm = idx;
+                let _ = window_settings::set_live_status_quota_color_glm(idx);
+            }
+            ProviderId::Agy => {
+                self.quota_color_agi = idx;
+                let _ = window_settings::set_live_status_quota_color_agi(idx);
+            }
+            ProviderId::Codex => {
+                self.quota_color_codex = idx;
+                let _ = window_settings::set_live_status_quota_color_codex(idx);
+            }
+            ProviderId::Claude => {
+                self.quota_color_claude = idx;
+                let _ = window_settings::set_live_status_quota_color_claude(idx);
+            }
         }
     }
 
@@ -1570,6 +1895,33 @@ impl LiveStatusApp {
                 self.weather_location = reading.location.clone();
                 self.weather_reading = Some(reading);
             }
+        }
+    }
+
+    fn refresh_quota(&mut self) {
+        if self.quota_checking
+            || !refresh_is_due(
+                self.last_quota_fetch,
+                Duration::from_secs(45),
+                Instant::now(),
+            )
+        {
+            return;
+        }
+        self.quota_checking = true;
+        self.last_quota_fetch = Some(Instant::now());
+        let sender = self.quota_tx.clone();
+        let snapshot = self.quota_snapshot.clone();
+        thread::spawn(move || {
+            let updated = crate::quota::fetch_live_snapshot(&snapshot);
+            let _ = sender.send(updated);
+        });
+    }
+
+    fn collect_quota(&mut self) {
+        while let Ok(snapshot) = self.quota_rx.try_recv() {
+            self.quota_checking = false;
+            self.quota_snapshot = snapshot;
         }
     }
 
@@ -1724,34 +2076,165 @@ impl eframe::App for LiveStatusApp {
                 live_title(current_language).into(),
             ));
         }
-        let current_opacity = window_settings::opacity();
-        if self.opacity != Some(current_opacity) {
-            window_chrome::apply_window_opacity(current_opacity, live_title(self.language));
-            self.opacity = Some(current_opacity);
+
+        let mut hwnds_changed = false;
+        if self.main_hwnd.is_none() {
+            self.main_hwnd = find_live_window_for_pid(current_pid());
+            if self.main_hwnd.is_some() {
+                hwnds_changed = true;
+            }
         }
-        let current_window_level = window_settings::WindowLevel::current();
-        if current_window_level != self.window_level {
-            self.window_level = current_window_level;
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                    window_chrome::window_level(current_window_level),
-                ));
+        if self.quota_open {
+            if self.satellite_hwnd.is_none() {
+                self.satellite_hwnd = find_satellite_window_for_pid(current_pid());
+                if self.satellite_hwnd.is_some() {
+                    hwnds_changed = true;
+                }
+            }
+            if let Some(sat_hwnd) = self.satellite_hwnd {
+                if self.satellite_configured_hwnd != Some(sat_hwnd)
+                    || !taskbar::is_satellite_exempt_synced(sat_hwnd)
+                {
+                    let main_hwnd = self.main_hwnd;
+                    taskbar::set_satellite_exempt(sat_hwnd, main_hwnd);
+                    self.satellite_configured_hwnd = Some(sat_hwnd);
+                    hwnds_changed = true;
+                }
+            }
+        } else {
+            if self.satellite_hwnd.is_some() {
+                hwnds_changed = true;
+            }
+            self.satellite_hwnd = None;
+            self.satellite_configured_hwnd = None;
+            self.satellite_frames_painted = 0;
+            self.satellite_opacity_applied = None;
+            self.last_synced_sat_height = None;
         }
-        let current_taskbar_visibility = window_settings::live_status_in_taskbar();
-        if self.taskbar_visible != Some(current_taskbar_visibility)
-            && let Some(hwnd) = find_live_window()
-            && taskbar::set_visible(hwnd, current_taskbar_visibility)
-        {
-            self.taskbar_visible = Some(current_taskbar_visibility);
+
+        if hwnds_changed {
+            self.sync_corner_regions();
+        }
+
+        let now = Instant::now();
+        let settings_poll_due = self
+            .last_settings_poll
+            .map_or(true, |t| now.duration_since(t) >= Duration::from_millis(500));
+        if settings_poll_due {
+            self.last_settings_poll = Some(now);
+            if self.first_frame_painted {
+                let current_opacity = window_settings::opacity();
+                if self.opacity != Some(current_opacity) {
+                    self.apply_opacity(current_opacity);
+                }
+            }
+            let current_window_level = window_settings::WindowLevel::current();
+            if current_window_level != self.window_level {
+                self.window_level = current_window_level;
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                        window_chrome::window_level(current_window_level),
+                    ));
+            }
+            let current_taskbar_visibility = window_settings::live_status_in_taskbar();
+            if let Some(hwnd) = self.main_hwnd {
+                if self.taskbar_visible != Some(current_taskbar_visibility)
+                    || !taskbar::is_taskbar_style_synced(hwnd, current_taskbar_visibility)
+                {
+                    let _ = taskbar::set_visible(hwnd, current_taskbar_visibility);
+                    self.taskbar_visible = Some(current_taskbar_visibility);
+                }
+            }
+            self.quota_show_glm = window_settings::live_status_quota_show_glm();
+            self.quota_show_agi = window_settings::live_status_quota_show_agi();
+            self.quota_show_codex = window_settings::live_status_quota_show_codex();
+            self.quota_show_claude = window_settings::live_status_quota_show_claude();
+            self.quota_color_glm = window_settings::live_status_quota_color_glm();
+            self.quota_color_agi = window_settings::live_status_quota_color_agi();
+            self.quota_color_codex = window_settings::live_status_quota_color_codex();
+            self.quota_color_claude = window_settings::live_status_quota_color_claude();
+            let current_radius = window_settings::live_status_corner_radius();
+            if current_radius != self.corner_radius {
+                self.set_corner_radius(current_radius);
+            }
+            let current_quota_open = window_settings::live_status_quota_open();
+            if current_quota_open != self.quota_open {
+                self.quota_open = current_quota_open;
+            }
+            let current_quota_docked = window_settings::live_status_quota_docked();
+            if current_quota_docked != self.quota_docked {
+                self.quota_docked = current_quota_docked;
+            }
+            let current_quota_settings_open = window_settings::live_status_quota_settings_open();
+            if current_quota_settings_open != self.quota_settings_open {
+                self.quota_settings_open = current_quota_settings_open;
+                self.last_synced_sat_height = None;
+            }
+        }
+
+        if self.quota_open && self.satellite_frames_painted >= 2 {
+            let op = self.opacity.unwrap_or_else(window_settings::opacity);
+            if let Some(sat_hwnd) = self.satellite_hwnd {
+                if self.satellite_opacity_applied != Some((sat_hwnd, op)) {
+                    window_chrome::apply_window_opacity_hwnd(sat_hwnd, op);
+                    self.satellite_opacity_applied = Some((sat_hwnd, op));
+                    self.sync_corner_regions();
+                }
+            }
         }
         self.collect_results();
         self.collect_actions();
         self.collect_metrics();
         self.collect_media();
         self.collect_weather();
+        self.collect_quota();
         self.refresh();
         self.refresh_weather();
-        window_chrome::paint_gradient(ui.painter(), ui.max_rect(), BG_TOP, BG_BOTTOM);
+        self.refresh_quota();
+        if self.pomodoro_running {
+            let now = Instant::now();
+            if let Some(last) = self.pomodoro_last_tick {
+                let delta = now.duration_since(last).as_secs_f32();
+                self.pomodoro_remaining_seconds = (self.pomodoro_remaining_seconds - delta).max(0.0);
+                if self.pomodoro_remaining_seconds <= 0.0 {
+                    self.pomodoro_remaining_seconds = 0.0;
+                    self.pomodoro_total_seconds = 0.0;
+                    self.pomodoro_running = false;
+                    #[cfg(windows)]
+                    unsafe {
+                        unsafe extern "system" {
+                            fn MessageBeep(u_type: u32) -> i32;
+                        }
+                        MessageBeep(0x00000040);
+                    }
+                    self.toast = Some(Toast {
+                        message: self
+                            .language
+                            .text(
+                                "⏱ Pomodoro abgeschlossen! Zeit für eine Pause.",
+                                "⏱ Pomodoro finished! Time for a break.",
+                            )
+                            .into(),
+                        color: egui::Color32::from_rgb(239, 68, 68),
+                        expires_at: now + Duration::from_secs(6),
+                    });
+                }
+            }
+            self.pomodoro_last_tick = Some(now);
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        } else {
+            self.pomodoro_last_tick = None;
+        }
+        if self.pomodoro_drag_active {
+            ui.ctx().request_repaint();
+        }
+        let is_docked = self.quota_open && self.quota_docked;
+        if self.last_docked_state != Some(is_docked) || self.last_synced_radius != Some(self.corner_radius) {
+            self.last_docked_state = Some(is_docked);
+            self.last_synced_radius = Some(self.corner_radius);
+            self.sync_corner_regions();
+        }
+        window_chrome::default_gradient(ui.painter(), ui.max_rect());
         // Register the controls now, then paint them after the content. This
         // deliberately gives their opaque hood precedence over the weather
         // line and any clock artwork that reaches into the title area.
@@ -1977,28 +2460,88 @@ impl eframe::App for LiveStatusApp {
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
                                 ui.add_space(30.0);
-                                let response = moon_icon(
-                                        ui,
-                                        moon.color,
-                                        MOON_ICON_DIAMETER,
-                                        gradient_rect,
-                                        moon.temperature_c,
-                                        moon.weather_symbol,
-                                        moon.phase,
-                                        self.clock_visible,
-                                        self.clock_second_hand_visible,
-                                    )
-                                    .on_hover_text(moon.tooltip);
-                                if response.hovered() && !self.action_in_progress {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                let (response, clock_interaction) = moon_icon(
+                                    ui,
+                                    moon.color,
+                                    MOON_ICON_DIAMETER,
+                                    gradient_rect,
+                                    moon.temperature_c,
+                                    moon.weather_symbol,
+                                    moon.phase,
+                                    self.clock_visible,
+                                    self.clock_second_hand_visible,
+                                    self.pomodoro_total_seconds,
+                                    self.pomodoro_remaining_seconds,
+                                    self.pomodoro_running,
+                                );
+                                let tooltip = if self.clock_visible {
+                                    if self.pomodoro_total_seconds > 0.0 {
+                                        let mins = (self.pomodoro_remaining_seconds / 60.0).ceil() as u32;
+                                        let total_mins = (self.pomodoro_total_seconds / 60.0).round() as u32;
+                                        let state_label = if self.pomodoro_running {
+                                            self.language.text("Läuft", "Running")
+                                        } else {
+                                            self.language.text("Pausiert", "Paused")
+                                        };
+                                        format!(
+                                            "{}\n⏱ Pomodoro: {mins} / {total_mins} min ({state_label})\n{}",
+                                            moon.tooltip,
+                                            self.language.text(
+                                                "Mitte: Start/Pause · Ziehen: Einstellen · Doppelklick: Löschen",
+                                                "Center: Start/Pause · Drag: Set time · Double click: Reset",
+                                            ),
+                                        )
+                                    } else {
+                                        format!(
+                                            "{}\n{}",
+                                            moon.tooltip,
+                                            self.language.text(
+                                                "⏱ Pomodoro: Auf Ziffernblatt ziehen (bis 60 Min.) oder Mitte klicken (25 Min.) · Doppelklick: Löschen",
+                                                "⏱ Pomodoro: Drag on dial (up to 60 min) or click center (25 min) · Double click: Reset",
+                                            ),
+                                        )
+                                    }
+                                } else {
+                                    moon.tooltip.to_string()
+                                };
+                                let _ = response.on_hover_text(tooltip);
+
+                                match clock_interaction {
+                                    ClockInteraction::TogglePomodoro => {
+                                        if self.pomodoro_running {
+                                            self.pomodoro_running = false;
+                                        } else {
+                                            if self.pomodoro_remaining_seconds <= 0.0 {
+                                                self.pomodoro_total_seconds = 25.0 * 60.0;
+                                                self.pomodoro_remaining_seconds = 25.0 * 60.0;
+                                            }
+                                            self.pomodoro_running = true;
+                                            self.pomodoro_last_tick = Some(Instant::now());
+                                        }
+                                    }
+                                    ClockInteraction::SetPomodoroSeconds(seconds) => {
+                                        self.pomodoro_total_seconds = seconds;
+                                        self.pomodoro_remaining_seconds = seconds;
+                                        self.pomodoro_running = false;
+                                    }
+                                    ClockInteraction::ResetPomodoro => {
+                                        self.pomodoro_total_seconds = 0.0;
+                                        self.pomodoro_remaining_seconds = 0.0;
+                                        self.pomodoro_running = false;
+                                    }
+                                    ClockInteraction::TriggerNightAction => {
+                                        if !self.action_in_progress {
+                                            self.run_action(action);
+                                        }
+                                    }
+                                    ClockInteraction::None => {}
                                 }
-                                if !self.action_in_progress && response.clicked() {
-                                    self.run_action(action);
-                                }
+
                                 if let Some(seconds_remaining) = countdown_seconds {
-                                    ui.add_space(1.0);
+                                    ui.add_space(11.0);
                                     ui.label(
                                         egui::RichText::new(format_countdown(seconds_remaining))
+                                            .size(11.0)
                                             .strong()
                                             .color(RED),
                                     );
@@ -2017,6 +2560,10 @@ impl eframe::App for LiveStatusApp {
                     &self.quota_snapshot,
                     self.quota_open,
                     self.language,
+                    self.quota_show_glm,
+                    self.quota_show_agi,
+                    self.quota_show_codex,
+                    self.quota_show_claude,
                 );
                 if let Some(position) = seek_action {
                     let _ = self.media_command_tx.send(MediaCommand::Seek(position));
@@ -2043,28 +2590,80 @@ impl eframe::App for LiveStatusApp {
         // Each repaint has a small random black-flash chance on the OpenGL
         // surface (see window_settings::REPAINT_INTERVAL_MS_VALUES), so the
         // cadence is a user setting instead of a constant.
-        ui.ctx().request_repaint_after(Duration::from_millis(u64::from(
-            self.repaint_interval_ms,
-        )));
+        let repaint_delay = if self.pomodoro_running {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(u64::from(self.repaint_interval_ms))
+        };
+        if !self.first_frame_painted {
+            self.first_frame_painted = true;
+            ui.ctx().request_repaint();
+        }
+        ui.ctx().request_repaint_after(repaint_delay);
     }
 }
 
 fn persist_window_position(app: &mut LiveStatusApp, ctx: &egui::Context) {
-    if ctx.input(|input| input.pointer.primary_down()) {
-        return;
-    }
-    let position = ctx.input(|input| {
+    let primary_down = ctx.input(|input| input.pointer.primary_down());
+    let current_pos = ctx.input(|input| {
         input
             .viewport()
             .outer_rect
             .map(|rect| [rect.min.x.round(), rect.min.y.round()])
     });
-    if position != app.last_saved_position
-        && let Some(position) = position
-        && window_settings::set_live_status_position(position).is_ok()
-    {
-        app.last_saved_position = Some(position);
+
+    if primary_down || app.window_drag_started {
+        if let Some(pos) = current_pos {
+            app.pending_persist_position = Some(pos);
+            app.last_position_persist = Some(Instant::now());
+        }
+        return;
     }
+
+    if let Some(pending) = app.pending_persist_position {
+        let is_settled = app
+            .last_position_persist
+            .map_or(true, |t| t.elapsed() >= Duration::from_millis(400));
+        if is_settled {
+            if Some(pending) != app.last_saved_position {
+                let _ = window_settings::set_live_status_position(pending);
+                app.last_saved_position = Some(pending);
+            }
+            app.pending_persist_position = None;
+        }
+    } else if let Some(pos) = current_pos {
+        if Some(pos) != app.last_saved_position {
+            app.pending_persist_position = Some(pos);
+            app.last_position_persist = Some(Instant::now());
+        }
+    }
+}
+
+fn provider_card_height(quota: &ProviderQuota) -> f32 {
+    let has_5h = quota.five_hour_percent.is_some() || quota.five_hour_reset.is_some();
+    let has_wk = quota.week_percent.is_some() || quota.week_reset.is_some();
+    let count = match (has_5h, has_wk) {
+        (true, true) => 2,
+        (false, false) => 1,
+        _ => 1,
+    };
+    if count == 2 {
+        104.0
+    } else {
+        68.0
+    }
+}
+
+fn quota_satellite_design_height(visible_providers: &[ProviderQuota], settings_open: bool) -> f32 {
+    if settings_open {
+        return 314.0;
+    }
+    if visible_providers.is_empty() {
+        return 38.0 + 42.0 + 8.0;
+    }
+    let total_cards: f32 = visible_providers.iter().map(provider_card_height).sum();
+    let gaps = (visible_providers.len() - 1) as f32 * 6.0;
+    38.0 + total_cards + gaps + 8.0
 }
 
 fn apply_live_status_scale(
@@ -2086,16 +2685,30 @@ fn apply_live_status_scale(
     )));
     if app.quota_open {
         let quota_viewport_id = egui::ViewportId::from_hash_of("live_status_quota_viewport");
+        let visible_providers: Vec<ProviderQuota> = app
+            .quota_snapshot
+            .providers
+            .iter()
+            .filter(|p| match p.id {
+                ProviderId::Glm => app.quota_show_glm,
+                ProviderId::Agy => app.quota_show_agi,
+                ProviderId::Codex => app.quota_show_codex,
+                ProviderId::Claude => app.quota_show_claude,
+            })
+            .cloned()
+            .collect();
+        let sat_height = quota_satellite_design_height(&visible_providers, app.quota_settings_open);
+        app.last_synced_sat_height = Some(sat_height);
         ctx.send_viewport_cmd_to(
             quota_viewport_id,
             egui::ViewportCommand::InnerSize(egui::vec2(
                 DESIGN_WIDTH * scale / previous_zoom,
-                176.0 * scale / previous_zoom,
+                sat_height * scale / previous_zoom,
             )),
         );
         if app.quota_docked {
             if let Some(main) = ctx.input(|i| i.viewport().outer_rect) {
-                let dock_overlap = (2.5 * scale).round();
+                let dock_overlap = 1.0;
                 ctx.send_viewport_cmd_to(
                     quota_viewport_id,
                     egui::ViewportCommand::OuterPosition(egui::pos2(
@@ -2105,6 +2718,7 @@ fn apply_live_status_scale(
                 );
             }
         }
+        app.sync_corner_regions();
     }
     if persist {
         let _ = window_settings::set_live_status_scale(scale);
@@ -2217,11 +2831,11 @@ fn handle_window_resize(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
     } else {
         egui::Color32::from_rgba_unmultiplied(148, 163, 184, 65)
     };
-    for offset in [0.0, 5.0, 10.0] {
+    for offset in [0.0, 4.0, 8.0] {
         ui.painter().line_segment(
             [
-                egui::pos2(grip.right() - 4.0 - offset, grip.bottom() - 1.0),
-                egui::pos2(grip.right() - 1.0, grip.bottom() - 4.0 - offset),
+                egui::pos2(grip.right() - 7.0 - offset, grip.bottom() - 4.0),
+                egui::pos2(grip.right() - 4.0, grip.bottom() - 7.0 - offset),
             ],
             egui::Stroke::new(1.0, color),
         );
@@ -2236,17 +2850,39 @@ fn handle_window_resize(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
         // opacity, not just a thin outline. The old content remains readable
         // underneath so the user can still orient themselves while dragging.
         let preview_fill = egui::Color32::from_rgba_unmultiplied(15, 31, 56, 128);
+        let r = app.corner_radius;
+        let is_docked = app.quota_open && app.quota_docked;
+        let preview_corners = if is_docked {
+            egui::CornerRadius {
+                nw: r,
+                ne: r,
+                sw: 0,
+                se: 0,
+            }
+        } else {
+            egui::CornerRadius::same(r)
+        };
+        let preview_inner_corners = if is_docked {
+            egui::CornerRadius {
+                nw: r.saturating_sub(2),
+                ne: r.saturating_sub(2),
+                sw: 0,
+                se: 0,
+            }
+        } else {
+            egui::CornerRadius::same(r.saturating_sub(2))
+        };
         ui.painter()
-            .rect_filled(preview_rect, egui::CornerRadius::same(8), preview_fill);
+            .rect_filled(preview_rect, preview_corners, preview_fill);
         ui.painter().rect_stroke(
             preview_rect,
-            egui::CornerRadius::same(8),
+            preview_corners,
             egui::Stroke::new(1.0, preview_color),
             egui::StrokeKind::Inside,
         );
         ui.painter().rect_stroke(
             preview_rect.shrink(4.0),
-            egui::CornerRadius::same(6),
+            preview_inner_corners,
             egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(226, 232, 240, 65),
@@ -2378,6 +3014,227 @@ fn context_menu_should_close_after_selection(
     reset_requested || clock_visibility_changed || second_hand_changed || repaint_interval_changed
 }
 
+fn render_palette_swatches(
+    painter: &egui::Painter,
+    ui: &egui::Ui,
+    origin: egui::Pos2,
+    selected_idx: u8,
+    id_salt: &str,
+    language: Language,
+) -> Option<u8> {
+    let circle_radius = 5.5;
+    let diameter = circle_radius * 2.0;
+    let gap = 4.0;
+    let mut chosen = None;
+
+    for (i, def) in PROVIDER_PASTEL_PALETTE.iter().enumerate() {
+        let center = egui::pos2(
+            origin.x + circle_radius + (i as f32) * (diameter + gap),
+            origin.y + circle_radius,
+        );
+        let swatch_rect = egui::Rect::from_center_size(center, egui::vec2(diameter + 3.0, diameter + 3.0));
+        let resp = ui.interact(
+            swatch_rect,
+            ui.make_persistent_id((id_salt, i)),
+            egui::Sense::click(),
+        );
+
+        let is_selected = (selected_idx as usize) == i;
+        let is_hovered = resp.hovered();
+
+        if is_hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        let name = language.text(def.name_de, def.name_en);
+        let resp = resp.on_hover_text(name);
+
+        painter.circle_filled(center, circle_radius, def.color);
+
+        if is_selected {
+            painter.circle_stroke(
+                center,
+                circle_radius + 1.6,
+                egui::Stroke::new(1.6, egui::Color32::WHITE),
+            );
+        } else if is_hovered {
+            painter.circle_stroke(
+                center,
+                circle_radius + 1.2,
+                egui::Stroke::new(1.2, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+            );
+        } else {
+            painter.circle_stroke(
+                center,
+                circle_radius,
+                egui::Stroke::new(0.6, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 100)),
+            );
+        }
+
+        if resp.clicked() {
+            chosen = Some(i as u8);
+        }
+    }
+
+    chosen
+}
+
+fn context_menu_swatches(
+    ui: &mut egui::Ui,
+    selected_idx: u8,
+    id_salt: &str,
+    language: Language,
+) -> Option<u8> {
+    let circle_radius = 5.5;
+    let diameter = circle_radius * 2.0;
+    let gap = 4.0;
+    let total_width = 10.0 * diameter + 9.0 * gap;
+    let total_height = diameter + 4.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total_width, total_height), egui::Sense::hover());
+    render_palette_swatches(
+        ui.painter(),
+        ui,
+        egui::pos2(rect.left(), rect.top() + 2.0),
+        selected_idx,
+        id_salt,
+        language,
+    )
+}
+
+fn render_option_pill(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    label: &str,
+    is_active: bool,
+    id_salt: &str,
+) -> bool {
+    let resp = ui.interact(rect, ui.make_persistent_id(id_salt), egui::Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let (bg, stroke_color, text_color) = if is_active {
+        (
+            egui::Color32::from_rgba_unmultiplied(59, 130, 246, 70),
+            egui::Color32::from_rgb(96, 165, 250),
+            egui::Color32::WHITE,
+        )
+    } else if hovered {
+        (
+            egui::Color32::from_rgba_unmultiplied(40, 55, 80, 140),
+            egui::Color32::from_rgba_unmultiplied(120, 140, 180, 120),
+            egui::Color32::from_rgb(226, 232, 240),
+        )
+    } else {
+        (
+            egui::Color32::from_rgba_unmultiplied(20, 28, 45, 120),
+            egui::Color32::from_rgba_unmultiplied(65, 82, 115, 70),
+            egui::Color32::from_rgb(148, 163, 184),
+        )
+    };
+    painter.rect_filled(rect, egui::CornerRadius::same(4), bg);
+    painter.rect_stroke(rect, egui::CornerRadius::same(4), egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Inside);
+    let galley = painter.layout_no_wrap(label.into(), egui::FontId::proportional(10.5), text_color);
+    painter.galley(
+        egui::pos2(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        text_color,
+    );
+    resp.clicked()
+}
+
+fn render_toggle_row(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    label: &str,
+    is_checked: bool,
+    enabled: bool,
+    id_salt: &str,
+) -> bool {
+    let resp = ui.interact(rect, ui.make_persistent_id(id_salt), if enabled { egui::Sense::click() } else { egui::Sense::hover() });
+    let hovered = enabled && resp.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if hovered {
+        painter.rect_filled(rect, egui::CornerRadius::same(4), egui::Color32::from_rgba_unmultiplied(30, 41, 65, 120));
+    }
+    let box_size = 14.0;
+    let box_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 4.0, rect.center().y - box_size / 2.0),
+        egui::vec2(box_size, box_size),
+    );
+    let (box_bg, box_stroke) = if !enabled {
+        (egui::Color32::from_rgba_unmultiplied(30, 40, 60, 60), egui::Color32::from_rgba_unmultiplied(80, 90, 110, 60))
+    } else if is_checked {
+        (egui::Color32::from_rgb(22, 163, 74), egui::Color32::from_rgb(34, 197, 94))
+    } else if hovered {
+        (egui::Color32::from_rgba_unmultiplied(35, 48, 72, 180), egui::Color32::from_rgb(148, 163, 184))
+    } else {
+        (egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140), egui::Color32::from_rgba_unmultiplied(80, 100, 140, 100))
+    };
+    painter.rect_filled(box_rect, egui::CornerRadius::same(3), box_bg);
+    painter.rect_stroke(box_rect, egui::CornerRadius::same(3), egui::Stroke::new(1.0, box_stroke), egui::StrokeKind::Inside);
+    if is_checked {
+        let c = box_rect.center();
+        let check_color = egui::Color32::WHITE;
+        painter.line_segment([egui::pos2(c.x - 3.5, c.y), egui::pos2(c.x - 1.0, c.y + 2.5)], egui::Stroke::new(1.5, check_color));
+        painter.line_segment([egui::pos2(c.x - 1.0, c.y + 2.5), egui::pos2(c.x + 3.5, c.y - 2.5)], egui::Stroke::new(1.5, check_color));
+    }
+    let text_color = if !enabled {
+        egui::Color32::from_rgb(100, 116, 139)
+    } else if hovered {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgb(226, 232, 240)
+    };
+    let galley = painter.layout_no_wrap(label.into(), egui::FontId::proportional(11.0), text_color);
+    painter.galley(
+        egui::pos2(box_rect.right() + 8.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        text_color,
+    );
+    enabled && resp.clicked()
+}
+
+fn render_action_btn(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    label: &str,
+    id_salt: &str,
+) -> bool {
+    let resp = ui.interact(rect, ui.make_persistent_id(id_salt), egui::Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let (bg, stroke_color, text_color) = if hovered {
+        (
+            egui::Color32::from_rgba_unmultiplied(45, 60, 90, 180),
+            egui::Color32::from_rgb(96, 165, 250),
+            egui::Color32::WHITE,
+        )
+    } else {
+        (
+            egui::Color32::from_rgba_unmultiplied(24, 32, 50, 140),
+            egui::Color32::from_rgba_unmultiplied(75, 95, 135, 90),
+            egui::Color32::from_rgb(203, 213, 225),
+        )
+    };
+    painter.rect_filled(rect, egui::CornerRadius::same(5), bg);
+    painter.rect_stroke(rect, egui::CornerRadius::same(5), egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Inside);
+    let galley = painter.layout_no_wrap(label.into(), egui::FontId::proportional(11.0), text_color);
+    painter.galley(
+        egui::pos2(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        text_color,
+    );
+    resp.clicked()
+}
+
 fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
     let rect = ui.max_rect();
     let (pointer, secondary_clicked, any_click) = ui.ctx().input(|input| {
@@ -2474,6 +3331,72 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
                 ui.separator();
                 ui.label(
                     egui::RichText::new(
+                        app.language.text("KI-Limits (Setup)", "AI limits (setup)"),
+                    )
+                    .color(GRAY),
+                );
+                let mut show_glm = app.quota_show_glm;
+                if ui.checkbox(&mut show_glm, "GLM (Z.ai)").changed() {
+                    app.quota_show_glm = show_glm;
+                    let _ = window_settings::set_live_status_quota_show_glm(show_glm);
+                }
+                if app.quota_show_glm {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        if let Some(c) = context_menu_swatches(ui, app.quota_color_glm, "ctx_sw_glm", app.language) {
+                            app.set_provider_color(ProviderId::Glm, c);
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+
+                let mut show_agi = app.quota_show_agi;
+                if ui.checkbox(&mut show_agi, "AGI (Antigravity)").changed() {
+                    app.quota_show_agi = show_agi;
+                    let _ = window_settings::set_live_status_quota_show_agi(show_agi);
+                }
+                if app.quota_show_agi {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        if let Some(c) = context_menu_swatches(ui, app.quota_color_agi, "ctx_sw_agi", app.language) {
+                            app.set_provider_color(ProviderId::Agy, c);
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+
+                let mut show_codex = app.quota_show_codex;
+                if ui.checkbox(&mut show_codex, "Codex (OpenAI)").changed() {
+                    app.quota_show_codex = show_codex;
+                    let _ = window_settings::set_live_status_quota_show_codex(show_codex);
+                }
+                if app.quota_show_codex {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        if let Some(c) = context_menu_swatches(ui, app.quota_color_codex, "ctx_sw_codex", app.language) {
+                            app.set_provider_color(ProviderId::Codex, c);
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+
+                let mut show_claude = app.quota_show_claude;
+                if ui.checkbox(&mut show_claude, "Claude (Anthropic)").changed() {
+                    app.quota_show_claude = show_claude;
+                    let _ = window_settings::set_live_status_quota_show_claude(show_claude);
+                }
+                if app.quota_show_claude {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        if let Some(c) = context_menu_swatches(ui, app.quota_color_claude, "ctx_sw_claude", app.language) {
+                            app.set_provider_color(ProviderId::Claude, c);
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
                         app.language.text("Aktualisierungsrate", "Refresh rate"),
                     )
                     .color(GRAY),
@@ -2488,6 +3411,36 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
                     {
                         repaint_interval_choice = Some(interval);
                     }
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
+                        app.language.text("Eckenrundung", "Corner radius"),
+                    )
+                    .color(GRAY),
+                );
+                ui.horizontal(|ui| {
+                    for &preset in &window_settings::CORNER_RADIUS_PRESETS {
+                        let label = format!("{preset}");
+                        let is_active = app.corner_radius == preset;
+                        let text = egui::RichText::new(label).color(if is_active { egui::Color32::WHITE } else { egui::Color32::from_rgb(148, 163, 184) });
+                        if ui.selectable_label(is_active, text).clicked() {
+                            app.set_corner_radius(preset);
+                        }
+                    }
+                });
+                ui.separator();
+                if ui
+                    .button(app.language.text(
+                        "⚙ Konfigurator & Optionen öffnen...",
+                        "⚙ Open configurator & options...",
+                    ))
+                    .clicked()
+                {
+                    app.quota_open = true;
+                    app.quota_settings_open = true;
+                    let _ = window_settings::set_live_status_quota_open(true);
+                    let _ = window_settings::set_live_status_quota_settings_open(true);
                 }
             });
         });
@@ -2605,6 +3558,16 @@ fn handle_window_drag(app: &mut LiveStatusApp, ui: &egui::Ui) {
     {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         app.window_drag_started = true;
+    }
+    if app.window_drag_started && primary_down {
+        let delta = ui.input(|i| i.pointer.delta());
+        if delta.length_sq() > 0.0 {
+            if let Some(current_pos) = ui.ctx().input(|i| i.viewport().outer_rect).map(|r| r.min) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                    current_pos + delta,
+                ));
+            }
+        }
     }
     if let Some(position) = position
         && !is_excluded(position)
@@ -3261,6 +4224,146 @@ fn draw_power_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Col
     );
 }
 
+fn pomodoro_minutes_from_vector(offset: egui::Vec2) -> f32 {
+    let angle = offset.x.atan2(-offset.y);
+    let normalized_angle = if angle < 0.0 { angle + std::f32::consts::TAU } else { angle };
+    let turns = normalized_angle / std::f32::consts::TAU;
+    (turns * 60.0).round().clamp(1.0, 60.0)
+}
+
+fn paint_pomodoro_sector(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    start_turns: f32,
+    sweep_turns: f32,
+    fill_color: egui::Color32,
+    stroke: egui::Stroke,
+) {
+    if sweep_turns <= f32::EPSILON {
+        return;
+    }
+    let steps = (36.0 * sweep_turns).ceil().clamp(12.0, 48.0) as usize;
+    let mut mesh = egui::Mesh::default();
+    let center_idx = 0u32;
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: center,
+        uv: egui::epaint::WHITE_UV,
+        color: fill_color,
+    });
+
+    let mut arc_points = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let t = start_turns + sweep_turns * (i as f32 / steps as f32);
+        let p = center + clock_direction(t) * radius;
+        arc_points.push(p);
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: p,
+            uv: egui::epaint::WHITE_UV,
+            color: fill_color,
+        });
+        if i > 0 {
+            let curr_idx = (i + 1) as u32;
+            let prev_idx = curr_idx - 1;
+            mesh.indices.extend_from_slice(&[center_idx, prev_idx, curr_idx]);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+
+    if stroke.width > 0.0 && stroke.color.a() > 0 {
+        painter.add(egui::Shape::line(arc_points, stroke));
+        painter.line_segment([center, center + clock_direction(start_turns) * radius], stroke);
+    }
+}
+
+fn paint_pomodoro_center_button(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    running: bool,
+    hovered: bool,
+) {
+    let btn_radius = 12.5;
+    let glow_alpha = if hovered { 75 } else { 35 };
+    painter.circle_filled(
+        center,
+        btn_radius + 3.0,
+        egui::Color32::from_rgba_unmultiplied(249, 115, 22, glow_alpha),
+    );
+
+    let body_color = if hovered {
+        egui::Color32::from_rgb(234, 88, 12)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(194, 65, 12, 220)
+    };
+    painter.circle_filled(center, btn_radius, body_color);
+    painter.circle_stroke(
+        center,
+        btn_radius,
+        egui::Stroke::new(1.2, egui::Color32::from_rgb(254, 215, 170)),
+    );
+
+    if running {
+        // Pause ❚❚
+        let bar_w = 2.2;
+        let bar_h = 7.0;
+        let gap = 2.2;
+        let left_x = center.x - gap / 2.0 - bar_w;
+        let right_x = center.x + gap / 2.0;
+        let top_y = center.y - bar_h / 2.0;
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(left_x, top_y), egui::vec2(bar_w, bar_h)),
+            egui::CornerRadius::same(1),
+            egui::Color32::WHITE,
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(right_x, top_y), egui::vec2(bar_w, bar_h)),
+            egui::CornerRadius::same(1),
+            egui::Color32::WHITE,
+        );
+    } else {
+        // Play ▶
+        let tri_w = 7.0;
+        let tri_h = 8.0;
+        let left = center.x - 2.2;
+        let right = left + tri_w;
+        let top = center.y - tri_h / 2.0;
+        let bottom = center.y + tri_h / 2.0;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(left, top),
+                egui::pos2(right, center.y),
+                egui::pos2(left, bottom),
+            ],
+            egui::Color32::WHITE,
+            egui::Stroke::NONE,
+        ));
+    }
+}
+
+fn paint_gear_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    let r_inner = 3.2;
+    let r_outer = 6.2;
+    for i in 0..6 {
+        let angle = (i as f32) * (std::f32::consts::TAU / 6.0);
+        let dir = egui::vec2(angle.cos(), angle.sin());
+        painter.line_segment(
+            [center + dir * r_inner, center + dir * r_outer],
+            egui::Stroke::new(2.2, color),
+        );
+    }
+    painter.circle_stroke(center, 4.4, egui::Stroke::new(1.4, color));
+    painter.circle_filled(center, 2.0, egui::Color32::from_rgb(11, 17, 32));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ClockInteraction {
+    None,
+    TogglePomodoro,
+    SetPomodoroSeconds(f32),
+    ResetPomodoro,
+    TriggerNightAction,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn moon_icon(
     ui: &mut egui::Ui,
@@ -3272,9 +4375,12 @@ fn moon_icon(
     phase: f64,
     show_clock: bool,
     show_second_hand: bool,
-) -> egui::Response {
+    pomodoro_total_seconds: f32,
+    pomodoro_remaining_seconds: f32,
+    pomodoro_running: bool,
+) -> (egui::Response, ClockInteraction) {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::click_and_drag());
     let center = rect.center();
     let radius = diameter / 2.0;
     let painter = ui.painter();
@@ -3295,9 +4401,93 @@ fn moon_icon(
         radius,
         gradient_color_at(gradient_rect, dark_center),
     );
+
+    let mut interaction = ClockInteraction::None;
+    let pointer_pos = ui.input(|i| i.pointer.latest_pos());
+    let is_clock_hovered = response.hovered();
+    let is_center_hovered = pointer_pos.map_or(false, |p| p.distance(center) <= 14.0);
+
     if show_clock {
+        if response.double_clicked() {
+            interaction = ClockInteraction::ResetPomodoro;
+        } else if response.secondary_clicked() {
+            interaction = ClockInteraction::ResetPomodoro;
+        } else if response.dragged() {
+            if let Some(pos) = pointer_pos {
+                let dist = pos.distance(center);
+                if dist > 8.0 {
+                    let mins = pomodoro_minutes_from_vector(pos - center);
+                    interaction = ClockInteraction::SetPomodoroSeconds(mins * 60.0);
+                }
+            }
+        } else if response.clicked() {
+            if is_center_hovered {
+                interaction = ClockInteraction::TogglePomodoro;
+            } else if pomodoro_total_seconds > 0.0 {
+                if let Some(pos) = pointer_pos {
+                    let mins = pomodoro_minutes_from_vector(pos - center);
+                    interaction = ClockInteraction::SetPomodoroSeconds(mins * 60.0);
+                }
+            } else {
+                interaction = ClockInteraction::TriggerNightAction;
+            }
+        }
+
+        if is_clock_hovered {
+            if is_center_hovered {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            } else {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        }
+
         paint_clock_index_marks(painter, center, radius);
         paint_clock_cardinal_labels(painter, center, radius);
+
+        // Pomodoro Time-Timer Arc (Variante 1)
+        if pomodoro_total_seconds > 0.0 {
+            // 1. Dunkler leichter Schatten: Der ursprünglich eingestellte Zielwert
+            if pomodoro_total_seconds > pomodoro_remaining_seconds {
+                let total_turns = (pomodoro_total_seconds / 3600.0).clamp(0.0, 1.0);
+                paint_pomodoro_sector(
+                    painter,
+                    center,
+                    radius * 0.98,
+                    0.0,
+                    total_turns,
+                    egui::Color32::from_rgba_unmultiplied(15, 23, 42, 160),
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(148, 163, 184, 110)),
+                );
+                let mark_pos = center + clock_direction(total_turns) * (radius * 0.98);
+                painter.circle_filled(mark_pos, 2.0, egui::Color32::from_rgba_unmultiplied(254, 215, 170, 210));
+            }
+
+            // 2. Karmesinroter Restzeit-Sektor
+            if pomodoro_remaining_seconds > 0.0 {
+                let remaining_turns = (pomodoro_remaining_seconds / 3600.0).clamp(0.0, 1.0);
+                let (alpha, rim_alpha) = if pomodoro_remaining_seconds <= 60.0 && pomodoro_running {
+                    let pulse = (ui.input(|i| i.time) * 4.0).sin().abs() as f32;
+                    ((70.0 + pulse * 45.0) as u8, (200.0 + pulse * 55.0) as u8)
+                } else {
+                    (80, 230)
+                };
+                paint_pomodoro_sector(
+                    painter,
+                    center,
+                    radius * 0.98,
+                    0.0,
+                    remaining_turns,
+                    egui::Color32::from_rgba_unmultiplied(239, 68, 68, alpha),
+                    egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(239, 68, 68, rim_alpha)),
+                );
+                painter.line_segment(
+                    [center, center + clock_direction(remaining_turns) * (radius * 0.98)],
+                    egui::Stroke::new(1.6, egui::Color32::from_rgba_unmultiplied(254, 202, 202, rim_alpha)),
+                );
+            }
+        }
+
+        // Zeiger der Uhr
         paint_clock_hands(
             painter,
             center,
@@ -3305,23 +4495,63 @@ fn moon_icon(
             show_second_hand,
             main_hand_color_for_moon(color),
         );
-        if let Some(temperature_c) = temperature_c {
+
+        // Center Play/Pause-Knopf: Nur anzeigen, wenn mit der Maus über das Zentrum gehovert wird
+        if is_center_hovered {
+            paint_pomodoro_center_button(
+                painter,
+                center,
+                pomodoro_running,
+                true,
+            );
+        }
+
+        if pomodoro_total_seconds > 0.0 {
+            let header_rect = paint_clock_pomodoro_header(
+                painter,
+                center,
+                radius,
+                pomodoro_remaining_seconds,
+                pomodoro_running,
+            );
+            let header_response = ui.interact(
+                header_rect,
+                ui.make_persistent_id("pomodoro_header_time_badge"),
+                egui::Sense::click(),
+            );
+            if header_response.double_clicked() {
+                interaction = ClockInteraction::ResetPomodoro;
+            } else if header_response.clicked() {
+                interaction = ClockInteraction::TogglePomodoro;
+            }
+            if header_response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        } else if let Some(temperature_c) = temperature_c {
             paint_clock_temperature(painter, center, radius, temperature_c, weather_symbol);
         }
-    } else if let Some(temperature_c) = temperature_c {
-        paint_moon_temperature(
-            painter,
-            rect,
-            center,
-            radius,
-            dark_side,
-            separation,
-            illumination,
-            gradient_color_at(gradient_rect, center),
-            temperature_c,
-        );
+    } else {
+        if response.clicked() {
+            interaction = ClockInteraction::TriggerNightAction;
+        }
+        if is_clock_hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if let Some(temperature_c) = temperature_c {
+            paint_moon_temperature(
+                painter,
+                rect,
+                center,
+                radius,
+                dark_side,
+                separation,
+                illumination,
+                gradient_color_at(gradient_rect, center),
+                temperature_c,
+            );
+        }
     }
-    response
+    (response, interaction)
 }
 
 fn paint_moon_shadow(
@@ -3761,6 +4991,72 @@ fn main_hand_color_for_moon(moon_color: egui::Color32) -> egui::Color32 {
 
 fn clock_temperature_position(center: egui::Pos2, radius: f32) -> egui::Pos2 {
     center - egui::vec2(0.0, radius * CLOCK_TEMPERATURE_VERTICAL_OFFSET)
+}
+
+fn paint_clock_pomodoro_header(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    remaining_seconds: f32,
+    running: bool,
+) -> egui::Rect {
+    let mins = (remaining_seconds / 60.0).floor() as u32;
+    let secs = (remaining_seconds % 60.0).floor() as u32;
+    let text = format!("{mins:02}:{secs:02}");
+    let font = egui::FontId::proportional(CLOCK_TEMPERATURE_FONT_SIZE);
+    let color = if running {
+        egui::Color32::from_rgb(252, 165, 165)
+    } else {
+        egui::Color32::from_rgb(253, 186, 116)
+    };
+    let text_width = painter
+        .layout_no_wrap(text.clone(), font.clone(), color)
+        .size()
+        .x;
+    let position = clock_temperature_position(center, radius);
+
+    let icon_size = 13.0;
+    let gap = 5.0;
+    let group_width = icon_size + gap + text_width;
+    let group_left = position.x - group_width / 2.0;
+
+    let icon_center = egui::pos2(group_left + icon_size / 2.0, position.y);
+    paint_pomodoro_header_icon(painter, icon_center, color);
+
+    let text_left = group_left + icon_size + gap;
+    painter.text(
+        egui::pos2(text_left, position.y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
+
+    egui::Rect::from_center_size(position, egui::vec2(group_width + 8.0, 20.0))
+}
+
+fn paint_pomodoro_header_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    let r = 4.8;
+    // Outer dial circle
+    painter.circle_stroke(center, r, egui::Stroke::new(1.1, color));
+    // Top button/crown
+    painter.line_segment(
+        [center + egui::vec2(-1.5, -r - 1.4), center + egui::vec2(1.5, -r - 1.4)],
+        egui::Stroke::new(1.1, color),
+    );
+    painter.line_segment(
+        [center + egui::vec2(0.0, -r), center + egui::vec2(0.0, -r - 1.4)],
+        egui::Stroke::new(1.0, color),
+    );
+    // Hands: 12 and 2 o'clock
+    painter.line_segment(
+        [center, center + egui::vec2(0.0, -2.6)],
+        egui::Stroke::new(1.1, color),
+    );
+    painter.line_segment(
+        [center, center + egui::vec2(2.0, -1.2)],
+        egui::Stroke::new(1.1, color),
+    );
 }
 
 fn paint_clock_temperature(
@@ -4296,6 +5592,10 @@ fn media_info_row(
     quota_snapshot: &QuotaSnapshot,
     quota_open: bool,
     language: Language,
+    show_glm: bool,
+    show_agi: bool,
+    show_codex: bool,
+    show_claude: bool,
 ) -> (Option<i64>, bool) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
@@ -4339,14 +5639,30 @@ fn media_info_row(
     );
     window_chrome::glass_sheen(painter, quota_btn_rect);
 
-    // Micro-LED beacon:
+    // Micro-LED beacon based only on visible providers:
     let beacon_center = egui::pos2(quota_btn_rect.left() + 8.0, quota_btn_rect.center().y);
-    let beacon_color = if quota_snapshot.has_throttle {
+    let throttled_visible: Vec<&'static str> = quota_snapshot
+        .providers
+        .iter()
+        .filter(|p| {
+            let visible = match p.id {
+                ProviderId::Glm => show_glm,
+                ProviderId::Agy => show_agi,
+                ProviderId::Codex => show_codex,
+                ProviderId::Claude => show_claude,
+            };
+            visible && p.is_throttled
+        })
+        .map(|p| p.title)
+        .collect();
+
+    let has_visible_throttle = !throttled_visible.is_empty();
+    let beacon_color = if has_visible_throttle {
         egui::Color32::from_rgb(248, 113, 113)
     } else {
         egui::Color32::from_rgb(74, 222, 128)
     };
-    let halo_color = if quota_snapshot.has_throttle {
+    let halo_color = if has_visible_throttle {
         egui::Color32::from_rgba_unmultiplied(248, 113, 113, 60)
     } else {
         egui::Color32::from_rgba_unmultiplied(74, 222, 128, 45)
@@ -4366,16 +5682,18 @@ fn media_info_row(
     );
     painter.galley(bolt_pos, bolt_galley, egui::Color32::from_rgb(251, 191, 36));
 
-    let tooltip = if quota_snapshot.has_throttle {
-        language.text(
-            "⚡ Limits: 1 Anbieter gedrosselt (Codex)\nKlicken zum Ein-/Ausblenden",
-            "⚡ Limits: 1 provider throttled (Codex)\nClick to toggle",
-        )
+    let tooltip = if has_visible_throttle {
+        let count = throttled_visible.len();
+        let list = throttled_visible.join(", ");
+        match language {
+            Language::German => format!("⚡ Limits: {count} Anbieter gedrosselt ({list})\nKlicken zum Ein-/Ausblenden"),
+            Language::English => format!("⚡ Limits: {count} provider throttled ({list})\nClick to toggle"),
+        }
     } else {
         language.text(
-            "⚡ Limits: Alle Anbieter aktiv\nKlicken zum Ein-/Ausblenden",
-            "⚡ Limits: All providers active\nClick to toggle",
-        )
+            "⚡ Limits: Alle aktiven Anbieter im Rahmen\nKlicken zum Ein-/Ausblenden",
+            "⚡ Limits: All active providers within limits\nClick to toggle",
+        ).to_string()
     };
     quota_response.on_hover_text(tooltip);
 
@@ -4552,9 +5870,37 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
 
     let scale = app.scale;
     let quota_width = DESIGN_WIDTH * scale;
-    let quota_height = 176.0 * scale;
 
-    let dock_overlap = (2.5 * scale).round();
+    let show_glm = app.quota_show_glm;
+    let show_agi = app.quota_show_agi;
+    let show_codex = app.quota_show_codex;
+    let show_claude = app.quota_show_claude;
+
+    let visible_providers: Vec<ProviderQuota> = app
+        .quota_snapshot
+        .providers
+        .iter()
+        .filter(|p| match p.id {
+            ProviderId::Glm => show_glm,
+            ProviderId::Agy => show_agi,
+            ProviderId::Codex => show_codex,
+            ProviderId::Claude => show_claude,
+        })
+        .cloned()
+        .collect();
+
+    let sat_design_height = quota_satellite_design_height(&visible_providers, app.quota_settings_open);
+    if app.last_synced_sat_height != Some(sat_design_height) {
+        app.last_synced_sat_height = Some(sat_design_height);
+        app.sync_corner_regions();
+        ctx.send_viewport_cmd_to(
+            quota_viewport_id,
+            egui::ViewportCommand::InnerSize(egui::vec2(DESIGN_WIDTH, sat_design_height)),
+        );
+    }
+    let quota_height = sat_design_height * scale;
+
+    let dock_overlap = 1.0;
     let main_outer_rect = ctx.input(|i| i.viewport().outer_rect);
     let target_pos = if app.quota_docked {
         main_outer_rect.map(|main| egui::pos2(main.min.x, main.max.y - dock_overlap))
@@ -4567,29 +5913,20 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
     let mut builder = egui::ViewportBuilder::default()
         .with_title(title)
         .with_inner_size([quota_width, quota_height])
-        .with_min_inner_size([
-            DESIGN_WIDTH * window_settings::MIN_LIVE_STATUS_SCALE,
-            176.0 * window_settings::MIN_LIVE_STATUS_SCALE,
-        ])
-        .with_max_inner_size([
-            DESIGN_WIDTH * window_settings::MAX_LIVE_STATUS_SCALE,
-            176.0 * window_settings::MAX_LIVE_STATUS_SCALE,
-        ])
-        .with_resizable(false)
         .with_decorations(false)
         .with_window_level(window_chrome::window_level(app.window_level));
 
     if let Some(pos) = target_pos {
-        if app.quota_docked && !app.quota_drag_active {
+        if app.satellite_configured_hwnd.is_none() && app.quota_docked && !app.quota_drag_active {
             builder = builder.with_position(pos);
         }
     }
 
     let is_docked = app.quota_docked;
     let language = app.language;
-    let quota_snapshot = app.quota_snapshot.clone();
 
     let mut user_toggled_dock = false;
+    let mut user_toggled_settings = false;
     let mut user_closed_window = false;
     let mut user_drag_started = false;
     let mut user_drag_stopped = false;
@@ -4601,15 +5938,29 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
         if class != egui::ViewportClass::Immediate {
             return;
         }
+        app.satellite_frames_painted = app.satellite_frames_painted.saturating_add(1);
+        if app.satellite_frames_painted == 1 {
+            sat_ctx.request_repaint();
+            app.sync_corner_regions();
+        }
         sat_ctx.set_zoom_factor(scale);
 
         // Auto-reconcile inner size: ensure satellite window matches exact design dimensions
-        let expected_size = egui::vec2(DESIGN_WIDTH, 176.0);
+        let expected_size = egui::vec2(DESIGN_WIDTH, sat_design_height);
         if let Some(current_size) = sat_ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) {
             if (current_size.x - expected_size.x).abs() > 2.0
                 || (current_size.y - expected_size.y).abs() > 2.0
             {
                 sat_ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(expected_size));
+                if let Some(sat_hwnd) = app.satellite_hwnd {
+                    window_chrome::sync_satellite_size(
+                        sat_hwnd,
+                        sat_design_height,
+                        app.main_hwnd,
+                        app.corner_radius,
+                        is_docked,
+                    );
+                }
             }
         }
 
@@ -4619,39 +5970,10 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                 let rect = ui.max_rect();
                 let painter = ui.painter();
 
-                // 1:1 Gehäuse-Hintergrund und Rand
-                window_chrome::paint_gradient(painter, rect, BG_TOP, BG_BOTTOM);
-                window_chrome::glass_sheen(painter, rect);
+                // 1:1 Gehäuse-Hintergrund
+                window_chrome::default_gradient(painter, rect);
 
-                let border_stroke_color =
-                    egui::Color32::from_rgba_unmultiplied(120, 140, 180, 56);
-                let corner_radius = if is_docked {
-                    egui::CornerRadius {
-                        nw: 0,
-                        ne: 0,
-                        sw: 10,
-                        se: 10,
-                    }
-                } else {
-                    egui::CornerRadius::same(10)
-                };
-                painter.rect_stroke(
-                    rect,
-                    corner_radius,
-                    egui::Stroke::new(1.0, border_stroke_color),
-                    egui::StrokeKind::Inside,
-                );
-
-                if is_docked {
-                    // Top seam line between the two docked windows
-                    painter.line_segment(
-                        [rect.left_top(), rect.right_top()],
-                        egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgba_unmultiplied(80, 100, 140, 130),
-                        ),
-                    );
-                }
+                let r = app.corner_radius;
 
                 // Titelleiste
                 let titlebar_height = 26.0;
@@ -4663,8 +5985,8 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     egui::CornerRadius::ZERO
                 } else {
                     egui::CornerRadius {
-                        nw: 9,
-                        ne: 9,
+                        nw: r.saturating_sub(1),
+                        ne: r.saturating_sub(1),
                         sw: 0,
                         se: 0,
                     }
@@ -4685,9 +6007,14 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     }
                 }
 
-                // Clean title: LIMITS
+                // Clean title: LIMITS (or OPTIONEN & LIMITS when in config mode)
+                let title_text = if app.quota_settings_open {
+                    language.text("OPTIONEN & LIMITS", "OPTIONS & LIMITS")
+                } else {
+                    language.text("LIMITS", "LIMITS")
+                };
                 let title_galley = painter.layout_no_wrap(
-                    language.text("LIMITS", "LIMITS").into(),
+                    title_text.into(),
                     egui::FontId::proportional(12.0),
                     egui::Color32::from_rgb(253, 186, 116),
                 );
@@ -4806,10 +6133,48 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     user_toggled_dock = true;
                 }
 
+                // Gear button: compact vector icon button for provider settings (left of Detach button)
+                let gear_size = 20.0;
+                let gear_btn_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        action_btn_rect.left() - gear_size - 4.0,
+                        titlebar_rect.center().y - gear_size / 2.0,
+                    ),
+                    egui::vec2(gear_size, gear_size),
+                );
+                let gear_resp = ui
+                    .interact(
+                        gear_btn_rect,
+                        ui.make_persistent_id("sat_gear_btn"),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_text(language.text(
+                        "Anbieter auswählen / konfigurieren",
+                        "Configure AI providers",
+                    ));
+                let gear_hovered = gear_resp.hovered();
+                if gear_hovered {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    painter.rect_filled(
+                        gear_btn_rect,
+                        egui::CornerRadius::same(4),
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25),
+                    );
+                }
+                let gear_color = if gear_hovered || app.quota_settings_open {
+                    egui::Color32::from_rgb(249, 115, 22)
+                } else {
+                    egui::Color32::from_rgb(148, 163, 184)
+                };
+                paint_gear_icon(painter, gear_btn_rect.center(), gear_color);
+                if gear_resp.clicked() {
+                    user_toggled_settings = true;
+                }
+
                 // Titlebar Drag handle interaction (no redundant 0px badge):
                 let drag_handle_rect = egui::Rect::from_min_max(
                     titlebar_rect.min,
-                    egui::pos2(action_btn_rect.left() - 4.0, titlebar_rect.bottom()),
+                    egui::pos2(gear_btn_rect.left() - 4.0, titlebar_rect.bottom()),
                 );
                 let drag_resp = ui.interact(
                     drag_handle_rect,
@@ -4827,19 +6192,551 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     user_drag_started = true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
+                if drag_resp.dragged() {
+                    let delta = drag_resp.drag_delta();
+                    if delta.length_sq() > 0.0 {
+                        if let Some(current_pos) = ui.ctx().input(|i| i.viewport().outer_rect).map(|r| r.min) {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                current_pos + delta,
+                            ));
+                        }
+                    }
+                }
 
-                // Provider Rows (GLM, AGI, Codex) - no filler text
                 let rows_top = titlebar_rect.bottom() + 4.0;
-                let row_height = 42.0;
-                let row_gap = 4.0;
+                let row_height = 56.0;
+                let row_gap = 5.0;
 
-                for (idx, quota) in quota_snapshot.providers.iter().enumerate() {
-                    let y = rows_top + idx as f32 * (row_height + row_gap);
+                if app.quota_settings_open {
+                    // Tab Bar directly underneath titlebar
+                    let tab_bar_y = titlebar_rect.bottom() + 4.0;
+                    let tab_h = 24.0;
+                    let tabs = [
+                        (ConfigTab::Providers, language.text("⚡ Limits", "⚡ Limits")),
+                        (ConfigTab::Window, language.text("⊞ Fenster", "⊞ Window")),
+                        (ConfigTab::System, language.text("⚙ System", "⚙ System")),
+                    ];
+                    let tab_gap = 5.0;
+                    let total_tab_w = rect.width() - 16.0;
+                    let tab_w = (total_tab_w - 2.0 * tab_gap) / 3.0;
+
+                    for (i, (tab_kind, label)) in tabs.iter().enumerate() {
+                        let tab_x = rect.left() + 8.0 + (i as f32) * (tab_w + tab_gap);
+                        let tab_rect = egui::Rect::from_min_size(
+                            egui::pos2(tab_x, tab_bar_y),
+                            egui::vec2(tab_w, tab_h),
+                        );
+                        let is_active = app.config_tab == *tab_kind;
+                        if render_option_pill(
+                            ui,
+                            painter,
+                            tab_rect,
+                            label,
+                            is_active,
+                            &format!("sat_cfg_tab_{i}"),
+                        ) {
+                            app.config_tab = *tab_kind;
+                        }
+                    }
+
+                    let content_top = tab_bar_y + tab_h + 6.0;
+                    match app.config_tab {
+                        ConfigTab::Providers => {
+                            let providers_to_config = [
+                                (ProviderId::Glm, "GLM", "Z.ai (GLM-4)", app.quota_show_glm),
+                                (ProviderId::Agy, "AGY", "Google (Antigravity)", app.quota_show_agi),
+                                (ProviderId::Codex, "CODEX", "OpenAI (Codex)", app.quota_show_codex),
+                                (ProviderId::Claude, "CLAUDE", "Anthropic (Claude)", app.quota_show_claude),
+                            ];
+
+                            for (idx, (pid, short_name, full_name, is_shown)) in providers_to_config.iter().enumerate() {
+                                let y = content_top + idx as f32 * (row_height + row_gap);
+                                let row_rect = egui::Rect::from_min_size(
+                                    egui::pos2(rect.left() + 8.0, y),
+                                    egui::vec2(rect.width() - 16.0, row_height),
+                                );
+                                let badge_color = app.provider_color(*pid);
+                                let current_color_idx = app.provider_color_idx(*pid);
+
+                                let top_area = egui::Rect::from_min_size(
+                                    row_rect.min,
+                                    egui::vec2(row_rect.width(), 30.0),
+                                );
+                                let top_resp = ui.interact(
+                                    top_area,
+                                    ui.make_persistent_id(format!("sat_cfg_top_{idx}")),
+                                    egui::Sense::click(),
+                                );
+                                let top_hovered = top_resp.hovered();
+                                if top_hovered {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+
+                                let bg_color = if top_hovered {
+                                    egui::Color32::from_rgba_unmultiplied(30, 41, 65, 180)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140)
+                                };
+                                painter.rect_filled(row_rect, egui::CornerRadius::same(6), bg_color);
+                                let border_color = if *is_shown {
+                                    egui::Color32::from_rgba_unmultiplied(badge_color.r(), badge_color.g(), badge_color.b(), 120)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)
+                                };
+                                painter.rect_stroke(
+                                    row_rect,
+                                    egui::CornerRadius::same(6),
+                                    egui::Stroke::new(1.0, border_color),
+                                    egui::StrokeKind::Inside,
+                                );
+
+                                // Badge
+                                let badge_w = 44.0;
+                                let badge_h = 18.0;
+                                let badge_rect = egui::Rect::from_min_size(
+                                    egui::pos2(row_rect.left() + 10.0, row_rect.top() + 6.0),
+                                    egui::vec2(badge_w, badge_h),
+                                );
+                                let badge_bg = egui::Color32::from_rgba_unmultiplied(badge_color.r(), badge_color.g(), badge_color.b(), 35);
+                                painter.rect_filled(badge_rect, egui::CornerRadius::same(4), badge_bg);
+                                painter.rect_stroke(badge_rect, egui::CornerRadius::same(4), egui::Stroke::new(1.0, badge_color), egui::StrokeKind::Inside);
+                                let badge_galley = painter.layout_no_wrap(
+                                    (*short_name).into(),
+                                    egui::FontId::proportional(11.0),
+                                    badge_color,
+                                );
+                                painter.galley(
+                                    egui::pos2(
+                                        badge_rect.center().x - badge_galley.size().x / 2.0,
+                                        badge_rect.center().y - badge_galley.size().y / 2.0,
+                                    ),
+                                    badge_galley,
+                                    badge_color,
+                                );
+
+                                // Name
+                                let name_galley = painter.layout_no_wrap(
+                                    (*full_name).into(),
+                                    egui::FontId::proportional(12.0),
+                                    if *is_shown { TEXT } else { GRAY },
+                                );
+                                painter.galley(
+                                    egui::pos2(badge_rect.right() + 8.0, badge_rect.center().y - name_galley.size().y / 2.0),
+                                    name_galley,
+                                    if *is_shown { TEXT } else { GRAY },
+                                );
+
+                                // Toggle pill
+                                let toggle_w = 34.0;
+                                let toggle_h = 18.0;
+                                let toggle_rect = egui::Rect::from_min_size(
+                                    egui::pos2(row_rect.right() - toggle_w - 10.0, row_rect.top() + 6.0),
+                                    egui::vec2(toggle_w, toggle_h),
+                                );
+                                let track_color = if *is_shown {
+                                    egui::Color32::from_rgb(22, 163, 74)
+                                } else {
+                                    egui::Color32::from_rgb(51, 65, 85)
+                                };
+                                painter.rect_filled(toggle_rect, egui::CornerRadius::same(9), track_color);
+                                let knob_r = toggle_h / 2.0 - 2.0;
+                                let knob_x = if *is_shown {
+                                    toggle_rect.right() - knob_r - 2.0
+                                } else {
+                                    toggle_rect.left() + knob_r + 2.0
+                                };
+                                painter.circle_filled(egui::pos2(knob_x, toggle_rect.center().y), knob_r, egui::Color32::WHITE);
+
+                                if top_resp.clicked() {
+                                    let new_val = !*is_shown;
+                                    match pid {
+                                        ProviderId::Glm => {
+                                            app.quota_show_glm = new_val;
+                                            let _ = window_settings::set_live_status_quota_show_glm(new_val);
+                                        }
+                                        ProviderId::Agy => {
+                                            app.quota_show_agi = new_val;
+                                            let _ = window_settings::set_live_status_quota_show_agi(new_val);
+                                        }
+                                        ProviderId::Codex => {
+                                            app.quota_show_codex = new_val;
+                                            let _ = window_settings::set_live_status_quota_show_codex(new_val);
+                                        }
+                                        ProviderId::Claude => {
+                                            app.quota_show_claude = new_val;
+                                            let _ = window_settings::set_live_status_quota_show_claude(new_val);
+                                        }
+                                    }
+                                }
+
+                                // Swatches row at bottom half
+                                let swatches_y = row_rect.top() + 33.0;
+                                let label_text = language.text("Farbe:", "Color:");
+                                let label_galley = painter.layout_no_wrap(label_text.into(), egui::FontId::proportional(10.0), GRAY);
+                                painter.galley(
+                                    egui::pos2(row_rect.left() + 10.0, swatches_y + 1.0),
+                                    label_galley,
+                                    GRAY,
+                                );
+                                let swatches_origin = egui::pos2(row_rect.left() + 52.0, swatches_y);
+                                if let Some(new_color) = render_palette_swatches(
+                                    painter,
+                                    ui,
+                                    swatches_origin,
+                                    current_color_idx,
+                                    &format!("sat_cfg_sw_{idx}"),
+                                    language,
+                                ) {
+                                    app.set_provider_color(*pid, new_color);
+                                }
+                            }
+                        }
+                        ConfigTab::Window => {
+                            let mut wy = content_top;
+                            let card_w = rect.width() - 16.0;
+
+                            // 1. Eckenrundung Card (Corner radius)
+                            let r_card_h = 56.0;
+                            let r_card_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 8.0, wy),
+                                egui::vec2(card_w, r_card_h),
+                            );
+                            painter.rect_filled(r_card_rect, egui::CornerRadius::same(6), egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140));
+                            painter.rect_stroke(r_card_rect, egui::CornerRadius::same(6), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)), egui::StrokeKind::Inside);
+
+                            let r_label = language.text("Eckenrundung:", "Corner radius:");
+                            let r_galley = painter.layout_no_wrap(r_label.into(), egui::FontId::proportional(11.0), TEXT);
+                            painter.galley(egui::pos2(r_card_rect.left() + 10.0, r_card_rect.top() + 7.0), r_galley, TEXT);
+
+                            let val_text = if app.corner_radius == 0 {
+                                language.text("0 px (Eckig)", "0 px (Square)")
+                            } else if app.corner_radius == window_settings::DEFAULT_LIVE_STATUS_CORNER_RADIUS {
+                                language.text("10 px (Standard)", "10 px (Default)")
+                            } else {
+                                &format!("{} px", app.corner_radius)
+                            };
+                            let val_galley = painter.layout_no_wrap(val_text.into(), egui::FontId::proportional(10.5), egui::Color32::from_rgb(56, 189, 248));
+                            painter.galley(egui::pos2(r_card_rect.right() - val_galley.size().x - 10.0, r_card_rect.top() + 7.0), val_galley, egui::Color32::from_rgb(56, 189, 248));
+
+                            let preset_count = window_settings::CORNER_RADIUS_PRESETS.len();
+                            let p_gap = 4.0;
+                            let p_w = (card_w - 20.0 - (preset_count - 1) as f32 * p_gap) / (preset_count as f32);
+                            let p_h = 22.0;
+                            let p_y = r_card_rect.top() + 27.0;
+
+                            for (pi, &preset) in window_settings::CORNER_RADIUS_PRESETS.iter().enumerate() {
+                                let px = r_card_rect.left() + 10.0 + (pi as f32) * (p_w + p_gap);
+                                let p_rect = egui::Rect::from_min_size(egui::pos2(px, p_y), egui::vec2(p_w, p_h));
+                                let p_label = format!("{preset} px");
+                                if render_option_pill(ui, painter, p_rect, &p_label, app.corner_radius == preset, &format!("sat_cr_p_{pi}")) {
+                                    app.set_corner_radius(preset);
+                                }
+                            }
+                            wy += r_card_h + 5.0;
+
+                            // 2. Fenstertransparenz Card (Window opacity)
+                            let op_card_h = 50.0;
+                            let op_card_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 8.0, wy),
+                                egui::vec2(card_w, op_card_h),
+                            );
+                            painter.rect_filled(op_card_rect, egui::CornerRadius::same(6), egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140));
+                            painter.rect_stroke(op_card_rect, egui::CornerRadius::same(6), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)), egui::StrokeKind::Inside);
+
+                            let op_label = language.text("Fenstertransparenz:", "Window opacity:");
+                            let op_galley = painter.layout_no_wrap(op_label.into(), egui::FontId::proportional(11.0), TEXT);
+                            painter.galley(egui::pos2(op_card_rect.left() + 10.0, op_card_rect.top() + 6.0), op_galley, TEXT);
+
+                            let cur_op = app.opacity.unwrap_or_else(window_settings::opacity);
+                            let cur_op_text = format!("{cur_op} %");
+                            let cur_op_galley = painter.layout_no_wrap(cur_op_text.into(), egui::FontId::proportional(10.5), egui::Color32::from_rgb(56, 189, 248));
+                            painter.galley(egui::pos2(op_card_rect.right() - cur_op_galley.size().x - 10.0, op_card_rect.top() + 6.0), cur_op_galley, egui::Color32::from_rgb(56, 189, 248));
+
+                            let op_values = [100u8, 90, 80, 70];
+                            let op_gap = 5.0;
+                            let op_w = (card_w - 20.0 - 3.0 * op_gap) / 4.0;
+                            let op_h = 20.0;
+                            let op_btn_y = op_card_rect.top() + 24.0;
+                            for (oi, &op_val) in op_values.iter().enumerate() {
+                                let opx = op_card_rect.left() + 10.0 + (oi as f32) * (op_w + op_gap);
+                                let op_rect = egui::Rect::from_min_size(egui::pos2(opx, op_btn_y), egui::vec2(op_w, op_h));
+                                let op_btn_label = format!("{op_val} %");
+                                if render_option_pill(ui, painter, op_rect, &op_btn_label, cur_op == op_val, &format!("sat_op_{oi}")) {
+                                    app.apply_opacity(op_val);
+                                }
+                            }
+                            wy += op_card_h + 5.0;
+
+                            // 3. Fensterebene Card (Window level)
+                            let lvl_card_h = 50.0;
+                            let lvl_card_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 8.0, wy),
+                                egui::vec2(card_w, lvl_card_h),
+                            );
+                            painter.rect_filled(lvl_card_rect, egui::CornerRadius::same(6), egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140));
+                            painter.rect_stroke(lvl_card_rect, egui::CornerRadius::same(6), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)), egui::StrokeKind::Inside);
+
+                            let lvl_label = language.text("Fensterebene:", "Window level:");
+                            let lvl_galley = painter.layout_no_wrap(lvl_label.into(), egui::FontId::proportional(11.0), TEXT);
+                            painter.galley(egui::pos2(lvl_card_rect.left() + 10.0, lvl_card_rect.top() + 6.0), lvl_galley, TEXT);
+
+                            let levels = [
+                                (window_settings::WindowLevel::Normal, language.text("Normal", "Normal")),
+                                (window_settings::WindowLevel::AlwaysOnTop, language.text("Vordergrund", "On top")),
+                                (window_settings::WindowLevel::AlwaysOnBottom, language.text("Hintergrund", "In bg")),
+                            ];
+                            let lvl_gap = 5.0;
+                            let lvl_w = (card_w - 20.0 - 2.0 * lvl_gap) / 3.0;
+                            let lvl_h = 20.0;
+                            let lvl_btn_y = lvl_card_rect.top() + 24.0;
+                            for (li, (target_lvl, lvl_btn_label)) in levels.iter().enumerate() {
+                                let lx = lvl_card_rect.left() + 10.0 + (li as f32) * (lvl_w + lvl_gap);
+                                let l_rect = egui::Rect::from_min_size(egui::pos2(lx, lvl_btn_y), egui::vec2(lvl_w, lvl_h));
+                                if render_option_pill(ui, painter, l_rect, lvl_btn_label, app.window_level == *target_lvl, &format!("sat_lvl_{li}")) {
+                                    let _ = target_lvl.set();
+                                    app.window_level = *target_lvl;
+                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_chrome::window_level(*target_lvl)));
+                                    ui.ctx().send_viewport_cmd_to(
+                                        egui::ViewportId::from_hash_of("live_status_quota_viewport"),
+                                        egui::ViewportCommand::WindowLevel(window_chrome::window_level(*target_lvl)),
+                                    );
+                                }
+                            }
+                            wy += lvl_card_h + 5.0;
+
+                            // 4. Verhalten Card (Taskbar & Docking checkboxes)
+                            let beh_card_h = 54.0;
+                            let beh_card_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 8.0, wy),
+                                egui::vec2(card_w, beh_card_h),
+                            );
+                            painter.rect_filled(beh_card_rect, egui::CornerRadius::same(6), egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140));
+                            painter.rect_stroke(beh_card_rect, egui::CornerRadius::same(6), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)), egui::StrokeKind::Inside);
+
+                            let cur_tb = app.taskbar_visible.unwrap_or_else(window_settings::live_status_in_taskbar);
+                            let r1_rect = egui::Rect::from_min_size(
+                                egui::pos2(beh_card_rect.left() + 6.0, beh_card_rect.top() + 4.0),
+                                egui::vec2(card_w - 12.0, 22.0),
+                            );
+                            if render_toggle_row(ui, painter, r1_rect, language.text("Live-Fenster in Taskleiste anzeigen", "Show live window in taskbar"), cur_tb, true, "sat_tgl_tb") {
+                                let new_tb = !cur_tb;
+                                let _ = window_settings::set_live_status_in_taskbar(new_tb);
+                                app.taskbar_visible = Some(new_tb);
+                                if let Some(hwnd) = app.main_hwnd {
+                                    let _ = taskbar::set_visible(hwnd, new_tb);
+                                }
+                            }
+
+                            let r2_rect = egui::Rect::from_min_size(
+                                egui::pos2(beh_card_rect.left() + 6.0, beh_card_rect.top() + 28.0),
+                                egui::vec2(card_w - 12.0, 22.0),
+                            );
+                            if render_toggle_row(ui, painter, r2_rect, language.text("Limits magnetisch andocken (ohne Nahtrundung)", "Dock Limits magnetically (flat seam)"), is_docked, true, "sat_tgl_dock") {
+                                user_toggled_dock = true;
+                            }
+                        }
+                        ConfigTab::System => {
+                            let mut sy = content_top;
+                            let card_w = rect.width() - 16.0;
+
+                            // 1. Start & Uhr Card
+                            let start_card_h = 84.0;
+                            let start_card_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 8.0, sy),
+                                egui::vec2(card_w, start_card_h),
+                            );
+                            painter.rect_filled(start_card_rect, egui::CornerRadius::same(6), egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140));
+                            painter.rect_stroke(start_card_rect, egui::CornerRadius::same(6), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)), egui::StrokeKind::Inside);
+
+                            let is_autostart = autostart::enabled();
+                            let s1_rect = egui::Rect::from_min_size(
+                                egui::pos2(start_card_rect.left() + 6.0, start_card_rect.top() + 4.0),
+                                egui::vec2(card_w - 12.0, 22.0),
+                            );
+                            if render_toggle_row(ui, painter, s1_rect, language.text("Mit Windows starten (Autostart)", "Start with Windows (autostart)"), is_autostart, true, "sat_tgl_auto") {
+                                let _ = autostart::set_enabled(!is_autostart);
+                            }
+
+                            let is_live_start = window_settings::live_status_on_start();
+                            let s2_rect = egui::Rect::from_min_size(
+                                egui::pos2(start_card_rect.left() + 6.0, start_card_rect.top() + 29.0),
+                                egui::vec2(card_w - 12.0, 22.0),
+                            );
+                            if render_toggle_row(ui, painter, s2_rect, language.text("Live-Fenster beim Start öffnen", "Open live window at startup"), is_live_start, true, "sat_tgl_ls") {
+                                let _ = window_settings::set_live_status_on_start(!is_live_start);
+                            }
+
+                            // Uhr & Sekundenzeiger nebeneinander
+                            let half_w = (card_w - 16.0) / 2.0;
+                            let s3_left_rect = egui::Rect::from_min_size(
+                                egui::pos2(start_card_rect.left() + 6.0, start_card_rect.top() + 54.0),
+                                egui::vec2(half_w, 22.0),
+                            );
+                            if render_toggle_row(ui, painter, s3_left_rect, language.text("Analoguhr", "Analog clock"), app.clock_visible, true, "sat_tgl_clock") {
+                                let new_c = !app.clock_visible;
+                                let _ = window_settings::set_clock_visible(new_c);
+                                app.clock_visible = new_c;
+                            }
+
+                            let s3_right_rect = egui::Rect::from_min_size(
+                                egui::pos2(start_card_rect.left() + 10.0 + half_w, start_card_rect.top() + 54.0),
+                                egui::vec2(half_w, 22.0),
+                            );
+                            if render_toggle_row(ui, painter, s3_right_rect, language.text("Sekundenzeiger", "Second hand"), app.clock_second_hand_visible, app.clock_visible, "sat_tgl_sec") {
+                                let new_sec = !app.clock_second_hand_visible;
+                                let _ = window_settings::set_clock_second_hand_visible(new_sec);
+                                app.clock_second_hand_visible = new_sec;
+                            }
+                            sy += start_card_h + 5.0;
+
+                            // 2. Aktualisierungsrate Card
+                            let rate_card_h = 44.0;
+                            let rate_card_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 8.0, sy),
+                                egui::vec2(card_w, rate_card_h),
+                            );
+                            painter.rect_filled(rate_card_rect, egui::CornerRadius::same(6), egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140));
+                            painter.rect_stroke(rate_card_rect, egui::CornerRadius::same(6), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)), egui::StrokeKind::Inside);
+
+                            let rate_label = language.text("Aktualisierungsrate:", "Refresh rate:");
+                            let rate_galley = painter.layout_no_wrap(rate_label.into(), egui::FontId::proportional(11.0), TEXT);
+                            painter.galley(egui::pos2(rate_card_rect.left() + 10.0, rate_card_rect.center().y - rate_galley.size().y / 2.0), rate_galley, TEXT);
+
+                            let rate_choices = [(250u32, "250 ms"), (500, "500 ms"), (1000, "1000 ms")];
+                            let rate_gap = 5.0;
+                            let rate_w = 54.0;
+                            let rate_h = 20.0;
+                            for (ri, (interval, r_label)) in rate_choices.iter().enumerate() {
+                                let rx = rate_card_rect.right() - 10.0 - ((3 - ri) as f32) * (rate_w + rate_gap) + rate_gap;
+                                let r_rect = egui::Rect::from_min_size(
+                                    egui::pos2(rx, rate_card_rect.center().y - rate_h / 2.0),
+                                    egui::vec2(rate_w, rate_h),
+                                );
+                                if render_option_pill(ui, painter, r_rect, r_label, app.repaint_interval_ms == *interval, &format!("sat_rate_{ri}")) {
+                                    let _ = window_settings::set_live_status_repaint_interval_ms(*interval);
+                                    app.repaint_interval_ms = *interval;
+                                }
+                            }
+                            sy += rate_card_h + 5.0;
+
+                            // 3. Sprache Card
+                            let lang_card_h = 44.0;
+                            let lang_card_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 8.0, sy),
+                                egui::vec2(card_w, lang_card_h),
+                            );
+                            painter.rect_filled(lang_card_rect, egui::CornerRadius::same(6), egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140));
+                            painter.rect_stroke(lang_card_rect, egui::CornerRadius::same(6), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)), egui::StrokeKind::Inside);
+
+                            let lang_label = language.text("Sprache / Language:", "Language / Sprache:");
+                            let lang_galley = painter.layout_no_wrap(lang_label.into(), egui::FontId::proportional(11.0), TEXT);
+                            painter.galley(egui::pos2(lang_card_rect.left() + 10.0, lang_card_rect.center().y - lang_galley.size().y / 2.0), lang_galley, TEXT);
+
+                            let lang_choices = [(Language::German, "Deutsch"), (Language::English, "English")];
+                            let lang_gap = 5.0;
+                            let lang_w = 64.0;
+                            let lang_h = 20.0;
+                            for (li, (target_lang, l_label)) in lang_choices.iter().enumerate() {
+                                let lx = lang_card_rect.right() - 10.0 - ((2 - li) as f32) * (lang_w + lang_gap) + lang_gap;
+                                let l_rect = egui::Rect::from_min_size(
+                                    egui::pos2(lx, lang_card_rect.center().y - lang_h / 2.0),
+                                    egui::vec2(lang_w, lang_h),
+                                );
+                                if render_option_pill(ui, painter, l_rect, l_label, app.language == *target_lang, &format!("sat_lang_{li}")) {
+                                    let _ = target_lang.set();
+                                    app.language = *target_lang;
+                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(live_title(*target_lang).into()));
+                                    ui.ctx().send_viewport_cmd_to(
+                                        egui::ViewportId::from_hash_of("live_status_quota_viewport"),
+                                        egui::ViewportCommand::Title(match target_lang {
+                                            Language::German => "Herdr-Nachtwächter - Limits",
+                                            Language::English => "Herdr Night Watch - Limits",
+                                        }.into()),
+                                    );
+                                }
+                            }
+                            sy += lang_card_h + 5.0;
+
+                            // 4. Dialog Buttons Card
+                            let dlg_card_h = 42.0;
+                            let dlg_card_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 8.0, sy),
+                                egui::vec2(card_w, dlg_card_h),
+                            );
+                            let dlg_gap = 5.0;
+                            let dlg_w = (card_w - 2.0 * dlg_gap) / 3.0;
+                            let dlg_h = 32.0;
+                            let dlg_y = dlg_card_rect.center().y - dlg_h / 2.0;
+
+                            let b1_rect = egui::Rect::from_min_size(egui::pos2(dlg_card_rect.left(), dlg_y), egui::vec2(dlg_w, dlg_h));
+                            if render_action_btn(ui, painter, b1_rect, language.text("📍 Wetterort", "📍 Location"), "sat_act_weather") {
+                                let _ = weather_location::open();
+                            }
+
+                            let b2_rect = egui::Rect::from_min_size(egui::pos2(dlg_card_rect.left() + dlg_w + dlg_gap, dlg_y), egui::vec2(dlg_w, dlg_h));
+                            if render_action_btn(ui, painter, b2_rect, language.text("📋 Protokoll", "📋 Log"), "sat_act_log") {
+                                let _ = log_viewer::open();
+                            }
+
+                            let b3_rect = egui::Rect::from_min_size(egui::pos2(dlg_card_rect.left() + 2.0 * (dlg_w + dlg_gap), dlg_y), egui::vec2(dlg_w, dlg_h));
+                            if render_action_btn(ui, painter, b3_rect, language.text("⚙ Einrichtung", "⚙ Setup"), "sat_act_setup") {
+                                let _ = settings::open();
+                            }
+                        }
+                    }
+                } else if visible_providers.is_empty() {
                     let row_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.left() + 8.0, y),
+                        egui::pos2(rect.left() + 8.0, rows_top),
                         egui::vec2(rect.width() - 16.0, row_height),
                     );
-                    draw_provider_row(painter, row_rect, quota, language);
+                    painter.rect_filled(
+                        row_rect,
+                        egui::CornerRadius::same(6),
+                        egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140),
+                    );
+                    painter.rect_stroke(
+                        row_rect,
+                        egui::CornerRadius::same(6),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 90)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let empty_msg = language.text(
+                        "Keine KI-Limits gewählt (Zahnrad ⚙ oben anklicken)",
+                        "No AI limits selected (Click gear ⚙ icon above)",
+                    );
+                    let empty_galley = painter.layout_no_wrap(
+                        empty_msg.into(),
+                        egui::FontId::proportional(11.5),
+                        GRAY,
+                    );
+                    painter.galley(
+                        egui::pos2(
+                            row_rect.center().x - empty_galley.size().x / 2.0,
+                            row_rect.center().y - empty_galley.size().y / 2.0,
+                        ),
+                        empty_galley,
+                        GRAY,
+                    );
+                } else {
+                    let mut current_y = rows_top;
+                    for quota in &visible_providers {
+                        let card_h = provider_card_height(quota);
+                        let row_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + 8.0, current_y),
+                            egui::vec2(rect.width() - 16.0, card_h),
+                        );
+                        let forecast = quota.pacing_forecast();
+                        draw_provider_card(painter, row_rect, quota, &forecast, language, app.provider_color(quota.id));
+                        let row_resp = ui.interact(
+                            row_rect,
+                            ui.make_persistent_id(format!("sat_quota_row_{:?}", quota.id)),
+                            egui::Sense::hover(),
+                        );
+                        row_resp.on_hover_ui(|ui| {
+                            render_quota_tooltip(ui, quota, &forecast, language);
+                        });
+                        current_y += card_h + 6.0;
+                    }
                 }
 
                 // Interactive proportional resize grip in the bottom-right corner:
@@ -4923,11 +6820,11 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                 } else {
                     egui::Color32::from_rgba_unmultiplied(148, 163, 184, 80)
                 };
-                for offset in [0.0, 5.0, 10.0] {
+                for offset in [0.0, 4.0, 8.0] {
                     painter.line_segment(
                         [
-                            egui::pos2(sat_grip.right() - 4.0 - offset, sat_grip.bottom() - 1.0),
-                            egui::pos2(sat_grip.right() - 1.0, sat_grip.bottom() - 4.0 - offset),
+                            egui::pos2(sat_grip.right() - 7.0 - offset, sat_grip.bottom() - 4.0),
+                            egui::pos2(sat_grip.right() - 4.0, sat_grip.bottom() - 7.0 - offset),
                         ],
                         egui::Stroke::new(1.0, grip_color),
                     );
@@ -4937,23 +6834,24 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     let preview_color = egui::Color32::from_rgba_unmultiplied(147, 197, 253, 230);
                     let preview_fill = egui::Color32::from_rgba_unmultiplied(15, 31, 56, 128);
 
+                    let r = app.corner_radius;
                     let (corner_radius, inner_corner_radius) = if is_docked {
                         (
                             egui::CornerRadius {
                                 nw: 0,
                                 ne: 0,
-                                sw: 8,
-                                se: 8,
+                                sw: r,
+                                se: r,
                             },
                             egui::CornerRadius {
                                 nw: 0,
                                 ne: 0,
-                                sw: 6,
-                                se: 6,
+                                sw: r.saturating_sub(2),
+                                se: r.saturating_sub(2),
                             },
                         )
                     } else {
-                        (egui::CornerRadius::same(8), egui::CornerRadius::same(6))
+                        (egui::CornerRadius::same(r), egui::CornerRadius::same(r.saturating_sub(2)))
                     };
 
                     painter.rect_filled(preview_rect, corner_radius, preview_fill);
@@ -5000,6 +6898,20 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                 // Handle magnetic snapping and position tracking:
                 let sat_outer = ui.ctx().input(|i| i.viewport().outer_rect);
                 let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+                if is_docked && !app.quota_drag_active {
+                    if let Some(sat) = sat_outer
+                        && let Some(main) = main_outer_rect
+                    {
+                        let dock_target = egui::pos2(main.min.x, main.max.y - dock_overlap);
+                        let delta_x = (sat.min.x - dock_target.x).abs();
+                        let delta_y = (sat.min.y - dock_target.y).abs();
+                        if delta_x > 0.5 || delta_y > 0.5 {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                dock_target,
+                            ));
+                        }
+                    }
+                }
                 if !primary_down {
                     if app.quota_drag_active {
                         user_drag_stopped = true;
@@ -5042,6 +6954,26 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
     if user_drag_stopped {
         app.quota_drag_active = false;
     }
+    if user_toggled_settings {
+        app.quota_settings_open = !app.quota_settings_open;
+        let _ = window_settings::set_live_status_quota_settings_open(app.quota_settings_open);
+        let new_sat_h = quota_satellite_design_height(&visible_providers, app.quota_settings_open);
+        app.last_synced_sat_height = Some(new_sat_h);
+        if let Some(sat_hwnd) = app.satellite_hwnd {
+            window_chrome::sync_satellite_size(
+                sat_hwnd,
+                new_sat_h,
+                app.main_hwnd,
+                app.corner_radius,
+                app.quota_docked,
+            );
+        }
+        ctx.send_viewport_cmd_to(
+            quota_viewport_id,
+            egui::ViewportCommand::InnerSize(egui::vec2(DESIGN_WIDTH, new_sat_h)),
+        );
+        ctx.request_repaint();
+    }
     if user_toggled_dock {
         app.quota_docked = !app.quota_docked;
         let _ = window_settings::set_live_status_quota_docked(app.quota_docked);
@@ -5072,10 +7004,12 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                 )),
             );
         }
+        app.sync_corner_regions();
     }
     if let Some(docked) = detected_dock_change {
         app.quota_docked = docked;
         let _ = window_settings::set_live_status_quota_docked(docked);
+        app.sync_corner_regions();
     }
     if let Some(pos) = detected_new_pos {
         app.quota_pos = Some(pos);
@@ -5086,354 +7020,564 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
     }
 }
 
-fn draw_provider_row(
+fn format_reset_phrase(
+    reset_raw: Option<&str>,
+    is_five_hour: bool,
+    language: Language,
+) -> String {
+    if let Some(raw) = reset_raw {
+        if is_five_hour && raw.contains(':') {
+            let now_hm = crate::quota::current_hm();
+            if let Some((rh, rm)) = crate::quota::parse_hm(Some(raw)) {
+                let curr_mins = now_hm.0 * 60 + now_hm.1;
+                let reset_mins = rh * 60 + rm;
+                let mut diff_mins = reset_mins as i32 - curr_mins as i32;
+                if diff_mins <= 0 {
+                    diff_mins += 24 * 60;
+                }
+                let hours = diff_mins / 60;
+                let mins = diff_mins % 60;
+                if diff_mins > 300 {
+                    match language {
+                        Language::German => format!("um {rh:02}:{rm:02}"),
+                        Language::English => format!("at {rh:02}:{rm:02}"),
+                    }
+                } else if hours > 0 {
+                    format!("in {hours}h {mins}m")
+                } else {
+                    format!("in {mins}m")
+                }
+            } else {
+                raw.to_string()
+            }
+        } else if raw.starts_with("in ") {
+            raw.to_string()
+        } else if raw.contains('.') {
+            match language {
+                Language::German => format!("am {raw}"),
+                Language::English => format!("on {raw}"),
+            }
+        } else {
+            format!("in {raw}")
+        }
+    } else {
+        match language {
+            Language::German => "nicht terminiert".to_string(),
+            Language::English => "no schedule".to_string(),
+        }
+    }
+}
+
+fn draw_smooth_limit_block(
     painter: &egui::Painter,
-    row_rect: egui::Rect,
-    quota: &ProviderQuota,
+    top_left: egui::Pos2,
+    width: f32,
+    title: &str,
+    pct: u8,
+    reset_raw: Option<&str>,
+    is_five_hour: bool,
+    is_throttled: bool,
+    forecast: &PacingForecast,
     language: Language,
 ) {
-    // Row card background
+    // Line 1: Header (Left: Title + pct, Right: Runway tag)
+    let title_text = format!("{title}: {pct}%");
+    let title_galley = painter.layout_no_wrap(
+        title_text.into(),
+        egui::FontId::monospace(10.5),
+        egui::Color32::from_rgb(226, 232, 240),
+    );
+    painter.galley(top_left, title_galley, egui::Color32::from_rgb(226, 232, 240));
+
+    let runway_text = if is_five_hour {
+        forecast.five_hour_runway_text(language)
+    } else {
+        forecast.week_runway_text(language)
+    };
+
+    // Simon's Traffic-Light Pastel Rule (A3 Whisper Jade #78b886):
+    // Green (#78b886): Ample buffer (>30d, 5.7d, buffer stable). Alles OK!
+    // Yellow (#fde047): Tight (<3.0d, high pace, moderate deficit). Vorwarn-Zone!
+    // Red (#fca5a5): Critical (<1.0d, severe deficit >45m before reset, throttled, 0%). Problem!
+    let (runway_color, is_red_alert, is_yellow_alert) = if pct == 0 || is_throttled {
+        (egui::Color32::from_rgb(252, 165, 165), true, false)
+    } else if is_five_hour {
+        if let Some(fh) = &forecast.five_hour_forecast {
+            if fh.is_exhausted_before_reset {
+                let def = fh.delta_minutes.unwrap_or(0);
+                if def < -45 {
+                    (egui::Color32::from_rgb(252, 165, 165), true, false)
+                } else {
+                    (egui::Color32::from_rgb(253, 224, 71), false, true)
+                }
+            } else if pct < 25 || fh.burn_rate >= 0.35 || fh.delta_minutes.unwrap_or(999) < 45 {
+                (egui::Color32::from_rgb(253, 224, 71), false, true)
+            } else {
+                (egui::Color32::from_rgb(120, 184, 134), false, false)
+            }
+        } else if pct < 25 {
+            (egui::Color32::from_rgb(253, 224, 71), false, true)
+        } else {
+            (egui::Color32::from_rgb(120, 184, 134), false, false)
+        }
+    } else {
+        let runway_days = forecast.runway_days.unwrap_or(30.0);
+        if runway_days < 1.0 || pct < 10 {
+            (egui::Color32::from_rgb(252, 165, 165), true, false)
+        } else if runway_days < 3.0 || pct < 30 || forecast.health == PacingHealth::Tight {
+            (egui::Color32::from_rgb(253, 224, 71), false, true)
+        } else {
+            (egui::Color32::from_rgb(120, 184, 134), false, false)
+        }
+    };
+
+    let runway_galley = painter.layout_no_wrap(
+        runway_text.into(),
+        egui::FontId::monospace(10.0),
+        runway_color,
+    );
+    let runway_x = top_left.x + width - runway_galley.size().x;
+    painter.galley(
+        egui::pos2(runway_x, top_left.y),
+        runway_galley,
+        runway_color,
+    );
+
+    // Line 2: Option A Single-Row Micro-Dots (2.2px diameter, like music progress bar)
+    let track_y = top_left.y + 14.0;
+    let dot_step = 3.6;
+    let dot_radius = 1.1;
+    let dot_count = ((width - 2.0) / dot_step).floor() as usize;
+    let active_count = ((dot_count as f32) * (pct as f32 / 100.0)).round() as usize;
+
+    let dot_active_color = if is_red_alert {
+        egui::Color32::from_rgb(248, 113, 113) // Pastel coral red
+    } else if is_yellow_alert {
+        egui::Color32::from_rgb(251, 191, 36) // Warm amber
+    } else {
+        egui::Color32::from_rgb(157, 196, 118) // Sage green pastel (#9dc476)
+    };
+    let dot_unfilled_color = egui::Color32::from_rgba_unmultiplied(51, 65, 85, 130);
+
+    for i in 0..dot_count {
+        let dot_x = top_left.x + 1.1 + (i as f32) * dot_step;
+        let dot_pos = egui::pos2(dot_x, track_y);
+        let is_active = i < active_count;
+        if is_active {
+            if i + 1 == active_count {
+                // Tip dot: micro-halo + white center
+                painter.circle_filled(dot_pos, 2.4, dot_active_color.gamma_multiply(0.4));
+                painter.circle_filled(dot_pos, dot_radius, egui::Color32::from_rgb(255, 255, 255));
+            } else {
+                painter.circle_filled(dot_pos, dot_radius, dot_active_color);
+            }
+        } else {
+            painter.circle_filled(dot_pos, dot_radius, dot_unfilled_color);
+        }
+    }
+
+    // Line 3: Footer meta
+    let reset_phrase = format_reset_phrase(reset_raw, is_five_hour, language);
+    let footer_left = format!("{pct}% {} · Reset {reset_phrase}", language.text("frei", "free"));
+    let footer_left_galley = painter.layout_no_wrap(
+        footer_left.into(),
+        egui::FontId::monospace(9.5),
+        egui::Color32::from_rgb(148, 163, 184),
+    );
+    let footer_y = track_y + 5.0;
+    painter.galley(
+        egui::pos2(top_left.x, footer_y),
+        footer_left_galley,
+        egui::Color32::from_rgb(148, 163, 184),
+    );
+
+    // Right: Tempo / Pace
+    let pace_text = if is_five_hour {
+        forecast.five_hour_pace_text(language)
+    } else {
+        forecast.week_pace_text(language)
+    };
+    if !pace_text.is_empty() {
+        let footer_right_galley = painter.layout_no_wrap(
+            pace_text.into(),
+            egui::FontId::monospace(9.5),
+            egui::Color32::from_rgb(148, 163, 184),
+        );
+        let right_x = top_left.x + width - footer_right_galley.size().x;
+        painter.galley(
+            egui::pos2(right_x, footer_y),
+            footer_right_galley,
+            egui::Color32::from_rgb(148, 163, 184),
+        );
+    }
+}
+
+fn draw_provider_card(
+    painter: &egui::Painter,
+    card_rect: egui::Rect,
+    quota: &ProviderQuota,
+    forecast: &PacingForecast,
+    language: Language,
+    provider_color: egui::Color32,
+) {
+    // Card background
     painter.rect_filled(
-        row_rect,
+        card_rect,
         egui::CornerRadius::same(6),
-        egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140),
+        egui::Color32::from_rgba_unmultiplied(18, 24, 38, 180),
     );
     painter.rect_stroke(
-        row_rect,
+        card_rect,
         egui::CornerRadius::same(6),
         egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 90)),
         egui::StrokeKind::Inside,
     );
 
-    // Single crisp pill on the left: GLM, AGI, Codex (no redundant subtitle pill)
-    let (pill_title_bg, pill_title_stroke, pill_title_color) = match quota.id {
-        ProviderId::Glm => (
-            egui::Color32::from_rgba_unmultiplied(251, 146, 60, 32),
-            egui::Color32::from_rgba_unmultiplied(251, 146, 60, 140),
-            egui::Color32::from_rgb(253, 186, 116),
-        ),
-        ProviderId::Agy => (
-            egui::Color32::from_rgba_unmultiplied(192, 132, 252, 32),
-            egui::Color32::from_rgba_unmultiplied(192, 132, 252, 140),
-            egui::Color32::from_rgb(216, 180, 254),
-        ),
-        ProviderId::Codex => (
-            egui::Color32::from_rgba_unmultiplied(248, 113, 113, 35),
-            egui::Color32::from_rgba_unmultiplied(248, 113, 113, 140),
-            egui::Color32::from_rgb(252, 165, 165),
-        ),
-    };
+    // Pill badge colors
+    let pill_color = provider_color;
+    let pill_bg = egui::Color32::from_rgba_unmultiplied(pill_color.r(), pill_color.g(), pill_color.b(), 32);
+    let pill_stroke = egui::Color32::from_rgba_unmultiplied(pill_color.r(), pill_color.g(), pill_color.b(), 140);
 
-    let title_pill_rect = egui::Rect::from_min_size(
-        egui::pos2(row_rect.left() + 7.0, row_rect.center().y - 12.0),
-        egui::vec2(46.0, 24.0),
+    // Header row
+    let header_y = card_rect.top() + 6.0;
+    let badge_rect = egui::Rect::from_min_size(
+        egui::pos2(card_rect.left() + 8.0, header_y),
+        egui::vec2(44.0, 18.0),
     );
-    painter.rect_filled(title_pill_rect, egui::CornerRadius::same(4), pill_title_bg);
-    painter.rect_stroke(
-        title_pill_rect,
-        egui::CornerRadius::same(4),
-        egui::Stroke::new(1.0, pill_title_stroke),
-        egui::StrokeKind::Inside,
-    );
-    let title_galley = painter.layout_no_wrap(
+    painter.rect_filled(badge_rect, egui::CornerRadius::same(3), pill_bg);
+    painter.rect_stroke(badge_rect, egui::CornerRadius::same(3), egui::Stroke::new(1.0, pill_stroke), egui::StrokeKind::Inside);
+    let badge_galley = painter.layout_no_wrap(
         quota.title.into(),
-        egui::FontId::proportional(12.5),
-        pill_title_color,
+        egui::FontId::proportional(10.5),
+        pill_color,
     );
     painter.galley(
         egui::pos2(
-            title_pill_rect.center().x - title_galley.size().x / 2.0,
-            title_pill_rect.center().y - title_galley.size().y / 2.0,
+            badge_rect.center().x - badge_galley.size().x / 2.0,
+            badge_rect.center().y - badge_galley.size().y / 2.0,
         ),
-        title_galley,
-        pill_title_color,
+        badge_galley,
+        pill_color,
     );
 
-    // Dual Gauges (5h & Wk) in the center column:
-    let gauge_col_left = row_rect.left() + 59.0;
-    let gauge_line_width = 44.0;
-
-    // Line 1: 5h
-    let y_5h = row_rect.top() + 7.0;
-    let tag_5h_galley = painter.layout_no_wrap(
-        "5h".into(),
-        egui::FontId::proportional(11.0),
-        egui::Color32::from_rgb(148, 163, 184),
-    );
-    painter.galley(
-        egui::pos2(gauge_col_left, y_5h),
-        tag_5h_galley,
-        egui::Color32::from_rgb(148, 163, 184),
-    );
-
-    let track_rect_5h = egui::Rect::from_min_size(
-        egui::pos2(gauge_col_left + 20.0, y_5h + 3.5),
-        egui::vec2(gauge_line_width, 6.0),
-    );
-    painter.rect_filled(
-        track_rect_5h,
-        egui::CornerRadius::same(3),
-        egui::Color32::from_rgb(15, 20, 32),
-    );
-
-    if let Some(pct) = quota.five_hour_percent {
-        let fill_width = (gauge_line_width * (pct as f32 / 100.0)).clamp(0.0, gauge_line_width);
-        let fill_color = if pct < 20 {
-            RED
-        } else if quota.id == ProviderId::Agy {
-            egui::Color32::from_rgb(56, 189, 248)
-        } else {
-            egui::Color32::from_rgb(52, 211, 153)
-        };
-        painter.rect_filled(
-            egui::Rect::from_min_size(track_rect_5h.min, egui::vec2(fill_width, 6.0)),
-            egui::CornerRadius::same(3),
-            fill_color,
-        );
-
-        // High-contrast BOLD pure white percentage
-        let pct_color = if pct < 20 {
-            egui::Color32::from_rgb(254, 202, 202)
-        } else {
-            egui::Color32::WHITE
-        };
-        let pct_galley = painter.layout_no_wrap(
-            format!("{pct}%"),
-            egui::FontId::proportional(12.5),
-            pct_color,
-        );
-        painter.galley(
-            egui::pos2(track_rect_5h.right() + 5.0, y_5h - 1.0),
-            pct_galley,
-            pct_color,
-        );
-
-        if let Some(reset) = &quota.five_hour_reset {
-            let reset_galley = painter.layout_no_wrap(
-                reset.clone(),
-                egui::FontId::proportional(10.0),
-                egui::Color32::from_rgb(148, 163, 184),
-            );
-            painter.galley(
-                egui::pos2(track_rect_5h.right() + 38.0, y_5h + 0.5),
-                reset_galley,
-                egui::Color32::from_rgb(148, 163, 184),
-            );
-        }
-    } else {
-        let none_galley =
-            painter.layout_no_wrap("—".into(), egui::FontId::proportional(11.5), GRAY);
-        painter.galley(
-            egui::pos2(track_rect_5h.right() + 5.0, y_5h - 1.0),
-            none_galley,
-            GRAY,
-        );
-        let no_limit_galley = painter.layout_no_wrap(
-            language.text("kein Limit", "no limit").into(),
-            egui::FontId::proportional(9.0),
-            GRAY,
-        );
-        painter.galley(
-            egui::pos2(track_rect_5h.right() + 20.0, y_5h + 1.0),
-            no_limit_galley,
-            GRAY,
-        );
-    }
-
-    // Line 2: Wk
-    let y_wk = row_rect.top() + 23.0;
-    let tag_wk_galley = painter.layout_no_wrap(
-        "Wk".into(),
-        egui::FontId::proportional(11.0),
-        egui::Color32::from_rgb(148, 163, 184),
+    // Full Name
+    let full_name = match quota.id {
+        ProviderId::Glm => "Z.ai · GLM-4",
+        ProviderId::Agy => "Google · Antigravity",
+        ProviderId::Codex => "OpenAI · Codex",
+        ProviderId::Claude => "Anthropic · Claude",
+    };
+    let name_galley = painter.layout_no_wrap(
+        full_name.into(),
+        egui::FontId::proportional(11.5),
+        egui::Color32::from_rgb(226, 232, 240),
     );
     painter.galley(
-        egui::pos2(gauge_col_left, y_wk),
-        tag_wk_galley,
-        egui::Color32::from_rgb(148, 163, 184),
+        egui::pos2(badge_rect.right() + 8.0, header_y + 1.0),
+        name_galley,
+        egui::Color32::from_rgb(226, 232, 240),
     );
 
-    let track_rect_wk = egui::Rect::from_min_size(
-        egui::pos2(gauge_col_left + 20.0, y_wk + 3.5),
-        egui::vec2(gauge_line_width, 6.0),
-    );
-    painter.rect_filled(
-        track_rect_wk,
-        egui::CornerRadius::same(3),
-        egui::Color32::from_rgb(15, 20, 32),
-    );
-
-    if let Some(pct) = quota.week_percent {
-        let fill_width = (gauge_line_width * (pct as f32 / 100.0)).clamp(0.0, gauge_line_width);
-        let fill_color = if pct == 0 || quota.is_throttled {
-            RED
-        } else if quota.id == ProviderId::Agy {
-            egui::Color32::from_rgb(56, 189, 248)
-        } else {
-            egui::Color32::from_rgb(52, 211, 153)
-        };
-        if fill_width > 0.0 {
-            painter.rect_filled(
-                egui::Rect::from_min_size(track_rect_wk.min, egui::vec2(fill_width, 6.0)),
-                egui::CornerRadius::same(3),
-                fill_color,
-            );
-        }
-
-        // High-contrast BOLD percentage
-        let pct_color = if pct == 0 || quota.is_throttled {
-            egui::Color32::from_rgb(254, 202, 202)
-        } else {
-            egui::Color32::WHITE
-        };
-        let pct_galley = painter.layout_no_wrap(
-            format!("{pct}%"),
-            egui::FontId::proportional(12.5),
-            pct_color,
-        );
-        painter.galley(
-            egui::pos2(track_rect_wk.right() + 5.0, y_wk - 1.0),
-            pct_galley,
-            pct_color,
-        );
-
-        if let Some(reset) = &quota.week_reset {
-            let reset_color = if quota.is_throttled {
-                egui::Color32::from_rgb(252, 165, 165)
-            } else {
-                egui::Color32::from_rgb(148, 163, 184)
-            };
-            let reset_galley = painter.layout_no_wrap(
-                reset.clone(),
-                egui::FontId::proportional(10.0),
-                reset_color,
-            );
-            painter.galley(
-                egui::pos2(track_rect_wk.right() + 38.0, y_wk + 0.5),
-                reset_galley,
-                reset_color,
-            );
-        }
-    }
-
-    // Pacing & Forecast Radar Card on the right:
-    let forecast = quota.pacing_forecast();
-    let card_left = row_rect.left() + 204.0;
-    let card_right = row_rect.right() - 6.0;
-    let card_rect = egui::Rect::from_min_max(
-        egui::pos2(card_left, row_rect.center().y - 15.0),
-        egui::pos2(card_right, row_rect.center().y + 15.0),
-    );
-
-    let (card_bg, card_border, led_color, badge_color, summary_color, status_chip_text) = match forecast.health {
-        PacingHealth::Surplus => (
-            egui::Color32::from_rgba_unmultiplied(16, 42, 32, 180),
-            egui::Color32::from_rgba_unmultiplied(34, 197, 94, 90),
+    // Right: Pure status LED light without text clutter (per Simon's request)
+    let (led_color, halo_color) = match forecast.health {
+        PacingHealth::Surplus | PacingHealth::OnTrack => (
             egui::Color32::from_rgb(34, 197, 94),
-            egui::Color32::from_rgb(187, 247, 208),
-            egui::Color32::from_rgb(160, 180, 205),
-            "OK",
-        ),
-        PacingHealth::OnTrack => (
-            egui::Color32::from_rgba_unmultiplied(16, 38, 48, 180),
-            egui::Color32::from_rgba_unmultiplied(56, 189, 248, 90),
-            egui::Color32::from_rgb(56, 189, 248),
-            egui::Color32::from_rgb(186, 230, 253),
-            egui::Color32::from_rgb(160, 180, 205),
-            "OK",
+            egui::Color32::from_rgba_unmultiplied(34, 197, 94, 70),
         ),
         PacingHealth::Tight => (
-            egui::Color32::from_rgba_unmultiplied(54, 34, 14, 180),
-            egui::Color32::from_rgba_unmultiplied(245, 158, 11, 140),
-            egui::Color32::from_rgb(245, 158, 11),
-            egui::Color32::from_rgb(254, 215, 170),
-            egui::Color32::from_rgb(253, 186, 116),
-            "WARN",
+            egui::Color32::from_rgb(253, 224, 71),
+            egui::Color32::from_rgba_unmultiplied(253, 224, 71, 75),
         ),
         PacingHealth::Throttled => (
-            egui::Color32::from_rgba_unmultiplied(54, 20, 24, 180),
-            egui::Color32::from_rgba_unmultiplied(239, 68, 68, 140),
             egui::Color32::from_rgb(239, 68, 68),
-            egui::Color32::from_rgb(254, 202, 202),
-            egui::Color32::from_rgb(248, 113, 113),
-            "HALT",
+            egui::Color32::from_rgba_unmultiplied(239, 68, 68, 80),
         ),
     };
-
-    painter.rect_filled(card_rect, egui::CornerRadius::same(4), card_bg);
-    painter.rect_stroke(
-        card_rect,
-        egui::CornerRadius::same(4),
-        egui::Stroke::new(1.0, card_border),
-        egui::StrokeKind::Inside,
-    );
-
-    // Procedural Hardware Micro-LED
-    let led_center = egui::pos2(card_rect.left() + 9.0, card_rect.top() + 8.5);
+    let led_pos = egui::pos2(card_rect.right() - 14.0, header_y + 9.0);
+    painter.circle_filled(led_pos, 5.0, halo_color);
+    painter.circle_filled(led_pos, 2.5, led_color);
     painter.circle_filled(
-        led_center,
-        4.0,
-        egui::Color32::from_rgba_unmultiplied(led_color.r(), led_color.g(), led_color.b(), 55),
-    );
-    painter.circle_filled(led_center, 2.2, led_color);
-
-    // Upper line: Pacing badge text (bold)
-    let badge_galley = painter.layout_no_wrap(
-        forecast.localized_badge_text(language).into(),
-        egui::FontId::proportional(11.0),
-        badge_color,
-    );
-    painter.galley(
-        egui::pos2(card_rect.left() + 17.0, card_rect.top() + 2.5),
-        badge_galley,
-        badge_color,
+        egui::pos2(led_pos.x - 0.7, led_pos.y - 0.7),
+        0.8,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
     );
 
-    // Lower line: Forecast runway / reset text
-    let summary_galley = painter.layout_no_wrap(
-        forecast.localized_summary_text(language).into(),
-        egui::FontId::proportional(10.0),
-        summary_color,
-    );
-    painter.galley(
-        egui::pos2(card_rect.left() + 17.0, card_rect.top() + 15.5),
-        summary_galley,
-        summary_color,
+    // Subtle divider
+    let div_y = header_y + 22.0;
+    painter.line_segment(
+        [
+            egui::pos2(card_rect.left() + 8.0, div_y),
+            egui::pos2(card_rect.right() - 8.0, div_y),
+        ],
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 45)),
     );
 
-    // Chip tag on far right (OK, WARN, HALT)
-    let chip_width = 28.0;
-    let chip_rect = egui::Rect::from_min_size(
-        egui::pos2(card_rect.right() - chip_width - 4.0, card_rect.center().y - 8.0),
-        egui::vec2(chip_width, 16.0),
-    );
-    painter.rect_filled(
-        chip_rect,
-        egui::CornerRadius::same(3),
-        egui::Color32::from_rgba_unmultiplied(led_color.r(), led_color.g(), led_color.b(), 25),
-    );
-    painter.rect_stroke(
-        chip_rect,
-        egui::CornerRadius::same(3),
-        egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(led_color.r(), led_color.g(), led_color.b(), 90),
-        ),
-        egui::StrokeKind::Inside,
-    );
-    let chip_galley = painter.layout_no_wrap(
-        status_chip_text.into(),
-        egui::FontId::proportional(9.0),
-        badge_color,
-    );
-    painter.galley(
-        egui::pos2(
-            chip_rect.center().x - chip_galley.size().x / 2.0,
-            chip_rect.center().y - chip_galley.size().y / 2.0,
-        ),
-        chip_galley,
-        badge_color,
-    );
+    // Limit Blocks
+    let inner_left = card_rect.left() + 10.0;
+    let inner_w = card_rect.width() - 20.0;
+
+    let has_5h = quota.five_hour_percent.is_some() || quota.five_hour_reset.is_some();
+    let has_wk = quota.week_percent.is_some() || quota.week_reset.is_some();
+
+    if has_5h && has_wk {
+        let title_5h = if quota.id == ProviderId::Claude {
+            language.text("Session-Limit", "Session Limit")
+        } else {
+            language.text("5h-Limit", "5-Hour Limit")
+        };
+        draw_smooth_limit_block(
+            painter,
+            egui::pos2(inner_left, div_y + 5.0),
+            inner_w,
+            title_5h,
+            quota.five_hour_percent.unwrap_or(100),
+            quota.five_hour_reset.as_deref(),
+            true,
+            quota.is_throttled,
+            forecast,
+            language,
+        );
+
+        let title_wk = if quota.cycle_label() == "Mo" {
+            language.text("Monats-Limit", "Monthly Limit")
+        } else {
+            language.text("Wochen-Limit", "Weekly Limit")
+        };
+        draw_smooth_limit_block(
+            painter,
+            egui::pos2(inner_left, div_y + 41.0),
+            inner_w,
+            title_wk,
+            quota.week_percent.unwrap_or(100),
+            quota.week_reset.as_deref(),
+            false,
+            quota.is_throttled,
+            forecast,
+            language,
+        );
+    } else if has_5h {
+        let title_5h = if quota.id == ProviderId::Claude {
+            language.text("Session-Limit", "Session Limit")
+        } else {
+            language.text("5h-Limit", "5-Hour Limit")
+        };
+        draw_smooth_limit_block(
+            painter,
+            egui::pos2(inner_left, div_y + 5.0),
+            inner_w,
+            title_5h,
+            quota.five_hour_percent.unwrap_or(100),
+            quota.five_hour_reset.as_deref(),
+            true,
+            quota.is_throttled,
+            forecast,
+            language,
+        );
+    } else if has_wk {
+        let title_wk = if quota.cycle_label() == "Mo" {
+            language.text("Monats-Limit", "Monthly Limit")
+        } else {
+            language.text("Wochen-Limit", "Weekly Limit")
+        };
+        draw_smooth_limit_block(
+            painter,
+            egui::pos2(inner_left, div_y + 5.0),
+            inner_w,
+            title_wk,
+            quota.week_percent.unwrap_or(100),
+            quota.week_reset.as_deref(),
+            false,
+            quota.is_throttled,
+            forecast,
+            language,
+        );
+    } else {
+        let none_galley = painter.layout_no_wrap(
+            language.text("Kein Limit aktiv · Unbegrenzt", "No limit active · Unlimited").into(),
+            egui::FontId::monospace(11.0),
+            egui::Color32::from_rgb(148, 163, 184),
+        );
+        painter.galley(
+            egui::pos2(inner_left, div_y + 10.0),
+            none_galley,
+            egui::Color32::from_rgb(148, 163, 184),
+        );
+    }
+}
+
+fn render_quota_tooltip(
+    ui: &mut egui::Ui,
+    quota: &ProviderQuota,
+    forecast: &PacingForecast,
+    language: Language,
+) {
+    ui.spacing_mut().item_spacing = egui::vec2(6.0, 3.0);
+
+    // Header: Provider & Status
+    ui.horizontal(|ui| {
+        ui.strong(format!("{} · {}", quota.title, quota.author));
+        let (status_text, status_color) = match forecast.health {
+            PacingHealth::Surplus => (
+                language.text("Puffer gesund", "Buffer healthy"),
+                egui::Color32::from_rgb(34, 197, 94),
+            ),
+            PacingHealth::OnTrack => (
+                language.text("Im Plan", "On track"),
+                egui::Color32::from_rgb(56, 189, 248),
+            ),
+            PacingHealth::Tight => (
+                language.text("Knapp / Erhöht", "Tight / High pace"),
+                egui::Color32::from_rgb(245, 158, 11),
+            ),
+            PacingHealth::Throttled => (
+                language.text("Gedrosselt", "Throttled"),
+                egui::Color32::from_rgb(239, 68, 68),
+            ),
+        };
+        ui.colored_label(status_color, format!("· {status_text}"));
+    });
+
+    ui.separator();
+
+    // 5-Hour Section
+    if let Some(pct) = quota.five_hour_percent {
+        let title_5h = if quota.id == ProviderId::Claude {
+            language.text("Session-Fenster (3-5h)", "Session Window (3-5h)")
+        } else {
+            language.text("5-Stunden-Sitzungsfenster", "5-Hour Session Window")
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title_5h).strong().color(egui::Color32::from_rgb(226, 232, 240)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.colored_label(egui::Color32::from_rgb(157, 196, 118), format!("{pct}% {}", language.text("verfügbar", "remaining")));
+            });
+        });
+
+        egui::Grid::new(format!("grid_5h_{:?}", quota.id))
+            .num_columns(2)
+            .spacing([12.0, 3.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(language.text("Reset:", "Reset:")).color(egui::Color32::from_rgb(148, 163, 184)));
+                let reset_str = quota.five_hour_reset.as_deref().unwrap_or("—");
+                let phrase = format_reset_phrase(quota.five_hour_reset.as_deref(), true, language);
+                ui.label(format!("{phrase} ({reset_str})"));
+                ui.end_row();
+
+                if let Some(fh) = &forecast.five_hour_forecast {
+                    ui.label(egui::RichText::new(language.text("Pace:", "Pace:")).color(egui::Color32::from_rgb(148, 163, 184)));
+                    let pace_color = if fh.pace_ratio <= 1.05 {
+                        egui::Color32::from_rgb(157, 196, 118)
+                    } else if fh.pace_ratio <= 1.25 {
+                        egui::Color32::from_rgb(203, 213, 225)
+                    } else {
+                        egui::Color32::from_rgb(245, 158, 11)
+                    };
+                    ui.colored_label(pace_color, forecast.five_hour_pace_text(language));
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new(language.text("Reichweite:", "Runway:")).color(egui::Color32::from_rgb(148, 163, 184)));
+                    let rw_color = if fh.is_exhausted_before_reset {
+                        egui::Color32::from_rgb(245, 158, 11)
+                    } else {
+                        egui::Color32::from_rgb(56, 189, 248)
+                    };
+                    ui.colored_label(rw_color, forecast.five_hour_runway_text(language));
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new(language.text("Puffer-Lage:", "Buffer status:")).color(egui::Color32::from_rgb(148, 163, 184)));
+                    if fh.is_exhausted_before_reset {
+                        let def_mins = fh.delta_minutes.map(|d| (-d).max(1)).unwrap_or(30);
+                        let (h, m) = fh.exhaustion_time.unwrap_or((0, 0));
+                        ui.colored_label(
+                            egui::Color32::from_rgb(239, 68, 68),
+                            format!("-{}m ({} {:02}:{:02})", def_mins, language.text("Leer um", "Empty at"), h, m),
+                        );
+                    } else {
+                        let buf_text = if let Some(delta) = fh.delta_minutes {
+                            let h = (delta as f32 / 60.0).round() as i32;
+                            format!("+{}h {}", h, language.text("über Reset hinaus", "beyond reset"))
+                        } else {
+                            language.text(">24h Puffer stabil", ">24h buffer stable").to_string()
+                        };
+                        ui.colored_label(egui::Color32::from_rgb(157, 196, 118), buf_text);
+                    }
+                    ui.end_row();
+                }
+            });
+        ui.add_space(4.0);
+    }
+
+    // Weekly / Monthly Section
+    if let Some(pct) = quota.week_percent {
+        if quota.five_hour_percent.is_some() {
+            ui.separator();
+        }
+
+        let is_monthly = quota.cycle_label() == "Mo";
+        let title_wk = if is_monthly {
+            language.text("Monats-Kontingent", "Monthly Quota")
+        } else {
+            language.text("Wochen-Kontingent", "Weekly Quota")
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title_wk).strong().color(egui::Color32::from_rgb(226, 232, 240)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.colored_label(egui::Color32::from_rgb(157, 196, 118), format!("{pct}% {}", language.text("verfügbar", "remaining")));
+            });
+        });
+
+        egui::Grid::new(format!("grid_wk_{:?}", quota.id))
+            .num_columns(2)
+            .spacing([12.0, 3.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(language.text("Reset:", "Reset:")).color(egui::Color32::from_rgb(148, 163, 184)));
+                let reset_str = quota.week_reset.as_deref().unwrap_or("—");
+                let phrase = format_reset_phrase(quota.week_reset.as_deref(), false, language);
+                ui.label(format!("{phrase} ({reset_str})"));
+                ui.end_row();
+
+                if let Some(ratio) = forecast.pace_ratio {
+                    ui.label(egui::RichText::new(language.text("Pace:", "Pace:")).color(egui::Color32::from_rgb(148, 163, 184)));
+                    let pace_color = if ratio <= 1.05 {
+                        egui::Color32::from_rgb(157, 196, 118)
+                    } else if ratio <= 1.25 {
+                        egui::Color32::from_rgb(203, 213, 225)
+                    } else {
+                        egui::Color32::from_rgb(245, 158, 11)
+                    };
+                    ui.colored_label(pace_color, forecast.week_pace_text(language));
+                    ui.end_row();
+                }
+
+                ui.label(egui::RichText::new(language.text("Reichweite:", "Runway:")).color(egui::Color32::from_rgb(148, 163, 184)));
+                let rw_color = if forecast.health == PacingHealth::Tight || forecast.health == PacingHealth::Throttled {
+                    egui::Color32::from_rgb(245, 158, 11)
+                } else {
+                    egui::Color32::from_rgb(56, 189, 248)
+                };
+                ui.colored_label(rw_color, forecast.week_runway_text(language));
+                ui.end_row();
+
+                ui.label(egui::RichText::new(language.text("Puffer-Lage:", "Buffer status:")).color(egui::Color32::from_rgb(148, 163, 184)));
+                let (status_buf, buf_color) = if forecast.health == PacingHealth::Throttled {
+                    (language.text("Erschöpft", "Depleted").to_string(), egui::Color32::from_rgb(239, 68, 68))
+                } else if let Some(delta) = forecast.delta_days {
+                    if delta < 0 {
+                        (format!("-{} {}", -delta, language.text("Tage Defizit", "days deficit")), egui::Color32::from_rgb(239, 68, 68))
+                    } else if delta > 14 {
+                        (language.text("+>30 Tage Puffer", "+>30 days buffer").to_string(), egui::Color32::from_rgb(157, 196, 118))
+                    } else {
+                        (format!("+{} {}", delta, language.text("Tage Puffer", "days buffer")), egui::Color32::from_rgb(157, 196, 118))
+                    }
+                } else {
+                    (language.text("Puffer stabil", "Buffer stable").to_string(), egui::Color32::from_rgb(157, 196, 118))
+                };
+                ui.colored_label(buf_color, status_buf);
+                ui.end_row();
+            });
+    }
 }
 
 fn blend_media_colors(
@@ -6244,6 +8388,17 @@ mod tests {
     }
 
     #[test]
+    fn satellite_window_titles_are_recognized() {
+        assert!(is_satellite_window_title("Herdr-Nachtwächter - Limits"));
+        assert!(is_satellite_window_title("Herdr Night Watch - Limits"));
+        assert!(!is_satellite_window_title(""));
+        assert!(!is_satellite_window_title("Herdr-Nachtwächter - Live-Status"));
+        assert!(!is_satellite_window_title(
+            "Herdr-Nachtwächter - Abschlussprotokoll"
+        ));
+    }
+
+    #[test]
     fn owner_pid_is_read_from_spawn_argument() {
         assert_eq!(
             parse_owner_pid(["--live-status", "--owner-pid=3648"]),
@@ -6642,5 +8797,53 @@ mod tests {
         assert!(window.shrink(4.0).contains_rect(label));
         assert!(label.width() > 120.0);
         assert!(label.height() > 14.0);
+    }
+
+    #[test]
+    fn test_quota_satellite_design_height() {
+        assert_eq!(quota_satellite_design_height(&[], true), 314.0);
+        assert_eq!(quota_satellite_design_height(&[], false), 88.0);
+
+        let glm = ProviderQuota::new(ProviderId::Glm, "GLM", "Z.ai", None, None, Some(90), Some("01.10.".into()));
+        assert_eq!(provider_card_height(&glm), 68.0);
+        assert_eq!(quota_satellite_design_height(&[glm.clone()], false), 38.0 + 68.0 + 8.0);
+
+        let agy = ProviderQuota::new(ProviderId::Agy, "AGY", "Google", Some(73), Some("19:45".into()), Some(85), Some("137h".into()));
+        assert_eq!(provider_card_height(&agy), 104.0);
+        assert_eq!(quota_satellite_design_height(&[glm, agy], false), 38.0 + 68.0 + 104.0 + 6.0 + 8.0);
+    }
+
+    #[test]
+    fn test_pomodoro_minutes_from_vector() {
+        // 3 o'clock -> 15 min
+        assert_eq!(pomodoro_minutes_from_vector(egui::vec2(10.0, 0.0)), 15.0);
+        // 6 o'clock -> 30 min
+        assert_eq!(pomodoro_minutes_from_vector(egui::vec2(0.0, 10.0)), 30.0);
+        // 8 o'clock -> 40 min (Simon's default case)
+        let angle_40m = (40.0 / 60.0) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        let vec_40m = egui::vec2(angle_40m.cos() * 10.0, angle_40m.sin() * 10.0);
+        assert_eq!(pomodoro_minutes_from_vector(vec_40m), 40.0);
+        // 9 o'clock -> 45 min
+        assert_eq!(pomodoro_minutes_from_vector(egui::vec2(-10.0, 0.0)), 45.0);
+    }
+
+    #[test]
+    fn test_provider_pastel_palette() {
+        assert_eq!(PROVIDER_PASTEL_PALETTE.len(), 10);
+        for (i, def) in PROVIDER_PASTEL_PALETTE.iter().enumerate() {
+            assert!(!def.name_de.is_empty(), "Palette {i} missing German name");
+            assert!(!def.name_en.is_empty(), "Palette {i} missing English name");
+            assert_ne!(def.color, egui::Color32::BLACK);
+            assert_ne!(def.color, egui::Color32::TRANSPARENT);
+        }
+        // Unique colors
+        let mut unique = std::collections::HashSet::new();
+        for def in &PROVIDER_PASTEL_PALETTE {
+            assert!(unique.insert(def.color), "Duplicate color in palette");
+        }
+        // Wrap-around test
+        assert_eq!(provider_palette_color(0), PROVIDER_PASTEL_PALETTE[0].color);
+        assert_eq!(provider_palette_color(9), PROVIDER_PASTEL_PALETTE[9].color);
+        assert_eq!(provider_palette_color(10), PROVIDER_PASTEL_PALETTE[0].color);
     }
 }

@@ -16,6 +16,21 @@ const LIVE_STATUS_QUOTA_OPEN_VALUE: &str = "LiveStatusQuotaOpen";
 const LIVE_STATUS_QUOTA_DOCKED_VALUE: &str = "LiveStatusQuotaDocked";
 const LIVE_STATUS_QUOTA_POS_X_VALUE: &str = "LiveStatusQuotaPositionX";
 const LIVE_STATUS_QUOTA_POS_Y_VALUE: &str = "LiveStatusQuotaPositionY";
+const LIVE_STATUS_QUOTA_SHOW_GLM_VALUE: &str = "LiveStatusQuotaShowGlm";
+const LIVE_STATUS_QUOTA_SHOW_AGI_VALUE: &str = "LiveStatusQuotaShowAgi";
+const LIVE_STATUS_QUOTA_SHOW_CODEX_VALUE: &str = "LiveStatusQuotaShowCodex";
+const LIVE_STATUS_QUOTA_SHOW_CLAUDE_VALUE: &str = "LiveStatusQuotaShowClaude";
+const LIVE_STATUS_QUOTA_COLOR_GLM_VALUE: &str = "LiveStatusQuotaColorGlm";
+const LIVE_STATUS_QUOTA_COLOR_AGI_VALUE: &str = "LiveStatusQuotaColorAgi";
+const LIVE_STATUS_QUOTA_COLOR_CODEX_VALUE: &str = "LiveStatusQuotaColorCodex";
+const LIVE_STATUS_QUOTA_COLOR_CLAUDE_VALUE: &str = "LiveStatusQuotaColorClaude";
+const LIVE_STATUS_CORNER_RADIUS_VALUE: &str = "LiveStatusCornerRadius";
+const LIVE_STATUS_QUOTA_SETTINGS_OPEN_VALUE: &str = "LiveStatusQuotaSettingsOpen";
+
+pub const DEFAULT_LIVE_STATUS_CORNER_RADIUS: u8 = 10;
+pub const MIN_LIVE_STATUS_CORNER_RADIUS: u8 = 0;
+pub const MAX_LIVE_STATUS_CORNER_RADIUS: u8 = 20;
+pub const CORNER_RADIUS_PRESETS: [u8; 6] = [0, 4, 8, 10, 14, 18];
 
 pub const OPACITY_VALUES: [u8; 10] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
 // The live-status repaint cadence trades the gliding second hand against
@@ -224,6 +239,14 @@ pub fn set_live_status_quota_open(open: bool) -> anyhow::Result<()> {
     write_bool_setting(LIVE_STATUS_QUOTA_OPEN_VALUE, open)
 }
 
+pub fn live_status_quota_settings_open() -> bool {
+    read_bool_setting(LIVE_STATUS_QUOTA_SETTINGS_OPEN_VALUE, false)
+}
+
+pub fn set_live_status_quota_settings_open(open: bool) -> anyhow::Result<()> {
+    write_bool_setting(LIVE_STATUS_QUOTA_SETTINGS_OPEN_VALUE, open)
+}
+
 pub fn live_status_quota_docked() -> bool {
     read_bool_setting(LIVE_STATUS_QUOTA_DOCKED_VALUE, true)
 }
@@ -246,6 +269,102 @@ pub fn set_live_status_quota_position(position: [f32; 2]) -> anyhow::Result<()> 
     key.set_value(LIVE_STATUS_QUOTA_POS_X_VALUE, &(x as u32))?;
     key.set_value(LIVE_STATUS_QUOTA_POS_Y_VALUE, &(y as u32))?;
     Ok(())
+}
+
+pub fn live_status_quota_show_glm() -> bool {
+    read_bool_setting(LIVE_STATUS_QUOTA_SHOW_GLM_VALUE, true)
+}
+
+pub fn set_live_status_quota_show_glm(show: bool) -> anyhow::Result<()> {
+    write_bool_setting(LIVE_STATUS_QUOTA_SHOW_GLM_VALUE, show)
+}
+
+pub fn live_status_quota_show_agi() -> bool {
+    read_bool_setting(LIVE_STATUS_QUOTA_SHOW_AGI_VALUE, true)
+}
+
+pub fn set_live_status_quota_show_agi(show: bool) -> anyhow::Result<()> {
+    write_bool_setting(LIVE_STATUS_QUOTA_SHOW_AGI_VALUE, show)
+}
+
+pub fn live_status_quota_show_codex() -> bool {
+    read_bool_setting(LIVE_STATUS_QUOTA_SHOW_CODEX_VALUE, true)
+}
+
+pub fn set_live_status_quota_show_codex(show: bool) -> anyhow::Result<()> {
+    write_bool_setting(LIVE_STATUS_QUOTA_SHOW_CODEX_VALUE, show)
+}
+
+pub fn live_status_quota_show_claude() -> bool {
+    read_bool_setting(LIVE_STATUS_QUOTA_SHOW_CLAUDE_VALUE, false)
+}
+
+pub fn set_live_status_quota_show_claude(show: bool) -> anyhow::Result<()> {
+    write_bool_setting(LIVE_STATUS_QUOTA_SHOW_CLAUDE_VALUE, show)
+}
+
+fn read_u32_setting(value_name: &str, default: u32) -> u32 {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .and_then(|key| key.get_value::<u32, _>(value_name))
+        .unwrap_or(default)
+}
+
+fn write_u32_setting(value_name: &str, value: u32) -> anyhow::Result<()> {
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
+    key.set_value(value_name, &value)?;
+    Ok(())
+}
+
+pub fn live_status_quota_color_glm() -> u8 {
+    read_u32_setting(LIVE_STATUS_QUOTA_COLOR_GLM_VALUE, 6).min(9) as u8
+}
+
+pub fn set_live_status_quota_color_glm(idx: u8) -> anyhow::Result<()> {
+    write_u32_setting(LIVE_STATUS_QUOTA_COLOR_GLM_VALUE, idx.min(9) as u32)
+}
+
+pub fn live_status_quota_color_agi() -> u8 {
+    read_u32_setting(LIVE_STATUS_QUOTA_COLOR_AGI_VALUE, 0).min(9) as u8
+}
+
+pub fn set_live_status_quota_color_agi(idx: u8) -> anyhow::Result<()> {
+    write_u32_setting(LIVE_STATUS_QUOTA_COLOR_AGI_VALUE, idx.min(9) as u32)
+}
+
+pub fn live_status_quota_color_codex() -> u8 {
+    read_u32_setting(LIVE_STATUS_QUOTA_COLOR_CODEX_VALUE, 3).min(9) as u8
+}
+
+pub fn set_live_status_quota_color_codex(idx: u8) -> anyhow::Result<()> {
+    write_u32_setting(LIVE_STATUS_QUOTA_COLOR_CODEX_VALUE, idx.min(9) as u32)
+}
+
+pub fn live_status_quota_color_claude() -> u8 {
+    read_u32_setting(LIVE_STATUS_QUOTA_COLOR_CLAUDE_VALUE, 6).min(9) as u8
+}
+
+pub fn set_live_status_quota_color_claude(idx: u8) -> anyhow::Result<()> {
+    write_u32_setting(LIVE_STATUS_QUOTA_COLOR_CLAUDE_VALUE, idx.min(9) as u32)
+}
+
+pub fn clamp_corner_radius(radius: u8) -> u8 {
+    radius.clamp(MIN_LIVE_STATUS_CORNER_RADIUS, MAX_LIVE_STATUS_CORNER_RADIUS)
+}
+
+pub fn live_status_corner_radius() -> u8 {
+    read_u32_setting(
+        LIVE_STATUS_CORNER_RADIUS_VALUE,
+        u32::from(DEFAULT_LIVE_STATUS_CORNER_RADIUS),
+    )
+    .min(u32::from(MAX_LIVE_STATUS_CORNER_RADIUS)) as u8
+}
+
+pub fn set_live_status_corner_radius(radius: u8) -> anyhow::Result<()> {
+    write_u32_setting(
+        LIVE_STATUS_CORNER_RADIUS_VALUE,
+        u32::from(clamp_corner_radius(radius)),
+    )
 }
 
 #[cfg(test)]
@@ -285,5 +404,48 @@ mod tests {
         assert_eq!(clamp_repaint_interval_ms(Some(250)), 250);
         assert_eq!(clamp_repaint_interval_ms(Some(500)), 500);
         assert_eq!(clamp_repaint_interval_ms(Some(1000)), 1000);
+    }
+
+    #[test]
+    fn quota_provider_visibility_constants_are_distinct() {
+        let keys = [
+            LIVE_STATUS_QUOTA_SHOW_GLM_VALUE,
+            LIVE_STATUS_QUOTA_SHOW_AGI_VALUE,
+            LIVE_STATUS_QUOTA_SHOW_CODEX_VALUE,
+            LIVE_STATUS_QUOTA_SHOW_CLAUDE_VALUE,
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for (j, b) in keys.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quota_provider_color_constants_are_distinct() {
+        let keys = [
+            LIVE_STATUS_QUOTA_COLOR_GLM_VALUE,
+            LIVE_STATUS_QUOTA_COLOR_AGI_VALUE,
+            LIVE_STATUS_QUOTA_COLOR_CODEX_VALUE,
+            LIVE_STATUS_QUOTA_COLOR_CLAUDE_VALUE,
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for (j, b) in keys.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn corner_radius_clamps_properly() {
+        assert_eq!(clamp_corner_radius(0), 0);
+        assert_eq!(clamp_corner_radius(10), 10);
+        assert_eq!(clamp_corner_radius(20), 20);
+        assert_eq!(clamp_corner_radius(25), 20);
+        assert_eq!(DEFAULT_LIVE_STATUS_CORNER_RADIUS, 10);
     }
 }
