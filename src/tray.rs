@@ -34,6 +34,7 @@ const ID_QUIT: &str = "quit";
 const ID_LANGUAGE_DE: &str = "language_de";
 const ID_LANGUAGE_EN: &str = "language_en";
 const ID_SETTINGS: &str = "settings";
+const ID_WINDOW_TRANSPARENCY_PREFIX: &str = "window_transparency_";
 const ID_WINDOW_OPACITY_PREFIX: &str = "window_opacity_";
 const ID_WINDOW_LEVEL_NORMAL: &str = "window_level_normal";
 const ID_WINDOW_LEVEL_TOP: &str = "window_level_top";
@@ -323,7 +324,7 @@ impl App {
             self.status,
             self.message,
             autostart::enabled(),
-            window_settings::opacity(),
+            window_settings::transparency(),
             window_settings::WindowLevel::current(),
             window_settings::live_status_on_start(),
             window_settings::live_status_in_taskbar(),
@@ -407,6 +408,11 @@ impl App {
             ID_WINDOW_LEVEL_NORMAL => window_settings::WindowLevel::Normal.set(),
             ID_WINDOW_LEVEL_TOP => window_settings::WindowLevel::AlwaysOnTop.set(),
             ID_WINDOW_LEVEL_BOTTOM => window_settings::WindowLevel::AlwaysOnBottom.set(),
+            action if action.starts_with(ID_WINDOW_TRANSPARENCY_PREFIX) => action
+                .trim_start_matches(ID_WINDOW_TRANSPARENCY_PREFIX)
+                .parse::<u8>()
+                .map_err(|error| anyhow::anyhow!("invalid transparency value: {error}"))
+                .and_then(window_settings::set_transparency),
             action if action.starts_with(ID_WINDOW_OPACITY_PREFIX) => action
                 .trim_start_matches(ID_WINDOW_OPACITY_PREFIX)
                 .parse::<u8>()
@@ -493,12 +499,20 @@ impl App {
                         "Window stays in background",
                     )
                     .into(),
+                action if action.starts_with(ID_WINDOW_TRANSPARENCY_PREFIX) => {
+                    let value = action.trim_start_matches(ID_WINDOW_TRANSPARENCY_PREFIX);
+                    if self.language == Language::German {
+                        format!("Fenstertransparenz auf {value} % gesetzt")
+                    } else {
+                        format!("Window transparency set to {value}%")
+                    }
+                }
                 action if action.starts_with(ID_WINDOW_OPACITY_PREFIX) => {
                     let value = action.trim_start_matches(ID_WINDOW_OPACITY_PREFIX);
                     if self.language == Language::German {
                         format!("Fenstertransparenz auf {value} % gesetzt")
                     } else {
-                        format!("Window opacity set to {value}%")
+                        format!("Window transparency set to {value}%")
                     }
                 }
                 action if action.starts_with(ID_WINDOW_CORNER_RADIUS_PREFIX) => {
@@ -639,26 +653,30 @@ fn menu_for(
         language.text("Fenstereinstellungen", "Window settings"),
         true,
     );
-    let opacity_submenu = Submenu::new(language.text("Fenstertransparenz", "Window opacity"), true);
-    let current_opacity = window_settings::opacity();
-    for value in window_settings::OPACITY_VALUES {
-        let id = format!("{ID_WINDOW_OPACITY_PREFIX}{value}");
-        let label = if value == 100 {
+    let transparency_submenu = Submenu::new(language.text("Fenstertransparenz", "Window transparency"), true);
+    let current_transparency = window_settings::transparency();
+    for value in window_settings::TRANSPARENCY_VALUES {
+        let id = format!("{ID_WINDOW_TRANSPARENCY_PREFIX}{value}");
+        let label = if value == 0 {
             language
-                .text("100 % (deckend)", "100% (opaque)")
+                .text("0 % (voll sichtbar)", "0% (solid)")
+                .to_string()
+        } else if value == 90 {
+            language
+                .text("90 % (fast unsichtbar)", "90% (nearly invisible)")
                 .to_string()
         } else {
             format!("{value} %")
         };
-        let _ = opacity_submenu.append(&CheckMenuItem::with_id(
+        let _ = transparency_submenu.append(&CheckMenuItem::with_id(
             id,
             label,
             true,
-            value == current_opacity,
+            value == current_transparency,
             None,
         ));
     }
-    let _ = window_submenu.append(&opacity_submenu);
+    let _ = window_submenu.append(&transparency_submenu);
     let level_submenu = Submenu::new(language.text("Fensterebene", "Window level"), true);
     let current_level = window_settings::WindowLevel::current();
     let _ = level_submenu.append(&CheckMenuItem::with_id(

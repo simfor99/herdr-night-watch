@@ -5,7 +5,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GWL_EXSTYLE, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, WS_EX_LAYERED,
+    SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, WS_EX_LAYERED, WS_EX_TOPMOST,
 };
 
 const BG_TOP: egui::Color32 = egui::Color32::from_rgb(26, 34, 54);
@@ -17,6 +17,14 @@ pub fn window_level(level: window_settings::WindowLevel) -> egui::WindowLevel {
         window_settings::WindowLevel::AlwaysOnTop => egui::WindowLevel::AlwaysOnTop,
         window_settings::WindowLevel::AlwaysOnBottom => egui::WindowLevel::AlwaysOnBottom,
     }
+}
+
+pub fn apply_window_transparency(transparency: u8, title: &str) {
+    apply_window_opacity(100u8.saturating_sub(transparency), title);
+}
+
+pub fn apply_window_transparency_hwnd(hwnd: HWND, transparency: u8) {
+    apply_window_opacity_hwnd(hwnd, 100u8.saturating_sub(transparency));
 }
 
 pub fn apply_window_opacity(opacity: u8, title: &str) {
@@ -39,6 +47,56 @@ pub fn apply_window_opacity(opacity: u8, title: &str) {
 }
 
 #[cfg(windows)]
+pub fn apply_window_level_hwnd(hwnd: HWND, level: window_settings::WindowLevel) {
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE,
+        };
+        let insert_after = match level {
+            window_settings::WindowLevel::AlwaysOnTop => HWND_TOPMOST,
+            window_settings::WindowLevel::AlwaysOnBottom => HWND_BOTTOM,
+            window_settings::WindowLevel::Normal => HWND_NOTOPMOST,
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn apply_window_level_hwnd(_hwnd: HWND, _level: window_settings::WindowLevel) {}
+
+#[cfg(windows)]
+pub fn ensure_window_chrome_synced(hwnd: HWND, opacity: u8, level: window_settings::WindowLevel) {
+    unsafe {
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let has_layered = (ex_style & (WS_EX_LAYERED as i32)) != 0;
+        let should_have_layered = opacity < 100;
+
+        let has_topmost = (ex_style & (WS_EX_TOPMOST as i32)) != 0;
+        let should_have_topmost = level == window_settings::WindowLevel::AlwaysOnTop;
+
+        if has_layered != should_have_layered {
+            apply_window_opacity_hwnd(hwnd, opacity);
+        }
+
+        if has_topmost != should_have_topmost {
+            apply_window_level_hwnd(hwnd, level);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn ensure_window_chrome_synced(_hwnd: HWND, _opacity: u8, _level: window_settings::WindowLevel) {}
+
+#[cfg(windows)]
 pub fn apply_window_opacity_hwnd(hwnd: HWND, opacity: u8) {
     unsafe {
         let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
@@ -46,6 +104,15 @@ pub fn apply_window_opacity_hwnd(hwnd: HWND, opacity: u8) {
             let target_style = style | WS_EX_LAYERED as i32;
             if target_style != style {
                 let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, target_style);
+                let _ = SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+                );
             }
             let _ = SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
             return;
@@ -77,6 +144,15 @@ pub(crate) fn layered_window_alpha(opacity: u8) -> Option<u8> {
         None
     } else {
         Some(((u16::from(opacity) * 255 + 50) / 100) as u8)
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn layered_window_alpha_from_transparency(transparency: u8) -> Option<u8> {
+    if transparency == 0 {
+        None
+    } else {
+        layered_window_alpha(100u8.saturating_sub(transparency))
     }
 }
 
@@ -456,5 +532,23 @@ mod tests {
         assert_eq!(layered_window_alpha(90), Some(230));
         assert_eq!(layered_window_alpha(50), Some(128));
         assert_eq!(layered_window_alpha(10), Some(26));
+    }
+
+    #[test]
+    fn window_level_mapping() {
+        use super::window_level;
+        use crate::window_settings::WindowLevel;
+        assert_eq!(window_level(WindowLevel::Normal), eframe::egui::WindowLevel::Normal);
+        assert_eq!(window_level(WindowLevel::AlwaysOnTop), eframe::egui::WindowLevel::AlwaysOnTop);
+        assert_eq!(window_level(WindowLevel::AlwaysOnBottom), eframe::egui::WindowLevel::AlwaysOnBottom);
+    }
+
+    #[test]
+    fn transparency_alpha_mapping() {
+        use super::layered_window_alpha_from_transparency;
+        assert_eq!(layered_window_alpha_from_transparency(0), None);
+        assert_eq!(layered_window_alpha_from_transparency(10), Some(230));
+        assert_eq!(layered_window_alpha_from_transparency(50), Some(128));
+        assert_eq!(layered_window_alpha_from_transparency(90), Some(26));
     }
 }
