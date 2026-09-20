@@ -7242,22 +7242,42 @@ fn draw_smooth_limit_block(
     );
 
     // Right: Tempo / Pace
-    let pace_text = if is_five_hour {
-        forecast.five_hour_pace_text(language)
+    let (pace_text, pace_ratio_opt) = if is_five_hour {
+        (
+            forecast.five_hour_pace_text(language),
+            forecast.five_hour_forecast.as_ref().map(|fh| fh.pace_ratio),
+        )
     } else {
-        forecast.week_pace_text(language)
+        (
+            forecast.week_pace_text(language),
+            forecast.pace_ratio,
+        )
     };
     if !pace_text.is_empty() {
+        let pace_color = if pct == 0 || is_throttled {
+            egui::Color32::from_rgb(252, 165, 165) // Red: throttled / depleted
+        } else if let Some(ratio) = pace_ratio_opt {
+            if ratio < 1.0 {
+                egui::Color32::from_rgb(120, 184, 134) // Green: healthy pace / good reserve
+            } else if ratio <= 1.25 {
+                egui::Color32::from_rgb(253, 224, 71) // Yellow: slightly above 1.0
+            } else {
+                egui::Color32::from_rgb(252, 165, 165) // Red: far above 1.0
+            }
+        } else {
+            egui::Color32::from_rgb(148, 163, 184)
+        };
+
         let footer_right_galley = painter.layout_no_wrap(
             pace_text.into(),
             egui::FontId::monospace(9.5),
-            egui::Color32::from_rgb(148, 163, 184),
+            pace_color,
         );
         let right_x = top_left.x + width - footer_right_galley.size().x;
         painter.galley(
             egui::pos2(right_x, footer_y),
             footer_right_galley,
-            egui::Color32::from_rgb(148, 163, 184),
+            pace_color,
         );
     }
 }
@@ -7468,7 +7488,7 @@ fn render_quota_tooltip(
         ui.strong(format!("{} · {}", quota.title, quota.author));
         let (status_text, status_color) = match forecast.health {
             PacingHealth::Surplus => (
-                language.text("Puffer gesund", "Buffer healthy"),
+                language.text("Reserve solide", "Reserve solid"),
                 egui::Color32::from_rgb(34, 197, 94),
             ),
             PacingHealth::OnTrack => (
@@ -7516,12 +7536,12 @@ fn render_quota_tooltip(
 
                 if let Some(fh) = &forecast.five_hour_forecast {
                     ui.label(egui::RichText::new(language.text("Pace:", "Pace:")).color(egui::Color32::from_rgb(148, 163, 184)));
-                    let pace_color = if fh.pace_ratio <= 1.05 {
-                        egui::Color32::from_rgb(157, 196, 118)
+                    let pace_color = if fh.pace_ratio < 1.0 {
+                        egui::Color32::from_rgb(120, 184, 134)
                     } else if fh.pace_ratio <= 1.25 {
-                        egui::Color32::from_rgb(203, 213, 225)
+                        egui::Color32::from_rgb(253, 224, 71)
                     } else {
-                        egui::Color32::from_rgb(245, 158, 11)
+                        egui::Color32::from_rgb(252, 165, 165)
                     };
                     ui.colored_label(pace_color, forecast.five_hour_pace_text(language));
                     ui.end_row();
@@ -7535,7 +7555,7 @@ fn render_quota_tooltip(
                     ui.colored_label(rw_color, forecast.five_hour_runway_text(language));
                     ui.end_row();
 
-                    ui.label(egui::RichText::new(language.text("Puffer-Lage:", "Buffer status:")).color(egui::Color32::from_rgb(148, 163, 184)));
+                    ui.label(egui::RichText::new(language.text("Reserve-Lage:", "Reserve status:")).color(egui::Color32::from_rgb(148, 163, 184)));
                     if fh.is_exhausted_before_reset {
                         let def_mins = fh.delta_minutes.map(|d| (-d).max(1)).unwrap_or(30);
                         let (h, m) = fh.exhaustion_time.unwrap_or((0, 0));
@@ -7545,10 +7565,17 @@ fn render_quota_tooltip(
                         );
                     } else {
                         let buf_text = if let Some(delta) = fh.delta_minutes {
-                            let h = (delta as f32 / 60.0).round() as i32;
-                            format!("+{}h {}", h, language.text("über Reset hinaus", "beyond reset"))
+                            let h = delta / 60;
+                            let m = delta % 60;
+                            if h > 0 && m > 0 {
+                                format!("+{}h {}m {}", h, m, language.text("über Reset hinaus", "beyond reset"))
+                            } else if h > 0 {
+                                format!("+{}h {}", h, language.text("über Reset hinaus", "beyond reset"))
+                            } else {
+                                format!("+{}m {}", m, language.text("über Reset hinaus", "beyond reset"))
+                            }
                         } else {
-                            language.text("+>24h Puffer", "+>24h buffer").to_string()
+                            language.text("+>24h Reserve", "+>24h reserve").to_string()
                         };
                         ui.colored_label(egui::Color32::from_rgb(157, 196, 118), buf_text);
                     }
@@ -7590,12 +7617,12 @@ fn render_quota_tooltip(
 
                 if let Some(ratio) = forecast.pace_ratio {
                     ui.label(egui::RichText::new(language.text("Pace:", "Pace:")).color(egui::Color32::from_rgb(148, 163, 184)));
-                    let pace_color = if ratio <= 1.05 {
-                        egui::Color32::from_rgb(157, 196, 118)
+                    let pace_color = if ratio < 1.0 {
+                        egui::Color32::from_rgb(120, 184, 134)
                     } else if ratio <= 1.25 {
-                        egui::Color32::from_rgb(203, 213, 225)
+                        egui::Color32::from_rgb(253, 224, 71)
                     } else {
-                        egui::Color32::from_rgb(245, 158, 11)
+                        egui::Color32::from_rgb(252, 165, 165)
                     };
                     ui.colored_label(pace_color, forecast.week_pace_text(language));
                     ui.end_row();
@@ -7610,19 +7637,46 @@ fn render_quota_tooltip(
                 ui.colored_label(rw_color, forecast.week_runway_text(language));
                 ui.end_row();
 
-                ui.label(egui::RichText::new(language.text("Puffer-Lage:", "Buffer status:")).color(egui::Color32::from_rgb(148, 163, 184)));
+                ui.label(egui::RichText::new(language.text("Reserve-Lage:", "Reserve status:")).color(egui::Color32::from_rgb(148, 163, 184)));
                 let (status_buf, buf_color) = if forecast.health == PacingHealth::Throttled {
-                    (language.text("Erschöpft", "Depleted").to_string(), egui::Color32::from_rgb(239, 68, 68))
+                    (language.text("Erschöpft", "Depleted").to_string(), egui::Color32::from_rgb(252, 165, 165))
+                } else if let Some(rw) = forecast.runway_days {
+                    let diff = rw - forecast.remaining_days;
+                    if diff < -0.04 {
+                        if diff <= -1.5 {
+                            (format!("-{} {}", (-diff).round() as i32, language.text("Tage Defizit", "days deficit")), egui::Color32::from_rgb(252, 165, 165))
+                        } else if diff <= -0.85 {
+                            (format!("-1 {}", language.text("Tag Defizit", "day deficit")), egui::Color32::from_rgb(252, 165, 165))
+                        } else {
+                            let h = ((-diff) * 24.0).round() as i32;
+                            (format!("-{}h {}", h.max(1), language.text("Defizit", "deficit")), egui::Color32::from_rgb(252, 165, 165))
+                        }
+                    } else if diff > 0.04 {
+                        if diff > 14.0 {
+                            (language.text("+>30 Tage Reserve", "+>30 days reserve").to_string(), egui::Color32::from_rgb(120, 184, 134))
+                        } else if diff > 7.0 {
+                            (language.text("+>7 Tage Reserve", "+>7 days reserve").to_string(), egui::Color32::from_rgb(120, 184, 134))
+                        } else if diff >= 1.5 {
+                            (format!("+{} {}", diff.round() as i32, language.text("Tage Reserve", "days reserve")), egui::Color32::from_rgb(120, 184, 134))
+                        } else if diff >= 0.85 {
+                            (format!("+1 {}", language.text("Tag Reserve", "day reserve")), egui::Color32::from_rgb(120, 184, 134))
+                        } else {
+                            let h = (diff * 24.0).round() as i32;
+                            (format!("+{}h {}", h.max(1), language.text("Reserve", "reserve")), egui::Color32::from_rgb(120, 184, 134))
+                        }
+                    } else {
+                        (language.text("±0h Reserve", "±0h reserve").to_string(), egui::Color32::from_rgb(120, 184, 134))
+                    }
                 } else if let Some(delta) = forecast.delta_days {
                     if delta < 0 {
-                        (format!("-{} {}", -delta, language.text("Tage Defizit", "days deficit")), egui::Color32::from_rgb(239, 68, 68))
+                        (format!("-{} {}", -delta, language.text("Tage Defizit", "days deficit")), egui::Color32::from_rgb(252, 165, 165))
                     } else if delta > 14 {
-                        (language.text("+>30 Tage Puffer", "+>30 days buffer").to_string(), egui::Color32::from_rgb(157, 196, 118))
+                        (language.text("+>30 Tage Reserve", "+>30 days reserve").to_string(), egui::Color32::from_rgb(120, 184, 134))
                     } else {
-                        (format!("+{} {}", delta, language.text("Tage Puffer", "days buffer")), egui::Color32::from_rgb(157, 196, 118))
+                        (format!("+{} {}", delta, language.text("Tage Reserve", "days reserve")), egui::Color32::from_rgb(120, 184, 134))
                     }
                 } else {
-                    (language.text("+>30 Tage Puffer", "+>30 days buffer").to_string(), egui::Color32::from_rgb(157, 196, 118))
+                    (language.text("+>30 Tage Reserve", "+>30 days reserve").to_string(), egui::Color32::from_rgb(120, 184, 134))
                 };
                 ui.colored_label(buf_color, status_buf);
                 ui.end_row();

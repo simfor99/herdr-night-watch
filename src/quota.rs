@@ -171,40 +171,46 @@ impl PacingForecast {
                 if let Some(delta) = fh.delta_minutes {
                     if fh.runway_minutes.unwrap_or(0) >= 1440 || delta >= 1440 {
                         match language {
-                            Language::German => "+>24 Stunden".to_string(),
-                            Language::English => "+>24 hours".to_string(),
+                            Language::German => "+>24h Reserve".to_string(),
+                            Language::English => "+>24h reserve".to_string(),
                         }
                     } else if delta > 300 {
                         match language {
-                            Language::German => "+>5 Stunden (Puffer)".to_string(),
-                            Language::English => "+>5 hours (Buffer)".to_string(),
+                            Language::German => "+>5h Reserve".to_string(),
+                            Language::English => "+>5h reserve".to_string(),
                         }
                     } else if delta >= 60 {
-                        let hours = (delta as f32 / 60.0).round() as i32;
-                        let unit = if hours == 1 {
-                            language.text("Stunde", "hour")
+                        let hours = delta / 60;
+                        let mins = delta % 60;
+                        if mins == 0 {
+                            match language {
+                                Language::German => format!("+{}h Reserve ({:02}:{:02})", hours, h, m),
+                                Language::English => format!("+{}h reserve ({:02}:{:02})", hours, h, m),
+                            }
                         } else {
-                            language.text("Stunden", "hours")
-                        };
-                        format!("+{} {} ({:02}:{:02})", hours, unit, h, m)
+                            match language {
+                                Language::German => format!("+{}h {}m Reserve ({:02}:{:02})", hours, mins, h, m),
+                                Language::English => format!("+{}h {}m reserve ({:02}:{:02})", hours, mins, h, m),
+                            }
+                        }
                     } else if delta > 0 {
                         match language {
-                            Language::German => format!("+{} Min. ({:02}:{:02})", delta, h, m),
-                            Language::English => format!("+{} min ({:02}:{:02})", delta, h, m),
+                            Language::German => format!("+{} Min. Reserve ({:02}:{:02})", delta, h, m),
+                            Language::English => format!("+{} min reserve ({:02}:{:02})", delta, h, m),
                         }
                     } else {
                         format!("±0 Min. ({:02}:{:02})", h, m)
                     }
                 } else {
                     match language {
-                        Language::German => "+>24 Stunden".to_string(),
-                        Language::English => "+>24 hours".to_string(),
+                        Language::German => "+>24h Reserve".to_string(),
+                        Language::English => "+>24h reserve".to_string(),
                     }
                 }
             } else {
                 match language {
-                    Language::German => "+>24 Stunden".to_string(),
-                    Language::English => "+>24 hours".to_string(),
+                    Language::German => "+>24h Reserve".to_string(),
+                    Language::English => "+>24h reserve".to_string(),
                 }
             }
         } else if let Some(ratio) = self.pace_ratio {
@@ -238,6 +244,15 @@ impl PacingForecast {
                     format!("-{} {}", days, unit)
                 }
             } else if delta == 0 {
+                if let Some(rw) = self.runway_days {
+                    let diff = rw - self.remaining_days;
+                    let hours = (diff * 24.0).round() as i32;
+                    if hours > 0 {
+                        return format!("+{}h {}", hours, language.text("Reserve", "reserve"));
+                    } else if hours < 0 {
+                        return format!("-{}h {}", -hours, language.text("Defizit", "deficit"));
+                    }
+                }
                 let reset = self.reset_str.as_deref().unwrap_or("—");
                 match language {
                     Language::German => format!("±0 Tage ({reset})"),
@@ -245,13 +260,13 @@ impl PacingForecast {
                 }
             } else if delta > 14 {
                 match language {
-                    Language::German => "+>30 Tage (Puffer)".to_string(),
-                    Language::English => "+>30 days (Buffer)".to_string(),
+                    Language::German => "+>30 Tage Reserve".to_string(),
+                    Language::English => "+>30 days reserve".to_string(),
                 }
             } else if delta > 7 {
                 match language {
-                    Language::German => "+>7 Tage (Puffer)".to_string(),
-                    Language::English => "+>7 days (Buffer)".to_string(),
+                    Language::German => "+>7 Tage Reserve".to_string(),
+                    Language::English => "+>7 days reserve".to_string(),
                 }
             } else {
                 let days = delta;
@@ -267,7 +282,7 @@ impl PacingForecast {
                     };
                     format!("+{} {} ({})", days, unit, date_str)
                 } else {
-                    format!("+{} {}", days, unit)
+                    format!("+{} {} {}", days, unit, language.text("Reserve", "reserve"))
                 }
             }
         } else if let Some((m, d)) = self.week_exhaustion_date {
@@ -276,15 +291,15 @@ impl PacingForecast {
                 Language::English => format!("{:02}.{:02}", d, m),
             };
             match language {
-                Language::German => format!("+Puffer ({})", date_str),
-                Language::English => format!("+Buffer ({})", date_str),
+                Language::German => format!("+Reserve ({})", date_str),
+                Language::English => format!("+Reserve ({})", date_str),
             }
         } else if self.delta_days.is_none() && self.reset_str.is_none() && self.runway_days.is_none() {
             language.text("Telemetrie ausstehend", "Telemetry pending").to_string()
         } else {
             match language {
-                Language::German => "+>30 Tage (Puffer)".to_string(),
-                Language::English => "+>30 days (Buffer)".to_string(),
+                Language::German => "+>30 Tage Reserve".to_string(),
+                Language::English => "+>30 days reserve".to_string(),
             }
         }
     }
@@ -330,12 +345,39 @@ impl PacingForecast {
     pub fn five_hour_pace_text(&self, language: Language) -> String {
         if let Some(fh) = &self.five_hour_forecast {
             let ratio = fh.pace_ratio;
-            let qualifier = if ratio < 0.85 {
-                language.text("Puffer", "buffer")
-            } else if ratio <= 1.20 {
-                language.text("Ausgeglichen", "on track")
+            let qualifier = if fh.is_exhausted_before_reset {
+                let def = fh.delta_minutes.map(|d| (-d).max(1)).unwrap_or(30);
+                if def < 60 {
+                    format!("-{}m {}", def, language.text("Defizit", "deficit"))
+                } else {
+                    let h = def / 60;
+                    let m = def % 60;
+                    if m == 0 {
+                        format!("-{}h {}", h, language.text("Defizit", "deficit"))
+                    } else {
+                        format!("-{}h {}m {}", h, m, language.text("Defizit", "deficit"))
+                    }
+                }
+            } else if let Some(delta) = fh.delta_minutes {
+                if fh.runway_minutes.unwrap_or(0) >= 1440 || delta >= 1440 {
+                    language.text("+>24h Reserve", "+>24h reserve").to_string()
+                } else if delta > 300 {
+                    language.text("+>5h Reserve", "+>5h reserve").to_string()
+                } else if delta >= 60 {
+                    let h = delta / 60;
+                    let m = delta % 60;
+                    if m == 0 {
+                        format!("+{}h {}", h, language.text("Reserve", "reserve"))
+                    } else {
+                        format!("+{}h {}m {}", h, m, language.text("Reserve", "reserve"))
+                    }
+                } else if delta > 0 {
+                    format!("+{}m {}", delta, language.text("Reserve", "reserve"))
+                } else {
+                    language.text("±0m Reserve", "±0m reserve").to_string()
+                }
             } else {
-                language.text("Erhöht", "elevated")
+                language.text("Reserve", "reserve").to_string()
             };
             format!("Pace: {:.2}x · {}", ratio, qualifier)
         } else {
@@ -366,12 +408,62 @@ impl PacingForecast {
 
     pub fn week_pace_text(&self, language: Language) -> String {
         if let Some(ratio) = self.pace_ratio {
-            let qualifier = if ratio < 0.85 {
-                language.text("Puffer", "buffer")
-            } else if ratio <= 1.20 {
-                language.text("Ausgeglichen", "on track")
+            let qualifier = if let Some(runway) = self.runway_days {
+                let diff = runway - self.remaining_days;
+                if diff < -0.04 {
+                    if diff <= -1.5 {
+                        let d = (-diff).round() as i32;
+                        format!("-{}d {}", d, language.text("Defizit", "deficit"))
+                    } else if diff <= -0.85 {
+                        format!("-1d {}", language.text("Defizit", "deficit"))
+                    } else {
+                        let h = ((-diff) * 24.0).round() as i32;
+                        if h >= 20 {
+                            format!("-1d {}", language.text("Defizit", "deficit"))
+                        } else {
+                            format!("-{}h {}", h.max(1), language.text("Defizit", "deficit"))
+                        }
+                    }
+                } else if diff > 0.04 {
+                    if diff > 14.0 {
+                        language.text("+>30 Tage Reserve", "+>30 days reserve").to_string()
+                    } else if diff > 7.0 {
+                        language.text("+>7 Tage Reserve", "+>7 days reserve").to_string()
+                    } else if diff >= 1.5 {
+                        let d = diff.round() as i32;
+                        format!("+{}d {}", d, language.text("Reserve", "reserve"))
+                    } else if diff >= 0.85 {
+                        format!("+1d {}", language.text("Reserve", "reserve"))
+                    } else {
+                        let h = (diff * 24.0).round() as i32;
+                        if h >= 20 {
+                            format!("+1d {}", language.text("Reserve", "reserve"))
+                        } else {
+                            format!("+{}h {}", h.max(1), language.text("Reserve", "reserve"))
+                        }
+                    }
+                } else {
+                    language.text("±0h Reserve", "±0h reserve").to_string()
+                }
+            } else if let Some(delta) = self.delta_days {
+                if delta < 0 {
+                    let d = (-delta).max(1);
+                    format!("-{}d {}", d, language.text("Defizit", "deficit"))
+                } else if delta > 14 {
+                    language.text("+>30 Tage Reserve", "+>30 days reserve").to_string()
+                } else if delta > 7 {
+                    language.text("+>7 Tage Reserve", "+>7 days reserve").to_string()
+                } else if delta > 0 {
+                    format!("+{}d {}", delta, language.text("Reserve", "reserve"))
+                } else {
+                    language.text("±0d Reserve", "±0d reserve").to_string()
+                }
+            } else if ratio < 1.0 {
+                language.text("Reserve", "reserve").to_string()
+            } else if ratio <= 1.25 {
+                language.text("Ausgeglichen", "on track").to_string()
             } else {
-                language.text("Erhöht", "elevated")
+                language.text("Erhöht", "elevated").to_string()
             };
             format!("Pace: {:.2}x · {}", ratio, qualifier)
         } else {
@@ -1168,8 +1260,8 @@ mod tests {
         );
         assert_eq!(glm_fc.health, PacingHealth::Surplus);
         assert!(glm_fc.pace_ratio.unwrap() < 0.6);
-        assert_eq!(glm_fc.badge_text, "+5 Stunden (21:20)");
-        assert_eq!(glm_fc.summary_text, "+>30 Tage (Puffer)");
+        assert_eq!(glm_fc.badge_text, "+4h 39m Reserve (21:20)");
+        assert_eq!(glm_fc.summary_text, "+>30 Tage Reserve");
 
         // AGI: 100% remaining, reset 25.09 (7 days away, 0 consumed) -> Surplus / buffer
         let agi_fc = pacing_forecast_for(
@@ -1182,8 +1274,8 @@ mod tests {
             Some(now),
         );
         assert_eq!(agi_fc.health, PacingHealth::Surplus);
-        assert_eq!(agi_fc.badge_text, "+>24 Stunden");
-        assert_eq!(agi_fc.summary_text, "+>30 Tage (Puffer)");
+        assert_eq!(agi_fc.badge_text, "+>24h Reserve");
+        assert_eq!(agi_fc.summary_text, "+>30 Tage Reserve");
 
         // Codex: Throttled (0% remaining, reset 23.09) -> Throttled
         let codex_fc = pacing_forecast_for(
@@ -1262,7 +1354,7 @@ mod tests {
         assert_eq!(codex_fc.localized_summary_text(Language::German), "Reset 23.09.");
         assert_eq!(codex_fc.localized_summary_text(Language::English), "Reset 23.09.");
 
-        // GLM surplus: >14 days delta maps to +>30 Tage (Puffer) / +>30 days (Buffer)
+        // GLM surplus: >14 days delta maps to +>30 Tage Reserve / +>30 days reserve
         let glm_fc = pacing_forecast_for(
             false,
             Some(75),
@@ -1272,12 +1364,12 @@ mod tests {
             Some(today),
             Some(now),
         );
-        assert_eq!(glm_fc.localized_upper_line(Language::German), "+5 Stunden (21:20)");
-        assert_eq!(glm_fc.localized_upper_line(Language::English), "+5 hours (21:20)");
-        assert_eq!(glm_fc.localized_lower_line(Language::German), "+>30 Tage (Puffer)");
-        assert_eq!(glm_fc.localized_lower_line(Language::English), "+>30 days (Buffer)");
+        assert_eq!(glm_fc.localized_upper_line(Language::German), "+4h 39m Reserve (21:20)");
+        assert_eq!(glm_fc.localized_upper_line(Language::English), "+4h 39m reserve (21:20)");
+        assert_eq!(glm_fc.localized_lower_line(Language::German), "+>30 Tage Reserve");
+        assert_eq!(glm_fc.localized_lower_line(Language::English), "+>30 days reserve");
 
-        // AGI surplus: minimal burn DE = "+>30 Tage (Puffer)", EN = "+>30 days (Buffer)"
+        // AGI surplus: minimal burn DE = "+>30 Tage Reserve", EN = "+>30 days reserve"
         let agi_fc = pacing_forecast_for(
             false,
             Some(100),
@@ -1287,10 +1379,10 @@ mod tests {
             Some(today),
             Some(now),
         );
-        assert_eq!(agi_fc.localized_upper_line(Language::German), "+>24 Stunden");
-        assert_eq!(agi_fc.localized_upper_line(Language::English), "+>24 hours");
-        assert_eq!(agi_fc.localized_lower_line(Language::German), "+>30 Tage (Puffer)");
-        assert_eq!(agi_fc.localized_lower_line(Language::English), "+>30 days (Buffer)");
+        assert_eq!(agi_fc.localized_upper_line(Language::German), "+>24h Reserve");
+        assert_eq!(agi_fc.localized_upper_line(Language::English), "+>24h reserve");
+        assert_eq!(agi_fc.localized_lower_line(Language::German), "+>30 Tage Reserve");
+        assert_eq!(agi_fc.localized_lower_line(Language::English), "+>30 days reserve");
 
         // Tight: DE = "-3 Tage (20.09.)", EN = "-3 days (20.09)"
         let tight_fc = pacing_forecast_for(
@@ -1322,9 +1414,9 @@ mod tests {
             Some(now),
         );
         assert_eq!(fc.health, PacingHealth::Surplus);
-        assert_eq!(fc.localized_upper_line(Language::English), "+>24 hours");
-        assert_eq!(fc.localized_upper_line(Language::German), "+>24 Stunden");
-        assert_eq!(fc.localized_lower_line(Language::English), "+>30 days (Buffer)");
+        assert_eq!(fc.localized_upper_line(Language::English), "+>24h reserve");
+        assert_eq!(fc.localized_upper_line(Language::German), "+>24h Reserve");
+        assert_eq!(fc.localized_lower_line(Language::English), "+>30 days reserve");
     }
 
     #[test]
@@ -1368,6 +1460,35 @@ mod tests {
         assert!(pace_de.starts_with("Pace: "), "Got: {pace_de}");
         assert!(pace_en.starts_with("Pace: "), "Got: {pace_en}");
         assert!(pace_de.contains("x · "), "Got: {pace_de}");
+    }
+
+    #[test]
+    fn test_english_translations_for_reserve_and_pace() {
+        // Scenario matching Simon's live status: 73% week, reset in 5 days, 52% 5h
+        let fc = pacing_forecast_for(
+            false,
+            Some(73),
+            Some("25.09."),
+            Some(52),
+            Some("21:14"),
+            Some((2026, 9, 20)),
+            Some((19, 15)),
+        );
+
+        let week_de = fc.week_pace_text(Language::German);
+        let week_en = fc.week_pace_text(Language::English);
+        assert!(week_de.contains("Reserve"), "DE got: {week_de}");
+        assert!(week_en.contains("reserve"), "EN got: {week_en}");
+        assert!(!week_de.contains("Ausgeglichen"), "DE got: {week_de}");
+        assert!(!week_en.contains("on track"), "EN got: {week_en}");
+
+        let fh_de = fc.five_hour_pace_text(Language::German);
+        let fh_en = fc.five_hour_pace_text(Language::English);
+        assert!(fh_de.contains("Reserve"), "DE got: {fh_de}");
+        assert!(fh_en.contains("reserve"), "EN got: {fh_en}");
+
+        let lower_en = fc.localized_lower_line(Language::English);
+        assert!(lower_en.contains("reserve"), "EN got: {lower_en}");
     }
 
     #[test]
