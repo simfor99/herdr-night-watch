@@ -1586,7 +1586,7 @@ struct LiveStatusApp {
     weather_checking: bool,
     last_weather_fetch: Option<Instant>,
     last_weather_location_check: Option<Instant>,
-    opacity: Option<u8>,
+    transparency: Option<u8>,
     window_level: window_settings::WindowLevel,
     taskbar_visible: Option<bool>,
     window_drag_started: bool,
@@ -1699,7 +1699,7 @@ impl LiveStatusApp {
             weather_checking: false,
             last_weather_fetch: None,
             last_weather_location_check: None,
-            opacity: None,
+            transparency: None,
             window_level: window_settings::WindowLevel::current(),
             taskbar_visible: None,
             window_drag_started: false,
@@ -1758,12 +1758,49 @@ impl LiveStatusApp {
         let is_docked = self.quota_open && self.quota_docked;
         let r = self.corner_radius;
         let scale = self.scale;
+        let op = self.opacity();
         if let Some(main_hwnd) = self.main_hwnd {
             window_chrome::apply_corner_preference(main_hwnd, r, false, is_docked, scale);
+            window_chrome::ensure_window_chrome_synced(main_hwnd, op, self.window_level);
         }
         if let Some(sat_hwnd) = self.satellite_hwnd {
             let sat_h = self.last_synced_sat_height.unwrap_or(314.0);
             window_chrome::sync_satellite_size(sat_hwnd, sat_h, self.main_hwnd, r, is_docked);
+            window_chrome::ensure_window_chrome_synced(sat_hwnd, op, self.window_level);
+        }
+    }
+
+    pub fn apply_window_level(&mut self, ctx: &egui::Context, level: window_settings::WindowLevel) {
+        let _ = level.set();
+        self.window_level = level;
+        let egui_level = window_chrome::window_level(level);
+
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::WindowLevel(egui_level),
+        );
+        if self.quota_open {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of("live_status_quota_viewport"),
+                egui::ViewportCommand::WindowLevel(egui_level),
+            );
+        }
+
+        let op = self.opacity();
+        if let Some(main_hwnd) = self.main_hwnd {
+            window_chrome::ensure_window_chrome_synced(main_hwnd, op, level);
+        } else if let Some(main_hwnd) = find_live_window_for_pid(current_pid()) {
+            self.main_hwnd = Some(main_hwnd);
+            window_chrome::ensure_window_chrome_synced(main_hwnd, op, level);
+        }
+
+        if let Some(sat_hwnd) = self.satellite_hwnd {
+            window_chrome::ensure_window_chrome_synced(sat_hwnd, op, level);
+        } else if self.quota_open {
+            if let Some(sat_hwnd) = find_satellite_window_for_pid(current_pid()) {
+                self.satellite_hwnd = Some(sat_hwnd);
+                window_chrome::ensure_window_chrome_synced(sat_hwnd, op, level);
+            }
         }
     }
 
@@ -1774,23 +1811,43 @@ impl LiveStatusApp {
         self.sync_corner_regions();
     }
 
-    pub fn apply_opacity(&mut self, opacity: u8) {
-        self.opacity = Some(opacity);
+    pub fn transparency(&self) -> u8 {
+        self.transparency.unwrap_or_else(window_settings::transparency)
+    }
+
+    pub fn opacity(&self) -> u8 {
+        100 - self.transparency()
+    }
+
+    pub fn apply_transparency(&mut self, transparency: u8) {
+        let transparency = window_settings::clamp_transparency(transparency);
+        self.transparency = Some(transparency);
         self.satellite_opacity_applied = None;
-        let _ = window_settings::set_opacity(opacity);
+        let _ = window_settings::set_transparency(transparency);
         if let Some(main_hwnd) = self.main_hwnd {
-            window_chrome::apply_window_opacity_hwnd(main_hwnd, opacity);
+            window_chrome::apply_window_transparency_hwnd(main_hwnd, transparency);
+            window_chrome::apply_window_level_hwnd(main_hwnd, self.window_level);
         } else {
-            window_chrome::apply_window_opacity(opacity, live_title(self.language));
+            window_chrome::apply_window_transparency(transparency, live_title(self.language));
         }
         if let Some(sat_hwnd) = self.satellite_hwnd {
-            window_chrome::apply_window_opacity_hwnd(sat_hwnd, opacity);
+            window_chrome::apply_window_transparency_hwnd(sat_hwnd, transparency);
+            window_chrome::apply_window_level_hwnd(sat_hwnd, self.window_level);
         } else {
             let sat_title = match self.language {
                 Language::German => "Herdr-Nachtwächter - Limits",
                 Language::English => "Herdr Night Watch - Limits",
             };
-            window_chrome::apply_window_opacity(opacity, sat_title);
+            window_chrome::apply_window_transparency(transparency, sat_title);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn apply_opacity(&mut self, opacity: u8) {
+        if opacity <= 100 {
+            self.apply_transparency(100 - opacity);
+        } else {
+            self.apply_transparency(0);
         }
     }
 
@@ -2123,18 +2180,22 @@ impl eframe::App for LiveStatusApp {
         if settings_poll_due {
             self.last_settings_poll = Some(now);
             if self.first_frame_painted {
-                let current_opacity = window_settings::opacity();
-                if self.opacity != Some(current_opacity) {
-                    self.apply_opacity(current_opacity);
+                let current_trans = window_settings::transparency();
+                if self.transparency != Some(current_trans) {
+                    self.apply_transparency(current_trans);
+                } else {
+                    let op = 100 - current_trans;
+                    if let Some(main_hwnd) = self.main_hwnd {
+                        window_chrome::ensure_window_chrome_synced(main_hwnd, op, self.window_level);
+                    }
+                    if let Some(sat_hwnd) = self.satellite_hwnd {
+                        window_chrome::ensure_window_chrome_synced(sat_hwnd, op, self.window_level);
+                    }
                 }
             }
             let current_window_level = window_settings::WindowLevel::current();
             if current_window_level != self.window_level {
-                self.window_level = current_window_level;
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                        window_chrome::window_level(current_window_level),
-                    ));
+                self.apply_window_level(ui.ctx(), current_window_level);
             }
             let current_taskbar_visibility = window_settings::live_status_in_taskbar();
             if let Some(hwnd) = self.main_hwnd {
@@ -2173,7 +2234,7 @@ impl eframe::App for LiveStatusApp {
         }
 
         if self.quota_open && self.satellite_frames_painted >= 2 {
-            let op = self.opacity.unwrap_or_else(window_settings::opacity);
+            let op = self.opacity();
             if let Some(sat_hwnd) = self.satellite_hwnd {
                 if self.satellite_opacity_applied != Some((sat_hwnd, op)) {
                     window_chrome::apply_window_opacity_hwnd(sat_hwnd, op);
@@ -2256,27 +2317,12 @@ impl eframe::App for LiveStatusApp {
         }
         if controls.level_clicked {
             let next_level = self.window_level.next();
-            match next_level.set() {
-                Ok(()) => {
-                    self.window_level = next_level;
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                            window_chrome::window_level(next_level),
-                        ));
-                    if self.quota_open {
-                        ui.ctx().send_viewport_cmd_to(
-                            egui::ViewportId::from_hash_of("live_status_quota_viewport"),
-                            egui::ViewportCommand::WindowLevel(window_chrome::window_level(next_level)),
-                        );
-                    }
-                    self.toast = Some(Toast {
-                        message: window_level_message(next_level, self.language).into(),
-                        color: ACCENT,
-                        expires_at: Instant::now() + Duration::from_secs(3),
-                    });
-                }
-                Err(error) => self.error = Some(error.to_string()),
-            }
+            self.apply_window_level(ui.ctx(), next_level);
+            self.toast = Some(Toast {
+                message: window_level_message(next_level, self.language).into(),
+                color: ACCENT,
+                expires_at: Instant::now() + Duration::from_secs(3),
+            });
         }
         if controls.minimize_clicked {
             ui.ctx()
@@ -6434,8 +6480,8 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             }
                             wy += r_card_h + 5.0;
 
-                            // 2. Fenstertransparenz Card (Window opacity)
-                            let op_card_h = 50.0;
+                            // 2. Fenstertransparenz Card (Window transparency)
+                            let op_card_h = 56.0;
                             let op_card_rect = egui::Rect::from_min_size(
                                 egui::pos2(rect.left() + 8.0, wy),
                                 egui::vec2(card_w, op_card_h),
@@ -6443,26 +6489,33 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             painter.rect_filled(op_card_rect, egui::CornerRadius::same(6), egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140));
                             painter.rect_stroke(op_card_rect, egui::CornerRadius::same(6), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)), egui::StrokeKind::Inside);
 
-                            let op_label = language.text("Fenstertransparenz:", "Window opacity:");
+                            let op_label = language.text("Fenstertransparenz:", "Window transparency:");
                             let op_galley = painter.layout_no_wrap(op_label.into(), egui::FontId::proportional(11.0), TEXT);
-                            painter.galley(egui::pos2(op_card_rect.left() + 10.0, op_card_rect.top() + 6.0), op_galley, TEXT);
+                            painter.galley(egui::pos2(op_card_rect.left() + 10.0, op_card_rect.top() + 7.0), op_galley, TEXT);
 
-                            let cur_op = app.opacity.unwrap_or_else(window_settings::opacity);
-                            let cur_op_text = format!("{cur_op} %");
-                            let cur_op_galley = painter.layout_no_wrap(cur_op_text.into(), egui::FontId::proportional(10.5), egui::Color32::from_rgb(56, 189, 248));
-                            painter.galley(egui::pos2(op_card_rect.right() - cur_op_galley.size().x - 10.0, op_card_rect.top() + 6.0), cur_op_galley, egui::Color32::from_rgb(56, 189, 248));
+                            let cur_trans = app.transparency();
+                            let cur_trans_text = if cur_trans == 0 {
+                                language.text("0 % (voll sichtbar)", "0% (solid)")
+                            } else if cur_trans == 90 {
+                                language.text("90 % (fast unsichtbar)", "90% (nearly invisible)")
+                            } else {
+                                &format!("{cur_trans} %")
+                            };
+                            let cur_trans_galley = painter.layout_no_wrap(cur_trans_text.into(), egui::FontId::proportional(10.5), egui::Color32::from_rgb(56, 189, 248));
+                            painter.galley(egui::pos2(op_card_rect.right() - cur_trans_galley.size().x - 10.0, op_card_rect.top() + 7.0), cur_trans_galley, egui::Color32::from_rgb(56, 189, 248));
 
-                            let op_values = [100u8, 90, 80, 70];
-                            let op_gap = 5.0;
-                            let op_w = (card_w - 20.0 - 3.0 * op_gap) / 4.0;
-                            let op_h = 20.0;
-                            let op_btn_y = op_card_rect.top() + 24.0;
-                            for (oi, &op_val) in op_values.iter().enumerate() {
+                            let trans_presets = window_settings::TRANSPARENCY_PRESETS;
+                            let p_count = trans_presets.len();
+                            let op_gap = 4.0;
+                            let op_w = (card_w - 20.0 - (p_count - 1) as f32 * op_gap) / (p_count as f32);
+                            let op_h = 22.0;
+                            let op_btn_y = op_card_rect.top() + 27.0;
+                            for (oi, &trans_val) in trans_presets.iter().enumerate() {
                                 let opx = op_card_rect.left() + 10.0 + (oi as f32) * (op_w + op_gap);
                                 let op_rect = egui::Rect::from_min_size(egui::pos2(opx, op_btn_y), egui::vec2(op_w, op_h));
-                                let op_btn_label = format!("{op_val} %");
-                                if render_option_pill(ui, painter, op_rect, &op_btn_label, cur_op == op_val, &format!("sat_op_{oi}")) {
-                                    app.apply_opacity(op_val);
+                                let op_btn_label = format!("{trans_val} %");
+                                if render_option_pill(ui, painter, op_rect, &op_btn_label, cur_trans == trans_val, &format!("sat_trans_{oi}")) {
+                                    app.apply_transparency(trans_val);
                                 }
                             }
                             wy += op_card_h + 5.0;
@@ -6493,13 +6546,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 let lx = lvl_card_rect.left() + 10.0 + (li as f32) * (lvl_w + lvl_gap);
                                 let l_rect = egui::Rect::from_min_size(egui::pos2(lx, lvl_btn_y), egui::vec2(lvl_w, lvl_h));
                                 if render_option_pill(ui, painter, l_rect, lvl_btn_label, app.window_level == *target_lvl, &format!("sat_lvl_{li}")) {
-                                    let _ = target_lvl.set();
-                                    app.window_level = *target_lvl;
-                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_chrome::window_level(*target_lvl)));
-                                    ui.ctx().send_viewport_cmd_to(
-                                        egui::ViewportId::from_hash_of("live_status_quota_viewport"),
-                                        egui::ViewportCommand::WindowLevel(window_chrome::window_level(*target_lvl)),
-                                    );
+                                    app.apply_window_level(ui.ctx(), *target_lvl);
                                 }
                             }
                             wy += lvl_card_h + 5.0;
@@ -6645,7 +6692,10 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 if render_option_pill(ui, painter, l_rect, l_label, app.language == *target_lang, &format!("sat_lang_{li}")) {
                                     let _ = target_lang.set();
                                     app.language = *target_lang;
-                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(live_title(*target_lang).into()));
+                                    ui.ctx().send_viewport_cmd_to(
+                                        egui::ViewportId::ROOT,
+                                        egui::ViewportCommand::Title(live_title(*target_lang).into()),
+                                    );
                                     ui.ctx().send_viewport_cmd_to(
                                         egui::ViewportId::from_hash_of("live_status_quota_viewport"),
                                         egui::ViewportCommand::Title(match target_lang {

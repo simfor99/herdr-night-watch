@@ -3,6 +3,7 @@ use winreg::enums::HKEY_CURRENT_USER;
 
 const KEY: &str = r"Software\HerdrNachtwaechter";
 const OPACITY_VALUE: &str = "WindowOpacity";
+const TRANSPARENCY_VALUE: &str = "WindowTransparency";
 const LEVEL_VALUE: &str = "WindowLevel";
 const LIVE_STATUS_START_VALUE: &str = "OpenLiveStatusOnStartup";
 const LIVE_STATUS_TASKBAR_VALUE: &str = "ShowLiveStatusInTaskbar";
@@ -32,6 +33,11 @@ pub const MIN_LIVE_STATUS_CORNER_RADIUS: u8 = 0;
 pub const MAX_LIVE_STATUS_CORNER_RADIUS: u8 = 20;
 pub const CORNER_RADIUS_PRESETS: [u8; 6] = [0, 4, 8, 10, 14, 18];
 
+pub const TRANSPARENCY_VALUES: [u8; 10] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90];
+pub const TRANSPARENCY_PRESETS: [u8; 6] = [0, 10, 20, 30, 50, 90];
+pub const DEFAULT_TRANSPARENCY: u8 = 0;
+
+#[allow(dead_code)]
 pub const OPACITY_VALUES: [u8; 10] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
 // The live-status repaint cadence trades the gliding second hand against
 // the OpenGL black-flash risk: every present has a small random chance to
@@ -85,29 +91,57 @@ impl WindowLevel {
     }
 }
 
-pub fn opacity() -> u8 {
-    let value = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(KEY)
-        .and_then(|key| key.get_value::<u32, _>(OPACITY_VALUE))
-        .ok()
-        .and_then(|value| u8::try_from(value).ok())
-        .unwrap_or(100);
-    if OPACITY_VALUES.contains(&value) {
+pub fn clamp_transparency(value: u8) -> u8 {
+    if TRANSPARENCY_VALUES.contains(&value) {
         value
     } else {
-        100
+        DEFAULT_TRANSPARENCY
     }
 }
 
-pub fn set_opacity(value: u8) -> anyhow::Result<()> {
-    let value = if OPACITY_VALUES.contains(&value) {
-        value
-    } else {
-        100
-    };
+pub fn transparency() -> u8 {
+    if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY) {
+        if let Ok(value) = key.get_value::<u32, _>(TRANSPARENCY_VALUE) {
+            if let Ok(value_u8) = u8::try_from(value) {
+                if TRANSPARENCY_VALUES.contains(&value_u8) {
+                    return value_u8;
+                }
+            }
+        }
+        // Fallback to legacy WindowOpacity:
+        if let Ok(op) = key.get_value::<u32, _>(OPACITY_VALUE) {
+            if let Ok(op_u8) = u8::try_from(op) {
+                if op_u8 <= 100 {
+                    let trans = 100 - op_u8;
+                    if TRANSPARENCY_VALUES.contains(&trans) {
+                        return trans;
+                    }
+                }
+            }
+        }
+    }
+    DEFAULT_TRANSPARENCY
+}
+
+pub fn set_transparency(value: u8) -> anyhow::Result<()> {
+    let value = clamp_transparency(value);
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
-    key.set_value(OPACITY_VALUE, &u32::from(value))?;
+    key.set_value(TRANSPARENCY_VALUE, &u32::from(value))?;
+    let opacity = 100 - value;
+    let _ = key.set_value(OPACITY_VALUE, &u32::from(opacity));
     Ok(())
+}
+
+pub fn opacity() -> u8 {
+    100 - transparency()
+}
+
+pub fn set_opacity(value: u8) -> anyhow::Result<()> {
+    if value <= 100 {
+        set_transparency(100 - value)
+    } else {
+        set_transparency(0)
+    }
 }
 
 pub fn live_status_on_start() -> bool {
@@ -447,5 +481,17 @@ mod tests {
         assert_eq!(clamp_corner_radius(20), 20);
         assert_eq!(clamp_corner_radius(25), 20);
         assert_eq!(DEFAULT_LIVE_STATUS_CORNER_RADIUS, 10);
+    }
+
+    #[test]
+    fn transparency_values_and_clamping() {
+        assert_eq!(TRANSPARENCY_VALUES, [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]);
+        assert_eq!(TRANSPARENCY_PRESETS, [0, 10, 20, 30, 50, 90]);
+        assert_eq!(DEFAULT_TRANSPARENCY, 0);
+        assert_eq!(clamp_transparency(0), 0);
+        assert_eq!(clamp_transparency(10), 10);
+        assert_eq!(clamp_transparency(90), 90);
+        assert_eq!(clamp_transparency(100), 0);
+        assert_eq!(clamp_transparency(45), 0);
     }
 }
