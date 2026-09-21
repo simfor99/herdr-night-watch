@@ -699,9 +699,10 @@ pub fn parse_remaining_days(reset_str: Option<&str>, today: (i32, u32, u32)) -> 
     let raw = reset_str?.trim();
     let today_days = ymd_to_days(today.0, today.1, today.2);
 
-    // Format 1: "25.09." or "25.09" or "01.10."
+    // Format 1: "25.09." or "25.09" or "25.09. 12:53"
     if raw.contains('.') {
-        let parts: Vec<&str> = raw.split('.').filter(|s| !s.trim().is_empty()).collect();
+        let date_part = raw.split_whitespace().next().unwrap_or(raw);
+        let parts: Vec<&str> = date_part.split('.').filter(|s| !s.trim().is_empty()).collect();
         if parts.len() >= 2 {
             let day: u32 = parts[0].trim().parse().ok()?;
             let month: u32 = parts[1].trim().parse().ok()?;
@@ -914,7 +915,7 @@ impl QuotaSnapshot {
                 Some(98),
                 Some("17:53".into()),
                 Some(100),
-                Some("25.09.".into()),
+                Some("25.09. (12:53)".into()),
             ),
             ProviderQuota::new(
                 ProviderId::Codex,
@@ -923,7 +924,7 @@ impl QuotaSnapshot {
                 None,
                 None,
                 Some(0),
-                Some("23.09.".into()),
+                Some("23.09. (19:00)".into()),
             ),
             ProviderQuota::new(
                 ProviderId::Claude,
@@ -1042,12 +1043,17 @@ pub fn update_snapshot_with_agy_tsv(snapshot: &mut QuotaSnapshot, tsv: &str) {
                         }
                     } else if limit_type.contains("Weekly") {
                         agy.week_percent = Some(pct);
+                        let hm_opt = iso_utc_to_local_hm(reset_raw);
                         if let Some(date_part) = reset_raw.split('T').next() {
                             let date_pieces: Vec<&str> = date_part.split('-').collect();
                             if date_pieces.len() >= 3 {
                                 let m = date_pieces[1];
                                 let d = date_pieces[2];
-                                agy.week_reset = Some(format!("{d}.{m}."));
+                                if let Some((h, min)) = hm_opt {
+                                    agy.week_reset = Some(format!("{d}.{m}. ({h:02}:{min:02})"));
+                                } else {
+                                    agy.week_reset = Some(format!("{d}.{m}."));
+                                }
                             }
                         }
                     }
@@ -1095,8 +1101,11 @@ pub fn update_snapshot_with_glm_json(snapshot: &mut QuotaSnapshot, json_str: &st
                     let offset_mins = local_timezone_offset_minutes() as i64;
                     let local_secs = secs + offset_mins * 60;
                     let days = local_secs / 86400;
-                    let (_y, m, d) = days_to_ymd(days);
-                    glm.week_reset = Some(format!("{d:02}.{m:02}."));
+                    let (_y, month, d) = days_to_ymd(days);
+                    let day_secs = local_secs.rem_euclid(86400);
+                    let h = (day_secs / 3600) as u32;
+                    let min = ((day_secs % 3600) / 60) as u32;
+                    glm.week_reset = Some(format!("{d:02}.{month:02}. ({h:02}:{min:02})"));
                 }
             }
         }
@@ -1427,7 +1436,7 @@ mod tests {
         let agi = snapshot.get(ProviderId::Agy).expect("AGI exists");
         assert_eq!(agi.five_hour_percent, Some(92));
         assert_eq!(agi.week_percent, Some(89));
-        assert_eq!(agi.week_reset, Some("25.09.".to_string()));
+        assert_eq!(agi.week_reset, Some("25.09. (12:53)".to_string()));
         assert!(agi.five_hour_reset.is_some());
     }
 
@@ -1439,7 +1448,7 @@ mod tests {
         let glm = snapshot.get(ProviderId::Glm).expect("GLM exists");
         assert_eq!(glm.five_hour_percent, Some(93)); // 100 - 7 = 93
         assert_eq!(glm.week_percent, Some(75)); // 100 - 25 = 75
-        assert_eq!(glm.week_reset, Some("01.10.".to_string()));
+        assert_eq!(glm.week_reset, Some("01.10. (19:34)".to_string()));
         assert!(glm.five_hour_reset.is_some());
         assert_eq!(glm.cycle_label(), "Mo");
     }
