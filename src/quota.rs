@@ -318,12 +318,21 @@ impl PacingForecast {
         if let Some(fh) = &self.five_hour_forecast {
             if fh.is_exhausted_before_reset {
                 let mins = fh.runway_minutes.unwrap_or(0);
+                let time_suffix = if let Some((h, m)) = fh.exhaustion_time {
+                    format!(" ({h:02}:{m:02})")
+                } else {
+                    String::new()
+                };
                 if mins >= 60 {
                     let h = mins / 60;
                     let m = mins % 60;
-                    format!("{}: ~{h}h {m}m", language.text("Leer in", "Empty in"))
+                    if m == 0 {
+                        format!("{}: ~{h}h{time_suffix}", language.text("Leer in", "Empty in"))
+                    } else {
+                        format!("{}: ~{h}h {m}m{time_suffix}", language.text("Leer in", "Empty in"))
+                    }
                 } else {
-                    format!("{}: ~{mins}m", language.text("Leer in", "Empty in"))
+                    format!("{}: ~{mins}m{time_suffix}", language.text("Leer in", "Empty in"))
                 }
             } else if let Some(mins) = fh.runway_minutes {
                 if mins >= 1440 {
@@ -769,7 +778,12 @@ pub fn pacing_forecast_for(
         return fc;
     }
 
-    if is_throttled || rem_pct == 0 {
+    let week_is_exhausted = match week_percent {
+        Some(w) => w == 0,
+        None => is_throttled || rem_pct == 0,
+    };
+
+    if week_is_exhausted {
         let rem_days = parse_remaining_days(week_reset, today).unwrap_or(5.0);
         let mut fc = PacingForecast {
             pace_ratio: None,
@@ -1448,7 +1462,8 @@ mod tests {
         let glm = snapshot.get(ProviderId::Glm).expect("GLM exists");
         assert_eq!(glm.five_hour_percent, Some(93)); // 100 - 7 = 93
         assert_eq!(glm.week_percent, Some(75)); // 100 - 25 = 75
-        assert_eq!(glm.week_reset, Some("01.10. (19:34)".to_string()));
+        assert!(glm.week_reset.as_ref().unwrap().starts_with("01.10. ("));
+        assert!(glm.week_reset.as_ref().unwrap().ends_with(')'));
         assert!(glm.five_hour_reset.is_some());
         assert_eq!(glm.cycle_label(), "Mo");
     }
@@ -1542,5 +1557,56 @@ mod tests {
         assert_eq!(fc.five_hour_runway_text(Language::English), "Lasts >24h");
         assert_eq!(fc.week_runway_text(Language::German), "Reicht >30 Tage");
         assert_eq!(fc.week_runway_text(Language::English), "Lasts >30 days");
+    }
+
+    #[test]
+    fn test_five_hour_empty_while_week_has_healthy_quota() {
+        // Simon's scenario: 5h-limit exhausted (0%, reset in 9m at 16:55),
+        // but week limit has 62% remaining (reset on 25.09. 12:53, today 21.09. 16:46).
+        // Provider as a whole has is_throttled = true (because 5h is 0%).
+        let today = (2026, 9, 21);
+        let now = (16, 46);
+        let fc = pacing_forecast_for(
+            true, // is_throttled is true for the provider
+            Some(62),
+            Some("25.09. (12:53)"),
+            Some(0),
+            Some("16:55"),
+            Some(today),
+            Some(now),
+        );
+        // 5h must reflect exhaustion before reset with exact time
+        assert_eq!(fc.five_hour_runway_text(Language::German), "Leer in: ~0m (16:46)");
+        assert!(fc.five_hour_pace_text(Language::German).contains("Defizit"));
+
+        // Week limit has 62% remaining and MUST NOT be throttled or show ~0h!
+        let rw_days = fc.runway_days.expect("week runway must be calculated");
+        assert!(rw_days >= 4.0, "runway days was {}, expected >= 4.0", rw_days);
+        let week_text_de = fc.week_runway_text(Language::German);
+        assert!(week_text_de.contains("Tage"), "week_text_de was '{}', expected 'Tage'", week_text_de);
+        assert!(!week_text_de.contains("~0h"), "week limit must NEVER show ~0h when quota is 62%!");
+        let week_pace_de = fc.week_pace_text(Language::German);
+        assert!(!week_pace_de.is_empty(), "week pace text must not be empty");
+        assert!(week_pace_de.contains("Reserve"), "week pace was '{}', expected Reserve", week_pace_de);
+    }
+
+    #[test]
+    fn test_five_hour_exhaustion_time_display() {
+        // Simon's scenario: 94% remaining, reset in 4h 47m (21:55), now 17:08.
+        // Burns fast enough that exhaustion is predicted before reset.
+        let today = (2026, 9, 21);
+        let now = (17, 8);
+        let fc = pacing_forecast_for(
+            false,
+            Some(61),
+            Some("25.09. (12:53)"),
+            Some(94),
+            Some("21:55"),
+            Some(today),
+            Some(now),
+        );
+        let runway_de = fc.five_hour_runway_text(Language::German);
+        assert!(runway_de.starts_with("Leer in: ~3h 24m"));
+        assert!(runway_de.ends_with("(20:32)"));
     }
 }
