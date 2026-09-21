@@ -7205,7 +7205,7 @@ fn draw_smooth_limit_block(
         let runway_days = forecast.runway_days.unwrap_or(30.0);
         if runway_days < 1.0 || pct < 10 {
             (egui::Color32::from_rgb(252, 165, 165), true, false)
-        } else if runway_days < 3.0 || pct < 30 || forecast.health == PacingHealth::Tight {
+        } else if runway_days < 3.0 || pct < 30 || forecast.week_is_deficit() {
             (egui::Color32::from_rgb(253, 224, 71), false, true)
         } else {
             (egui::Color32::from_rgb(120, 184, 134), false, false)
@@ -7430,6 +7430,7 @@ fn draw_provider_card(
         } else {
             language.text("5h-Limit", "5-Hour Limit")
         };
+        let five_h_throttled = quota.five_hour_percent.map(|p| p == 0).unwrap_or(false);
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 5.0),
@@ -7438,7 +7439,7 @@ fn draw_provider_card(
             quota.five_hour_percent.unwrap_or(100),
             quota.five_hour_reset.as_deref(),
             true,
-            quota.is_throttled,
+            five_h_throttled,
             forecast,
             language,
         );
@@ -7448,6 +7449,7 @@ fn draw_provider_card(
         } else {
             language.text("Wochen-Limit", "Weekly Limit")
         };
+        let week_throttled = quota.week_percent.map(|p| p == 0).unwrap_or(false);
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 41.0),
@@ -7456,7 +7458,7 @@ fn draw_provider_card(
             quota.week_percent.unwrap_or(100),
             quota.week_reset.as_deref(),
             false,
-            quota.is_throttled,
+            week_throttled,
             forecast,
             language,
         );
@@ -7466,6 +7468,7 @@ fn draw_provider_card(
         } else {
             language.text("5h-Limit", "5-Hour Limit")
         };
+        let five_h_throttled = quota.five_hour_percent.map(|p| p == 0).unwrap_or(false) || quota.is_throttled;
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 5.0),
@@ -7474,7 +7477,7 @@ fn draw_provider_card(
             quota.five_hour_percent.unwrap_or(100),
             quota.five_hour_reset.as_deref(),
             true,
-            quota.is_throttled,
+            five_h_throttled,
             forecast,
             language,
         );
@@ -7484,6 +7487,7 @@ fn draw_provider_card(
         } else {
             language.text("Wochen-Limit", "Weekly Limit")
         };
+        let week_throttled = quota.week_percent.map(|p| p == 0).unwrap_or(false) || quota.is_throttled;
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 5.0),
@@ -7492,7 +7496,7 @@ fn draw_provider_card(
             quota.week_percent.unwrap_or(100),
             quota.week_reset.as_deref(),
             false,
-            quota.is_throttled,
+            week_throttled,
             forecast,
             language,
         );
