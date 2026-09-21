@@ -683,6 +683,7 @@ fn activate_live_window(hwnd: HWND) {
             let _ = SetForegroundWindow(hwnd);
         }
     }
+    apply_taskbar_visibility(hwnd);
 }
 
 fn is_live_window_title(title: &str) -> bool {
@@ -1475,6 +1476,7 @@ fn live_viewport_builder(
     language: Language,
 ) -> egui::ViewportBuilder {
     let mut viewport = egui::ViewportBuilder::default()
+        .with_taskbar(window_settings::live_status_in_taskbar())
         // Do not set `visible=false` here. eframe already creates native
         // windows hidden and reveals them after their first rendered frame.
         // Marking the egui viewport itself hidden prevents `App::ui` from
@@ -1762,11 +1764,18 @@ impl LiveStatusApp {
         if let Some(main_hwnd) = self.main_hwnd {
             window_chrome::apply_corner_preference(main_hwnd, r, false, is_docked, scale);
             window_chrome::ensure_window_chrome_synced(main_hwnd, op, self.window_level);
+            let tb = window_settings::live_status_in_taskbar();
+            if !taskbar::is_taskbar_style_synced(main_hwnd, tb) {
+                let _ = taskbar::set_visible(main_hwnd, tb);
+            }
         }
         if let Some(sat_hwnd) = self.satellite_hwnd {
             let sat_h = self.last_synced_sat_height.unwrap_or(314.0);
             window_chrome::sync_satellite_size(sat_hwnd, sat_h, self.main_hwnd, r, is_docked);
             window_chrome::ensure_window_chrome_synced(sat_hwnd, op, self.window_level);
+            if !taskbar::is_satellite_exempt_synced(sat_hwnd) {
+                taskbar::set_satellite_exempt(sat_hwnd, self.main_hwnd);
+            }
         }
     }
 
@@ -2137,8 +2146,11 @@ impl eframe::App for LiveStatusApp {
         let mut hwnds_changed = false;
         if self.main_hwnd.is_none() {
             self.main_hwnd = find_live_window_for_pid(current_pid());
-            if self.main_hwnd.is_some() {
+            if let Some(hwnd) = self.main_hwnd {
                 hwnds_changed = true;
+                let current_taskbar_visibility = window_settings::live_status_in_taskbar();
+                let _ = taskbar::set_visible(hwnd, current_taskbar_visibility);
+                self.taskbar_visible = Some(current_taskbar_visibility);
             }
         }
         if self.quota_open {
@@ -5958,6 +5970,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
 
     let mut builder = egui::ViewportBuilder::default()
         .with_title(title)
+        .with_taskbar(false)
         .with_inner_size([quota_width, quota_height])
         .with_decorations(false)
         .with_window_level(window_chrome::window_level(app.window_level));
@@ -6569,8 +6582,15 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 let new_tb = !cur_tb;
                                 let _ = window_settings::set_live_status_in_taskbar(new_tb);
                                 app.taskbar_visible = Some(new_tb);
-                                if let Some(hwnd) = app.main_hwnd {
+                                let main_hwnd = app.main_hwnd.or_else(|| find_live_window_for_pid(current_pid()));
+                                if let Some(hwnd) = main_hwnd {
+                                    app.main_hwnd = Some(hwnd);
                                     let _ = taskbar::set_visible(hwnd, new_tb);
+                                }
+                                let sat_hwnd = app.satellite_hwnd.or_else(|| find_satellite_window_for_pid(current_pid()));
+                                if let Some(sat) = sat_hwnd {
+                                    app.satellite_hwnd = Some(sat);
+                                    taskbar::set_satellite_exempt(sat, main_hwnd);
                                 }
                             }
 
@@ -7076,13 +7096,14 @@ fn format_reset_phrase(
     language: Language,
 ) -> String {
     if let Some(raw) = reset_raw {
+        let raw = raw.trim();
         if is_five_hour && raw.contains(':') {
             let now_hm = crate::quota::current_hm();
             if let Some((rh, rm)) = crate::quota::parse_hm(Some(raw)) {
                 let curr_mins = now_hm.0 * 60 + now_hm.1;
                 let reset_mins = rh * 60 + rm;
                 let mut diff_mins = reset_mins as i32 - curr_mins as i32;
-                if diff_mins <= 0 {
+                if diff_mins < 0 {
                     diff_mins += 24 * 60;
                 }
                 let hours = diff_mins / 60;
@@ -7093,9 +7114,9 @@ fn format_reset_phrase(
                         Language::English => format!("at {rh:02}:{rm:02}"),
                     }
                 } else if hours > 0 {
-                    format!("in {hours}h {mins}m")
+                    format!("in {hours}h {mins}m ({rh:02}:{rm:02})")
                 } else {
-                    format!("in {mins}m")
+                    format!("in {mins}m ({rh:02}:{rm:02})")
                 }
             } else {
                 raw.to_string()
@@ -7103,9 +7124,19 @@ fn format_reset_phrase(
         } else if raw.starts_with("in ") {
             raw.to_string()
         } else if raw.contains('.') {
+            let formatted = if raw.contains(':') && !raw.contains('(') {
+                let parts: Vec<&str> = raw.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1].contains(':') {
+                    format!("{} ({})", parts[0], parts[1])
+                } else {
+                    raw.to_string()
+                }
+            } else {
+                raw.to_string()
+            };
             match language {
-                Language::German => format!("am {raw}"),
-                Language::English => format!("on {raw}"),
+                Language::German => format!("am {formatted}"),
+                Language::English => format!("on {formatted}"),
             }
         } else {
             format!("in {raw}")
@@ -7227,8 +7258,12 @@ fn draw_smooth_limit_block(
     }
 
     // Line 3: Footer meta
-    let reset_phrase = format_reset_phrase(reset_raw, is_five_hour, language);
-    let footer_left = format!("{pct}% {} · Reset {reset_phrase}", language.text("frei", "free"));
+    let footer_left = if let Some(raw) = reset_raw {
+        let reset_phrase = format_reset_phrase(Some(raw), is_five_hour, language);
+        format!("Reset {reset_phrase}")
+    } else {
+        format!("{pct}% {}", language.text("frei", "free"))
+    };
     let footer_left_galley = painter.layout_no_wrap(
         footer_left.into(),
         egui::FontId::monospace(9.5),
@@ -7531,7 +7566,12 @@ fn render_quota_tooltip(
                 ui.label(egui::RichText::new(language.text("Reset:", "Reset:")).color(egui::Color32::from_rgb(148, 163, 184)));
                 let reset_str = quota.five_hour_reset.as_deref().unwrap_or("—");
                 let phrase = format_reset_phrase(quota.five_hour_reset.as_deref(), true, language);
-                ui.label(format!("{phrase} ({reset_str})"));
+                let label_text = if phrase.contains(reset_str) || reset_str == "—" {
+                    phrase
+                } else {
+                    format!("{phrase} ({reset_str})")
+                };
+                ui.label(label_text);
                 ui.end_row();
 
                 if let Some(fh) = &forecast.five_hour_forecast {
@@ -7612,7 +7652,12 @@ fn render_quota_tooltip(
                 ui.label(egui::RichText::new(language.text("Reset:", "Reset:")).color(egui::Color32::from_rgb(148, 163, 184)));
                 let reset_str = quota.week_reset.as_deref().unwrap_or("—");
                 let phrase = format_reset_phrase(quota.week_reset.as_deref(), false, language);
-                ui.label(format!("{phrase} ({reset_str})"));
+                let label_text = if phrase.contains(reset_str) || reset_str == "—" {
+                    phrase
+                } else {
+                    format!("{phrase} ({reset_str})")
+                };
+                ui.label(label_text);
                 ui.end_row();
 
                 if let Some(ratio) = forecast.pace_ratio {

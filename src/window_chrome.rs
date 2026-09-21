@@ -506,6 +506,7 @@ pub fn sync_satellite_size(
         );
     }
     apply_corner_preference(hwnd, radius, true, is_docked, 1.0);
+    crate::taskbar::set_satellite_exempt(hwnd, main_hwnd);
 }
 
 #[cfg(not(windows))]
