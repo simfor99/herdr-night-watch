@@ -7373,8 +7373,10 @@ fn draw_smooth_limit_block(
         )
     };
     if !pace_text.is_empty() {
-        let pace_color = if pct == 0 || is_throttled {
-            egui::Color32::from_rgb(252, 165, 165) // Red: throttled / depleted
+        let pace_color = if pct == 0 || is_throttled || is_red_alert {
+            egui::Color32::from_rgb(252, 165, 165) // Red: throttled / depleted / red alert
+        } else if is_yellow_alert {
+            egui::Color32::from_rgb(253, 224, 71) // Yellow: yellow warning / tight buffer
         } else if let Some(ratio) = pace_ratio_opt {
             if ratio < 1.0 {
                 egui::Color32::from_rgb(120, 184, 134) // Green: healthy pace / good reserve
@@ -7664,7 +7666,9 @@ fn render_quota_tooltip(
 
                 if let Some(fh) = &forecast.five_hour_forecast {
                     ui.label(egui::RichText::new(language.text("Pace:", "Pace:")).color(egui::Color32::from_rgb(148, 163, 184)));
-                    let pace_color = if fh.pace_ratio < 1.0 {
+                    let pace_color = if fh.is_exhausted_before_reset && fh.delta_minutes.unwrap_or(0) < -45 {
+                        egui::Color32::from_rgb(252, 165, 165)
+                    } else if fh.pace_ratio < 1.0 {
                         egui::Color32::from_rgb(120, 184, 134)
                     } else if fh.pace_ratio <= 1.25 {
                         egui::Color32::from_rgb(253, 224, 71)
@@ -7750,7 +7754,9 @@ fn render_quota_tooltip(
 
                 if let Some(ratio) = forecast.pace_ratio {
                     ui.label(egui::RichText::new(language.text("Pace:", "Pace:")).color(egui::Color32::from_rgb(148, 163, 184)));
-                    let pace_color = if ratio < 1.0 {
+                    let pace_color = if forecast.week_is_deficit() {
+                        egui::Color32::from_rgb(252, 165, 165)
+                    } else if ratio < 1.0 {
                         egui::Color32::from_rgb(120, 184, 134)
                     } else if ratio <= 1.25 {
                         egui::Color32::from_rgb(253, 224, 71)
