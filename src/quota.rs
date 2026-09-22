@@ -335,13 +335,18 @@ impl PacingForecast {
                     format!("{}: ~{mins}m{time_suffix}", language.text("Leer in", "Empty in"))
                 }
             } else if let Some(mins) = fh.runway_minutes {
+                let time_suffix = if let Some((h, m)) = fh.exhaustion_time {
+                    format!(" ({h:02}:{m:02})")
+                } else {
+                    String::new()
+                };
                 if mins >= 1440 {
                     language.text("Reicht >24h", "Lasts >24h").to_string()
                 } else if mins >= 60 {
                     let h = (mins as f32 / 60.0).round() as u32;
-                    format!("{} ~{h}h", language.text("Reicht noch", "Lasts"))
+                    format!("{} ~{h}h{time_suffix}", language.text("Reicht noch", "Lasts"))
                 } else {
-                    format!("{} ~{mins}m", language.text("Reicht noch", "Lasts"))
+                    format!("{} ~{mins}m{time_suffix}", language.text("Reicht noch", "Lasts"))
                 }
             } else {
                 language.text("Reicht >24h", "Lasts >24h").to_string()
@@ -396,18 +401,23 @@ impl PacingForecast {
 
     pub fn week_runway_text(&self, language: Language) -> String {
         if let Some(days) = self.runway_days {
+            let date_suffix = if let Some((m, d)) = self.week_exhaustion_date {
+                format!(" ({d:02}.{m:02})")
+            } else {
+                String::new()
+            };
             if days >= 30.0 {
                 language.text("Reicht >30 Tage", "Lasts >30 days").to_string()
             } else if days >= 1.0 {
                 match language {
-                    Language::German => format!("Reicht noch {:.1} Tage", days),
-                    Language::English => format!("Lasts {:.1} days", days),
+                    Language::German => format!("Reicht noch {:.1} Tage{date_suffix}", days),
+                    Language::English => format!("Lasts {:.1} days{date_suffix}", days),
                 }
             } else {
                 let hours = (days * 24.0).round() as u32;
                 match language {
-                    Language::German => format!("Reicht noch ~{}h", hours),
-                    Language::English => format!("Lasts ~{}h", hours),
+                    Language::German => format!("Reicht noch ~{}h{date_suffix}", hours),
+                    Language::English => format!("Lasts ~{}h{date_suffix}", hours),
                 }
             }
         } else {
@@ -871,6 +881,16 @@ pub fn pacing_forecast_for(
         };
 
         let delta_days = runway_days.map(|rw| (rw - remaining_days).round() as i32);
+        let week_exhaustion_date = runway_days.and_then(|rw| {
+            if rw < 30.0 {
+                let today_days = ymd_to_days(today.0, today.1, today.2);
+                let add_days = rw.round() as i64;
+                let (_y, ex_m, ex_d) = days_to_ymd(today_days + add_days);
+                Some((ex_m, ex_d))
+            } else {
+                None
+            }
+        });
 
         let mut fc = PacingForecast {
             pace_ratio: Some(pace),
@@ -881,7 +901,7 @@ pub fn pacing_forecast_for(
             badge_text: String::new(),
             summary_text: String::new(),
             five_hour_forecast,
-            week_exhaustion_date: None,
+            week_exhaustion_date,
             reset_str: saved_reset,
             today,
         };
@@ -1568,8 +1588,8 @@ mod tests {
         );
         let runway_de = fc.five_hour_runway_text(Language::German);
         let runway_en = fc.five_hour_runway_text(Language::English);
-        assert_eq!(runway_de, "Reicht noch ~8h");
-        assert_eq!(runway_en, "Lasts ~8h");
+        assert_eq!(runway_de, "Reicht noch ~8h (00:31)");
+        assert_eq!(runway_en, "Lasts ~8h (00:31)");
         assert!(!runway_de.contains("Puffer stabil"));
     }
 
@@ -1642,5 +1662,24 @@ mod tests {
         let runway_de = fc.five_hour_runway_text(Language::German);
         assert!(runway_de.starts_with("Leer in: ~3h 24m"));
         assert!(runway_de.ends_with("(20:32)"));
+    }
+
+    #[test]
+    fn test_week_exhaustion_date_display() {
+        let today = (2026, 9, 22);
+        let now = (10, 34);
+        let fc = pacing_forecast_for(
+            false,
+            Some(55),
+            Some("25.09. (12:53)"),
+            Some(73),
+            Some("13:37"),
+            Some(today),
+            Some(now),
+        );
+        let week_de = fc.week_runway_text(Language::German);
+        assert_eq!(week_de, "Reicht noch 4.9 Tage (27.09)");
+        let week_en = fc.week_runway_text(Language::English);
+        assert_eq!(week_en, "Lasts 4.9 days (27.09)");
     }
 }
