@@ -6082,8 +6082,8 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                         titlebar_rect.left() + 22.0,
                         titlebar_rect.center().y - title_galley.size().y / 2.0,
                     ),
-                    title_galley,
-                    egui::Color32::from_rgb(253, 186, 116),
+                    title_galley.clone(),
+                    egui::Color32::from_rgb(220, 225, 235),
                 );
 
                 // Controls on the right:
@@ -6229,6 +6229,90 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                 if gear_resp.clicked() {
                     user_toggled_settings = true;
                 }
+
+                // Center: Circadian Date & Hourly-Rotating Time Pills (Music-Pill Style)
+                let (_year, month, day, weekday, hour, minute) = crate::quota::current_local_datetime();
+                let weekday_name = match weekday {
+                    1 => language.text("Mo", "Mon"),
+                    2 => language.text("Di", "Tue"),
+                    3 => language.text("Mi", "Wed"),
+                    4 => language.text("Do", "Thu"),
+                    5 => language.text("Fr", "Fri"),
+                    6 => language.text("Sa", "Sat"),
+                    _ => language.text("So", "Sun"),
+                };
+                let date_text = format!("{weekday_name}, {day:02}.{month:02}.");
+                let time_text = format!("{hour:02}:{minute:02}");
+
+                // Day-of-week pastel color (Music-Panel aesthetic)
+                let weekday_hue = match weekday {
+                    1 => 210.0, // Mo: Ice Blue
+                    2 => 175.0, // Di: Teal / Cyan
+                    3 => 140.0, // Mi: Mint Green
+                    4 => 45.0,  // Do: Warm Amber
+                    5 => 25.0,  // Fr: Coral
+                    6 => 330.0, // Sa: Rose
+                    _ => 275.0, // So: Lavender
+                };
+                let date_color = hsv_color(weekday_hue, 0.34, 0.98);
+                let date_bg = hsv_color(weekday_hue + 180.0, 0.60, 0.44);
+
+                // Hourly-rotating pastel color (Circadian cycle: hour * 15° around the wheel)
+                let hour_hue = (hour as f32 * 15.0 + 195.0).rem_euclid(360.0);
+                let time_color = hsv_color(hour_hue, 0.35, 0.98);
+                let time_bg = hsv_color(hour_hue + 180.0, 0.60, 0.44);
+
+                let date_galley = painter.layout_no_wrap(
+                    date_text.into(),
+                    egui::FontId::monospace(10.0),
+                    date_color,
+                );
+                let time_galley = painter.layout_no_wrap(
+                    time_text.into(),
+                    egui::FontId::monospace(10.0),
+                    time_color,
+                );
+
+                let pill_h = 17.0;
+                let date_pill_w = date_galley.size().x + 10.0;
+                let time_pill_w = time_galley.size().x + 10.0;
+                let pill_gap = 5.0;
+                let total_pills_w = date_pill_w + pill_gap + time_pill_w;
+
+                let left_edge = titlebar_rect.left() + 22.0 + title_galley.size().x + 8.0;
+                let right_edge = gear_btn_rect.left() - 8.0;
+                let pills_cx = (left_edge + right_edge) / 2.0;
+                let pills_start_x = pills_cx - total_pills_w / 2.0;
+                let pill_y = titlebar_rect.center().y - pill_h / 2.0;
+
+                let date_pill_rect = egui::Rect::from_min_size(
+                    egui::pos2(pills_start_x, pill_y),
+                    egui::vec2(date_pill_w, pill_h),
+                );
+                let time_pill_rect = egui::Rect::from_min_size(
+                    egui::pos2(date_pill_rect.right() + pill_gap, pill_y),
+                    egui::vec2(time_pill_w, pill_h),
+                );
+
+                draw_media_panel(painter, date_pill_rect, date_color, date_bg, 10, 36, 48);
+                painter.galley(
+                    egui::pos2(
+                        date_pill_rect.center().x - date_galley.size().x / 2.0,
+                        date_pill_rect.center().y - date_galley.size().y / 2.0,
+                    ),
+                    date_galley,
+                    date_color,
+                );
+
+                draw_media_panel(painter, time_pill_rect, time_color, time_bg, 10, 36, 48);
+                painter.galley(
+                    egui::pos2(
+                        time_pill_rect.center().x - time_galley.size().x / 2.0,
+                        time_pill_rect.center().y - time_galley.size().y / 2.0,
+                    ),
+                    time_galley,
+                    time_color,
+                );
 
                 // Titlebar Drag handle interaction (no redundant 0px badge):
                 let drag_handle_rect = egui::Rect::from_min_max(
@@ -7191,12 +7275,12 @@ fn draw_smooth_limit_block(
                 } else {
                     (egui::Color32::from_rgb(253, 224, 71), false, true)
                 }
-            } else if pct < 25 || fh.burn_rate >= 0.35 || fh.delta_minutes.unwrap_or(999) < 45 {
+            } else if pct < 20 || (pct < 30 && fh.pace_ratio > 1.15) {
                 (egui::Color32::from_rgb(253, 224, 71), false, true)
             } else {
                 (egui::Color32::from_rgb(120, 184, 134), false, false)
             }
-        } else if pct < 25 {
+        } else if pct < 20 {
             (egui::Color32::from_rgb(253, 224, 71), false, true)
         } else {
             (egui::Color32::from_rgb(120, 184, 134), false, false)

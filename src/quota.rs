@@ -546,6 +546,40 @@ pub fn current_hm() -> (u32, u32) {
     }
 }
 
+pub fn current_local_datetime() -> (u32, u32, u32, u32, u32, u32) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut st = SYSTEMTIME {
+            wYear: 0,
+            wMonth: 0,
+            wDayOfWeek: 0,
+            wDay: 0,
+            wHour: 0,
+            wMinute: 0,
+            wSecond: 0,
+            wMilliseconds: 0,
+        };
+        unsafe { GetLocalTime(&mut st) };
+        (
+            st.wYear as u32,
+            st.wMonth as u32,
+            st.wDay as u32,
+            st.wDayOfWeek as u32,
+            st.wHour as u32,
+            st.wMinute as u32,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let (y, m, d) = current_ymd();
+        let (h, min) = current_hm();
+        // Fallback weekday calculation
+        (y as u32, m, d, 1, h, min)
+    }
+}
+
 #[cfg(windows)]
 pub fn local_timezone_offset_minutes() -> i32 {
     use windows_sys::Win32::Foundation::SYSTEMTIME;
