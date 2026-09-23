@@ -7548,8 +7548,13 @@ fn draw_provider_card(
             language,
         );
     } else {
+        let empty_label = if quota.id == ProviderId::Codex {
+            language.text("Keine aktuellen Daten", "No current data")
+        } else {
+            language.text("Kein Limit aktiv · Unbegrenzt", "No limit active · Unlimited")
+        };
         let none_galley = painter.layout_no_wrap(
-            language.text("Kein Limit aktiv · Unbegrenzt", "No limit active · Unlimited").into(),
+            empty_label.into(),
             egui::FontId::monospace(11.0),
             egui::Color32::from_rgb(148, 163, 184),
         );

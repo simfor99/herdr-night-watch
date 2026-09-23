@@ -1165,7 +1165,7 @@ impl Default for QuotaSnapshot {
 }
 
 impl QuotaSnapshot {
-    /// Baseline measured on 2026-09-18 (GLM 76%/75%, AGI 98%/100%, Codex 0% throttled).
+    /// Initial display until live provider data is available.
     pub fn measured_baseline() -> Self {
         let providers = vec![
             ProviderQuota::new(
@@ -1192,8 +1192,8 @@ impl QuotaSnapshot {
                 "OpenAI",
                 None,
                 None,
-                Some(0),
-                Some("23.09. (19:00)".into()),
+                None,
+                None,
             ),
             ProviderQuota::new(
                 ProviderId::Claude,
@@ -1384,6 +1384,31 @@ pub fn update_snapshot_with_glm_json(snapshot: &mut QuotaSnapshot, json_str: &st
     snapshot.last_updated = Some(Instant::now());
 }
 
+pub fn update_snapshot_with_codex_json(snapshot: &mut QuotaSnapshot, json_str: &str) {
+    let value = serde_json::from_str::<serde_json::Value>(json_str).ok();
+    let codex = snapshot.providers.iter_mut().find(|p| p.id == ProviderId::Codex);
+    let Some(codex) = codex else { return };
+
+    // Every refresh replaces the observation. A missing or expired log must not
+    // leave a previous cycle displayed as a current throttling event.
+    codex.five_hour_percent = None;
+    codex.five_hour_reset = None;
+    codex.week_percent = None;
+    codex.week_reset = None;
+    for (key, percent, reset) in [
+        ("week", &mut codex.week_percent, &mut codex.week_reset),
+        ("five_hour", &mut codex.five_hour_percent, &mut codex.five_hour_reset),
+    ] {
+        if let Some(window) = value.as_ref().and_then(|v| v.get(key)) {
+            *percent = window.get("remaining_percent").and_then(|p| p.as_u64()).filter(|p| *p <= 100).map(|p| p as u8);
+            *reset = window.get("reset").and_then(|r| r.as_str()).map(str::to_owned);
+        }
+    }
+    codex.is_throttled = codex.week_percent == Some(0) || codex.five_hour_percent == Some(0);
+    snapshot.has_throttle = snapshot.providers.iter().any(|p| p.is_throttled);
+    snapshot.last_updated = Some(Instant::now());
+}
+
 #[cfg(windows)]
 pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
     use std::os::windows::process::CommandExt;
@@ -1426,6 +1451,20 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
         }
     }
 
+    let mut codex_cmd = Command::new("wsl.exe");
+    codex_cmd.creation_flags(CREATE_NO_WINDOW)
+        .arg("-d")
+        .arg(&distro)
+        .arg("--exec")
+        .arg("python3")
+        .arg("/home/simon/projects/herdr-night-watch/tools/fetch_codex_quota.py");
+    let codex_json = codex_cmd.output().ok().filter(|output| output.status.success());
+    update_snapshot_with_codex_json(
+        &mut updated,
+        codex_json.as_ref().map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or("null"),
+    );
+
     updated
 }
 
@@ -1450,6 +1489,14 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
             update_snapshot_with_glm_json(&mut updated, &json);
         }
     }
+    let codex_json = std::process::Command::new("python3")
+        .arg("/home/simon/projects/herdr-night-watch/tools/fetch_codex_quota.py")
+        .output().ok().filter(|output| output.status.success());
+    update_snapshot_with_codex_json(
+        &mut updated,
+        codex_json.as_ref().map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or("null"),
+    );
     updated
 }
 
@@ -1461,7 +1508,7 @@ mod tests {
     fn test_quota_snapshot_baseline() {
         let snapshot = QuotaSnapshot::measured_baseline();
         assert_eq!(snapshot.providers.len(), 4);
-        assert!(snapshot.has_throttle);
+        assert!(!snapshot.has_throttle);
 
         let glm = snapshot.get(ProviderId::Glm).expect("GLM present");
         assert_eq!(glm.five_hour_percent, Some(76));
@@ -1469,10 +1516,10 @@ mod tests {
         assert!(!glm.is_throttled);
 
         let codex = snapshot.get(ProviderId::Codex).expect("Codex present");
-        assert_eq!(codex.week_percent, Some(0));
+        assert_eq!(codex.week_percent, None);
         assert_eq!(codex.five_hour_percent, None);
-        assert!(codex.is_throttled);
-        assert_eq!(codex.status_text(), "Drossel aktiv");
+        assert!(!codex.is_throttled);
+        assert_eq!(codex.week_reset, None);
 
         let claude = snapshot.get(ProviderId::Claude).expect("Claude present");
         assert_eq!(claude.week_percent, None);
@@ -1519,6 +1566,27 @@ mod tests {
         let (five_h, wk) = parse_codex_rate_limits(json).expect("valid parse");
         assert_eq!(five_h, None);
         assert_eq!(wk, Some(0));
+    }
+
+    #[test]
+    fn test_codex_live_observation_replaces_expired_cycle() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_codex_json(
+            &mut snapshot,
+            r#"{"week":{"remaining_percent":98,"reset":"30.09. (19:44)"},"five_hour":{"remaining_percent":0,"reset":"23:00"}}"#,
+        );
+        let codex = snapshot.get(ProviderId::Codex).unwrap();
+        assert_eq!(codex.week_percent, Some(98));
+        assert_eq!(codex.five_hour_percent, Some(0));
+        assert!(snapshot.has_throttle);
+        assert!(codex.pacing_forecast().five_hour_forecast.is_some());
+
+        update_snapshot_with_codex_json(&mut snapshot, "null");
+        let codex = snapshot.get(ProviderId::Codex).unwrap();
+        assert_eq!(codex.week_percent, None);
+        assert_eq!(codex.five_hour_percent, None);
+        assert_eq!(codex.week_reset, None);
+        assert!(!snapshot.has_throttle);
     }
 
     #[test]
