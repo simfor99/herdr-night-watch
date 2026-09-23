@@ -7233,10 +7233,24 @@ fn draw_smooth_limit_block(
             (egui::Color32::from_rgb(120, 184, 134), false, false)
         }
     } else {
-        let runway_days = forecast.runway_days.unwrap_or(30.0);
-        if runway_days < 1.0 || pct < 10 {
+        let diff_days = forecast.runway_days.map(|rw| rw - forecast.remaining_days);
+        if pct < 10 {
             (egui::Color32::from_rgb(252, 165, 165), true, false)
-        } else if runway_days < 3.0 || pct < 30 || forecast.week_is_deficit() {
+        } else if let Some(diff) = diff_days {
+            if diff < -0.85 {
+                // Severe deficit: exhausted nearly a day or more before reset
+                (egui::Color32::from_rgb(252, 165, 165), true, false)
+            } else if diff < -0.04 {
+                // Moderate deficit: exhausted hours before reset
+                (egui::Color32::from_rgb(253, 224, 71), false, true)
+            } else if pct < 15 || (pct < 25 && forecast.pace_ratio.map_or(false, |r| r > 1.15)) {
+                // Low reserve or high pace
+                (egui::Color32::from_rgb(253, 224, 71), false, true)
+            } else {
+                // Healthy reserve (> 0 buffer until reset)
+                (egui::Color32::from_rgb(120, 184, 134), false, false)
+            }
+        } else if pct < 20 {
             (egui::Color32::from_rgb(253, 224, 71), false, true)
         } else {
             (egui::Color32::from_rgb(120, 184, 134), false, false)
