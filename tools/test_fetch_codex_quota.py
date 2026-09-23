@@ -120,6 +120,60 @@ class CodexQuotaTest(unittest.TestCase):
                 str(newer.parent),
             )
 
+    def test_app_server_retries_rate_limits_without_params_for_older_servers(self):
+        now = dt.datetime(2026, 9, 23, 18, 20, tzinfo=dt.timezone.utc)
+        responses = [
+            {"id": 1, "result": {}},
+            {"id": 2, "error": {"code": -32602, "message": "Invalid params"}},
+            {"id": 3, "result": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 12,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1790790254,
+                },
+            }}},
+        ]
+
+        class FakeStdin:
+            def __init__(self):
+                self.lines = []
+
+            def write(self, line):
+                self.lines.append(line)
+
+            async def drain(self):
+                pass
+
+        class FakeStdout:
+            async def readline(self):
+                return (json.dumps(responses.pop(0)) + "\n").encode()
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeStdin()
+                self.stdout = FakeStdout()
+                self.returncode = None
+
+            def terminate(self):
+                self.returncode = 0
+
+            async def wait(self):
+                return self.returncode
+
+        process = FakeProcess()
+        with patch.dict(os.environ, {"CODEX_BIN": "/custom/bin/codex"}), patch(
+            "fetch_codex_quota.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ):
+            result = asyncio.run(app_server_quota(now))
+
+        self.assertEqual(result["week"]["remaining_percent"], 88)
+        requests = [json.loads(line) for line in process.stdin.lines if b'"id"' in line]
+        self.assertEqual([request["id"] for request in requests], [1, 2, 3])
+        self.assertIsNone(requests[2]["params"])
+
     def test_unreadable_candidate_metadata_does_not_abort_scan(self):
         now = dt.datetime(2026, 9, 23, 18, 20, tzinfo=dt.timezone.utc)
         with tempfile.TemporaryDirectory() as directory:

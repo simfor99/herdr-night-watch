@@ -89,17 +89,26 @@ async def app_server_quota(now: dt.datetime) -> dict | None:
                 except json.JSONDecodeError:
                     continue
                 if response.get("id") == request_id:
+                    if "error" in response:
+                        return {"_jsonrpc_error": response["error"]}
                     return response.get("result")
 
         initialized = await request(
             {"id": 1, "method": "initialize", "params": {
                 "clientInfo": {"name": "herdr-night-watch", "version": "0.1"}}}, 1)
-        if initialized is None:
+        if initialized is None or "_jsonrpc_error" in initialized:
             return None
         process.stdin.write(b'{"method":"initialized"}\n')
         await process.stdin.drain()
         response = await request({"id": 2, "method": "account/rateLimits/read",
                                   "params": {"excludeResetCreditDetails": True}}, 2)
+        rpc_error = response.get("_jsonrpc_error") if isinstance(response, dict) else None
+        if isinstance(rpc_error, dict) and rpc_error.get("code") in {-32600, -32602}:
+            response = await request(
+                {"id": 3, "method": "account/rateLimits/read", "params": None}, 3
+            )
+        if isinstance(response, dict) and "_jsonrpc_error" in response:
+            return None
         limits = response.get("rateLimits") if isinstance(response, dict) else None
         if isinstance(limits, dict) and limits.get("limitId") == "codex":
             return normalize_windows(limits, now, app_server=True)
