@@ -1,11 +1,13 @@
+import asyncio
 import datetime as dt
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from fetch_codex_quota import fetch_quota, latest_quota, normalize_windows
+from fetch_codex_quota import app_server_quota, fetch_quota, latest_quota, normalize_windows
 
 
 class CodexQuotaTest(unittest.TestCase):
@@ -66,8 +68,57 @@ class CodexQuotaTest(unittest.TestCase):
 
             result = latest_quota(sessions, now)
             self.assertEqual(result["five_hour"]["remaining_percent"], 75)
-            self.assertRegex(result["five_hour"]["reset"], r"^\d{2}:\d{2}$")
+            self.assertEqual(result["five_hour"]["reset_epoch"], 1790190000)
+            self.assertNotIn("reset", result["five_hour"])
             self.assertEqual(result["week"]["remaining_percent"], 60)
+
+    def test_app_server_uses_configured_codex_executable(self):
+        now = dt.datetime(2026, 9, 23, 18, 20, tzinfo=dt.timezone.utc)
+        with patch.dict(os.environ, {"CODEX_BIN": "/custom/bin/codex"}), patch(
+            "fetch_codex_quota.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            side_effect=OSError("executable not found"),
+        ) as create_process:
+            self.assertIsNone(asyncio.run(app_server_quota(now)))
+        self.assertEqual(create_process.await_args.args[0], "/custom/bin/codex")
+
+    def test_app_server_defaults_to_codex_when_config_is_empty(self):
+        now = dt.datetime(2026, 9, 23, 18, 20, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CODEX_BIN": "", "NVM_DIR": directory}), patch(
+            "fetch_codex_quota.shutil.which", return_value=None
+        ), patch.object(Path, "home", return_value=Path(directory)), patch(
+            "fetch_codex_quota.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            side_effect=OSError("executable not found"),
+        ) as create_process:
+            self.assertIsNone(asyncio.run(app_server_quota(now)))
+        self.assertEqual(create_process.await_args.args[0], "codex")
+
+    def test_app_server_prefers_latest_nvm_codex_over_windows_path_shim(self):
+        now = dt.datetime(2026, 9, 23, 18, 20, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            older = home / ".nvm/versions/node/v22.22.0/bin/codex"
+            newer = home / ".nvm/versions/node/v24.16.0/bin/codex"
+            older.parent.mkdir(parents=True)
+            newer.parent.mkdir(parents=True)
+            older.touch()
+            newer.touch()
+            older.chmod(0o755)
+            newer.chmod(0o755)
+            with patch.dict(os.environ, {"CODEX_BIN": "", "NVM_DIR": str(home / ".nvm")}), patch(
+                "fetch_codex_quota.shutil.which", return_value="/mnt/c/Users/Simon/npm/codex"
+            ), patch.object(Path, "home", return_value=home), patch(
+                "fetch_codex_quota.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+                side_effect=OSError("simulated process failure"),
+            ) as create_process:
+                self.assertIsNone(asyncio.run(app_server_quota(now)))
+            self.assertEqual(create_process.await_args.args[0], str(newer))
+            self.assertEqual(
+                create_process.await_args.kwargs["env"]["PATH"].split(os.pathsep)[0],
+                str(newer.parent),
+            )
 
     def test_unreadable_candidate_metadata_does_not_abort_scan(self):
         now = dt.datetime(2026, 9, 23, 18, 20, tzinfo=dt.timezone.utc)

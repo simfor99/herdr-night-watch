@@ -1384,6 +1384,25 @@ pub fn update_snapshot_with_glm_json(snapshot: &mut QuotaSnapshot, json_str: &st
     snapshot.last_updated = Some(Instant::now());
 }
 
+fn codex_reset_epoch_to_local(epoch: i64, key: &str) -> String {
+    #[cfg(windows)]
+    let offset_minutes = local_timezone_offset_minutes();
+    #[cfg(not(windows))]
+    let offset_minutes = 0; // current_hm() uses UTC on non-Windows targets.
+
+    let local_secs = epoch + offset_minutes as i64 * 60;
+    let day_secs = local_secs.rem_euclid(86400);
+    let hour = (day_secs / 3600) as u32;
+    let minute = ((day_secs % 3600) / 60) as u32;
+    if key == "five_hour" {
+        format!("{hour:02}:{minute:02}")
+    } else {
+        let days = local_secs.div_euclid(86400);
+        let (_year, month, day) = days_to_ymd(days);
+        format!("{day:02}.{month:02}. ({hour:02}:{minute:02})")
+    }
+}
+
 pub fn update_snapshot_with_codex_json(snapshot: &mut QuotaSnapshot, json_str: &str) {
     let value = serde_json::from_str::<serde_json::Value>(json_str).ok();
     let codex = snapshot.providers.iter_mut().find(|p| p.id == ProviderId::Codex);
@@ -1401,7 +1420,16 @@ pub fn update_snapshot_with_codex_json(snapshot: &mut QuotaSnapshot, json_str: &
     ] {
         if let Some(window) = value.as_ref().and_then(|v| v.get(key)) {
             *percent = window.get("remaining_percent").and_then(|p| p.as_u64()).filter(|p| *p <= 100).map(|p| p as u8);
-            *reset = window.get("reset").and_then(|r| r.as_str()).map(str::to_owned);
+            *reset = window
+                .get("reset_epoch")
+                .and_then(|value| value.as_i64())
+                .map(|epoch| codex_reset_epoch_to_local(epoch, key))
+                .or_else(|| {
+                    window
+                        .get("reset")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                });
         }
     }
     codex.is_throttled = codex.week_percent == Some(0) || codex.five_hour_percent == Some(0);
@@ -1573,11 +1601,19 @@ mod tests {
         let mut snapshot = QuotaSnapshot::measured_baseline();
         update_snapshot_with_codex_json(
             &mut snapshot,
-            r#"{"week":{"remaining_percent":98,"reset":"30.09. (19:44)"},"five_hour":{"remaining_percent":0,"reset":"23:00"}}"#,
+            r#"{"week":{"remaining_percent":98,"reset_epoch":1790790254},"five_hour":{"remaining_percent":0,"reset_epoch":1790190000}}"#,
         );
         let codex = snapshot.get(ProviderId::Codex).unwrap();
         assert_eq!(codex.week_percent, Some(98));
         assert_eq!(codex.five_hour_percent, Some(0));
+        assert_eq!(
+            codex.week_reset,
+            Some(codex_reset_epoch_to_local(1790790254, "week"))
+        );
+        assert_eq!(
+            codex.five_hour_reset,
+            Some(codex_reset_epoch_to_local(1790190000, "five_hour"))
+        );
         assert!(snapshot.has_throttle);
         assert!(codex.pacing_forecast().five_hour_forecast.is_some());
 

@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 
 
@@ -22,19 +23,56 @@ def normalize_windows(limits: dict, now: dt.datetime, *, app_server: bool = Fals
             continue
         if not isinstance(reset, (int, float)) or reset <= now.timestamp():
             continue
-        reset_local = dt.datetime.fromtimestamp(reset).astimezone()
         result[label] = {
             "remaining_percent": round(100 - used),
-            "reset": reset_local.strftime("%H:%M" if label == "five_hour" else "%d.%m. (%H:%M)"),
+            "reset_epoch": int(reset),
         }
     return result or None
 
 
+def codex_executable() -> str:
+    configured = os.environ.get("CODEX_BIN")
+    if configured:
+        return configured
+
+    local_bin = Path.home() / ".local" / "bin" / "codex"
+    if local_bin.is_file() and os.access(local_bin, os.X_OK):
+        return str(local_bin)
+
+    nvm_dir = Path(os.environ.get("NVM_DIR", Path.home() / ".nvm"))
+    nvm_codex = [
+        candidate
+        for candidate in (nvm_dir / "versions" / "node").glob("*/bin/codex")
+        if candidate.is_file() and os.access(candidate, os.X_OK)
+    ]
+    if nvm_codex:
+        def version_key(candidate: Path) -> tuple[int, ...]:
+            version = candidate.parents[1].name.removeprefix("v")
+            try:
+                return tuple(int(part) for part in version.split("."))
+            except ValueError:
+                return ()
+
+        return str(max(nvm_codex, key=version_key))
+
+    path_codex = shutil.which("codex")
+    return path_codex or "codex"
+
+
 async def app_server_quota(now: dt.datetime) -> dict | None:
+    codex_bin = codex_executable()
+    process_env = os.environ.copy()
+    executable_path = Path(codex_bin)
+    if executable_path.parent != Path("."):
+        executable_dir = str(executable_path.parent)
+        process_env["PATH"] = os.pathsep.join(
+            path for path in (executable_dir, process_env.get("PATH", "")) if path
+        )
     try:
         process = await asyncio.create_subprocess_exec(
-            "codex", "app-server", "--stdio", stdin=asyncio.subprocess.PIPE,
+            codex_bin, "app-server", "--stdio", stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            env=process_env,
         )
     except OSError:
         return None
@@ -66,7 +104,7 @@ async def app_server_quota(now: dt.datetime) -> dict | None:
         if isinstance(limits, dict) and limits.get("limitId") == "codex":
             return normalize_windows(limits, now, app_server=True)
         return None
-    except (OSError, TimeoutError, BrokenPipeError):
+    except (OSError, TimeoutError, asyncio.TimeoutError, BrokenPipeError):
         return None
     finally:
         if process.returncode is None:
@@ -76,7 +114,7 @@ async def app_server_quota(now: dt.datetime) -> dict | None:
                 pass
             try:
                 await asyncio.wait_for(process.wait(), timeout=2)
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 try:
                     process.kill()
                 except ProcessLookupError:
