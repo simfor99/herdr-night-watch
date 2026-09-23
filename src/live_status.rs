@@ -6881,14 +6881,6 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                         );
                         let forecast = quota.pacing_forecast();
                         draw_provider_card(painter, row_rect, quota, &forecast, language, app.provider_color(quota.id));
-                        let row_resp = ui.interact(
-                            row_rect,
-                            ui.make_persistent_id(format!("sat_quota_row_{:?}", quota.id)),
-                            egui::Sense::hover(),
-                        );
-                        row_resp.on_hover_ui(|ui| {
-                            render_quota_tooltip(ui, quota, &forecast, language);
-                        });
                         current_y += card_h + 6.0;
                     }
                 }
@@ -7179,58 +7171,13 @@ fn format_reset_phrase(
     is_five_hour: bool,
     language: Language,
 ) -> String {
-    if let Some(raw) = reset_raw {
-        let raw = raw.trim();
-        if is_five_hour && raw.contains(':') {
-            let now_hm = crate::quota::current_hm();
-            if let Some((rh, rm)) = crate::quota::parse_hm(Some(raw)) {
-                let curr_mins = now_hm.0 * 60 + now_hm.1;
-                let reset_mins = rh * 60 + rm;
-                let mut diff_mins = reset_mins as i32 - curr_mins as i32;
-                if diff_mins < 0 {
-                    diff_mins += 24 * 60;
-                }
-                let hours = diff_mins / 60;
-                let mins = diff_mins % 60;
-                if diff_mins > 300 {
-                    match language {
-                        Language::German => format!("um {rh:02}:{rm:02}"),
-                        Language::English => format!("at {rh:02}:{rm:02}"),
-                    }
-                } else if hours > 0 {
-                    format!("in {hours}h {mins}m ({rh:02}:{rm:02})")
-                } else {
-                    format!("in {mins}m ({rh:02}:{rm:02})")
-                }
-            } else {
-                raw.to_string()
-            }
-        } else if raw.starts_with("in ") {
-            raw.to_string()
-        } else if raw.contains('.') {
-            let formatted = if raw.contains(':') && !raw.contains('(') {
-                let parts: Vec<&str> = raw.split_whitespace().collect();
-                if parts.len() >= 2 && parts[1].contains(':') {
-                    format!("{} ({})", parts[0], parts[1])
-                } else {
-                    raw.to_string()
-                }
-            } else {
-                raw.to_string()
-            };
-            match language {
-                Language::German => format!("am {formatted}"),
-                Language::English => format!("on {formatted}"),
-            }
-        } else {
-            format!("in {raw}")
-        }
-    } else {
-        match language {
-            Language::German => "nicht terminiert".to_string(),
-            Language::English => "no schedule".to_string(),
-        }
-    }
+    let dt = crate::quota::current_local_datetime();
+    crate::quota::format_reset_time_phrase(
+        reset_raw,
+        is_five_hour,
+        language,
+        (dt.0 as i32, dt.1, dt.2, dt.4, dt.5),
+    )
 }
 
 fn draw_smooth_limit_block(
@@ -7600,6 +7547,7 @@ fn draw_provider_card(
     }
 }
 
+#[allow(dead_code)]
 fn render_quota_tooltip(
     ui: &mut egui::Ui,
     quota: &ProviderQuota,

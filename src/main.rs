@@ -3,7 +3,7 @@
     windows_subsystem = "windows"
 )]
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod quota;
 
 #[cfg(windows)]
@@ -12,7 +12,7 @@ mod autostart;
 mod backend;
 #[cfg(windows)]
 mod configuration;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod language;
 #[cfg(windows)]
 mod live_status;

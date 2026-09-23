@@ -556,6 +556,7 @@ pub fn current_hm() -> (u32, u32) {
     }
 }
 
+#[allow(dead_code)]
 pub fn current_local_datetime() -> (u32, u32, u32, u32, u32, u32) {
     #[cfg(windows)]
     {
@@ -784,6 +785,206 @@ pub fn parse_remaining_days(reset_str: Option<&str>, today: (i32, u32, u32)) -> 
     }
 
     None
+}
+
+pub fn parse_target_datetime(raw: &str, today: (i32, u32, u32)) -> Option<((i32, u32, u32), Option<(u32, u32)>)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Format A: ISO string "2026-09-25T10:53:00Z" or "2026-09-25"
+    if raw.contains('-') && (raw.contains('T') || raw.split('-').count() >= 3) {
+        let date_part = raw.split('T').next()?;
+        let parts: Vec<&str> = date_part.split('-').collect();
+        if parts.len() >= 3 {
+            let y: i32 = parts[0].trim().parse().ok()?;
+            let m: u32 = parts[1].trim().parse().ok()?;
+            let d: u32 = parts[2].trim().parse().ok()?;
+            let time_opt = iso_utc_to_local_hm(raw);
+            return Some(((y, m, d), time_opt));
+        }
+    }
+
+    // Format B: "23.09. (19:00)", "23.09. 19:00", "25.09.", "25.09", "am 23.09. (19:00)"
+    if raw.contains('.') {
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let date_token = tokens.iter().find(|t| t.contains('.'))?;
+        let date_parts: Vec<&str> = date_token.split('.').filter(|s| !s.trim().is_empty()).collect();
+        if date_parts.len() >= 2 {
+            let d: u32 = date_parts[0].trim().parse().ok()?;
+            let m: u32 = date_parts[1].trim().parse().ok()?;
+            let mut y = today.0;
+            if m < today.1 {
+                y += 1;
+            }
+
+            let mut time_opt = None;
+            for token in &tokens {
+                if token.contains(':') {
+                    let cleaned: String = token.chars().filter(|c| c.is_ascii_digit() || *c == ':').collect();
+                    let hm_parts: Vec<&str> = cleaned.split(':').collect();
+                    if hm_parts.len() >= 2 {
+                        if let (Ok(h), Ok(min)) = (hm_parts[0].parse::<u32>(), hm_parts[1].parse::<u32>()) {
+                            time_opt = Some((h, min));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return Some(((y, m, d), time_opt));
+        }
+    }
+
+    None
+}
+
+pub fn format_reset_time_phrase(
+    reset_raw: Option<&str>,
+    is_five_hour: bool,
+    language: Language,
+    now_dt: (i32, u32, u32, u32, u32), // (year, month, day, hour, min)
+) -> String {
+    let Some(raw) = reset_raw.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return match language {
+            Language::German => "nicht terminiert".to_string(),
+            Language::English => "no schedule".to_string(),
+        };
+    };
+
+    if is_five_hour && raw.contains(':') {
+        if let Some((rh, rm)) = parse_hm(Some(raw)) {
+            let curr_mins = now_dt.3 * 60 + now_dt.4;
+            let reset_mins = rh * 60 + rm;
+            let mut diff_mins = reset_mins as i32 - curr_mins as i32;
+            if diff_mins < 0 {
+                diff_mins += 24 * 60;
+            }
+            let hours = diff_mins / 60;
+            let mins = diff_mins % 60;
+            if diff_mins > 300 {
+                return match language {
+                    Language::German => format!("um {rh:02}:{rm:02}"),
+                    Language::English => format!("at {rh:02}:{rm:02}"),
+                };
+            } else if hours > 0 {
+                return format!("in {hours}h {mins}m ({rh:02}:{rm:02})");
+            } else {
+                return format!("in {mins}m ({rh:02}:{rm:02})");
+            }
+        }
+        return raw.to_string();
+    }
+
+    if raw.starts_with("in ") {
+        return raw.to_string();
+    }
+
+    let Some(((target_y, target_m, target_d), time_opt)) =
+        parse_target_datetime(raw, (now_dt.0, now_dt.1, now_dt.2))
+    else {
+        return fallback_raw_format(raw, language);
+    };
+
+    let now_days = ymd_to_days(now_dt.0, now_dt.1, now_dt.2);
+    let target_days = ymd_to_days(target_y, target_m, target_d);
+
+    let (diff_mins, has_exact_time) = match time_opt {
+        Some((th, tm)) => {
+            let now_total = now_days * 1440 + now_dt.3 as i64 * 60 + now_dt.4 as i64;
+            let target_total = target_days * 1440 + th as i64 * 60 + tm as i64;
+            (target_total - now_total, true)
+        }
+        None => {
+            let diff_days = target_days - now_days;
+            (diff_days * 1440, false)
+        }
+    };
+
+    if diff_mins <= 0 {
+        return match time_opt {
+            Some((th, tm)) => {
+                let time_str = format!("{th:02}:{tm:02}");
+                format!("{} ({time_str})", language.text("in Kürze", "soon"))
+            }
+            None => language.text("in Kürze", "soon").to_string(),
+        };
+    }
+
+    if diff_mins < 60 && has_exact_time {
+        let (th, tm) = time_opt.unwrap();
+        let time_str = format!("{th:02}:{tm:02}");
+        return if target_days == now_days {
+            match language {
+                Language::German => format!("in {diff_mins}m (heute {time_str})"),
+                Language::English => format!("in {diff_mins}m (today {time_str})"),
+            }
+        } else {
+            format!("in {diff_mins}m ({target_d:02}.{target_m:02}. {time_str})")
+        };
+    }
+
+    let total_hours = ((diff_mins as f64) / 60.0).round() as u64;
+    let total_hours = total_hours.max(1);
+
+    if target_days == now_days {
+        return match time_opt {
+            Some((th, tm)) => {
+                let time_str = format!("{th:02}:{tm:02}");
+                match language {
+                    Language::German => format!("in ~{total_hours}h (heute {time_str})"),
+                    Language::English => format!("in ~{total_hours}h (today {time_str})"),
+                }
+            }
+            None => match language {
+                Language::German => format!("in ~{total_hours}h (heute)"),
+                Language::English => format!("in ~{total_hours}h (today)"),
+            },
+        };
+    }
+
+    if total_hours <= 240 {
+        return match time_opt {
+            Some((th, tm)) => {
+                let time_str = format!("{th:02}:{tm:02}");
+                format!("in ~{total_hours}h ({target_d:02}.{target_m:02}. {time_str})")
+            }
+            None => format!("in ~{total_hours}h ({target_d:02}.{target_m:02}.)"),
+        };
+    }
+
+    let days = ((diff_mins as f64) / 1440.0).round() as u64;
+    match time_opt {
+        Some((th, tm)) => {
+            let time_str = format!("{th:02}:{tm:02}");
+            format!("in ~{days}d ({target_d:02}.{target_m:02}. {time_str})")
+        }
+        None => format!("in ~{days}d ({target_d:02}.{target_m:02}.)"),
+    }
+}
+
+fn fallback_raw_format(raw: &str, language: Language) -> String {
+    if raw.starts_with("in ") {
+        raw.to_string()
+    } else if raw.contains('.') {
+        let formatted = if raw.contains(':') && !raw.contains('(') {
+            let parts: Vec<&str> = raw.split_whitespace().collect();
+            if parts.len() >= 2 && parts[1].contains(':') {
+                format!("{} ({})", parts[0], parts[1])
+            } else {
+                raw.to_string()
+            }
+        } else {
+            raw.to_string()
+        };
+        match language {
+            Language::German => format!("am {formatted}"),
+            Language::English => format!("on {formatted}"),
+        }
+    } else {
+        format!("in {raw}")
+    }
 }
 
 pub fn pacing_forecast_for(
@@ -1229,6 +1430,7 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
     let mut updated = current.clone();
     if let Ok(output) = std::process::Command::new("/home/simon/.local/bin/agy")
@@ -1681,5 +1883,94 @@ mod tests {
         assert_eq!(week_de, "Reicht noch 4.9 Tage (27.09)");
         let week_en = fc.week_runway_text(Language::English);
         assert_eq!(week_en, "Lasts 4.9 days (27.09)");
+    }
+
+    #[test]
+    fn test_format_reset_time_phrase_simon_screenshot() {
+        // Simon's scenario: 2026-09-23 at 12:36, reset on "23.09. (19:00)"
+        let now_dt = (2026, 9, 23, 12, 36);
+        let phrase_de = format_reset_time_phrase(Some("23.09. (19:00)"), false, Language::German, now_dt);
+        let phrase_en = format_reset_time_phrase(Some("23.09. (19:00)"), false, Language::English, now_dt);
+        assert_eq!(phrase_de, "in ~6h (heute 19:00)");
+        assert_eq!(phrase_en, "in ~6h (today 19:00)");
+    }
+
+    #[test]
+    fn test_format_reset_time_phrase_tomorrow_and_over_weekend() {
+        let now_dt = (2026, 9, 23, 12, 36); // Wednesday noon
+
+        // Tomorrow at 19:00 -> in ~30h
+        let phrase_tomorrow = format_reset_time_phrase(Some("24.09. (19:00)"), false, Language::German, now_dt);
+        assert_eq!(phrase_tomorrow, "in ~30h (24.09. 19:00)");
+
+        // Friday at 12:53 -> in ~48h
+        let phrase_fri = format_reset_time_phrase(Some("25.09. (12:53)"), false, Language::German, now_dt);
+        assert_eq!(phrase_fri, "in ~48h (25.09. 12:53)");
+
+        // Over the weekend to Monday 19:00 -> in ~126h
+        let phrase_mon = format_reset_time_phrase(Some("28.09. (19:00)"), false, Language::German, now_dt);
+        assert_eq!(phrase_mon, "in ~126h (28.09. 19:00)");
+    }
+
+    #[test]
+    fn test_format_reset_time_phrase_under_one_hour_and_due() {
+        let now_dt = (2026, 9, 23, 18, 20); // 40 minutes before 19:00
+        let phrase_de = format_reset_time_phrase(Some("23.09. (19:00)"), false, Language::German, now_dt);
+        let phrase_en = format_reset_time_phrase(Some("23.09. (19:00)"), false, Language::English, now_dt);
+        assert_eq!(phrase_de, "in 40m (heute 19:00)");
+        assert_eq!(phrase_en, "in 40m (today 19:00)");
+
+        // Passed reset time -> in Kürze / soon
+        let now_past = (2026, 9, 23, 19, 5);
+        let phrase_due_de = format_reset_time_phrase(Some("23.09. (19:00)"), false, Language::German, now_past);
+        let phrase_due_en = format_reset_time_phrase(Some("23.09. (19:00)"), false, Language::English, now_past);
+        assert_eq!(phrase_due_de, "in Kürze (19:00)");
+        assert_eq!(phrase_due_en, "soon (19:00)");
+    }
+
+    #[test]
+    fn test_format_reset_time_phrase_five_hour_window() {
+        let now_dt = (2026, 9, 23, 12, 36);
+        let phrase_5h = format_reset_time_phrase(Some("15:45"), true, Language::German, now_dt);
+        assert_eq!(phrase_5h, "in 3h 9m (15:45)");
+    }
+
+    #[test]
+    fn test_format_reset_time_phrase_date_only_and_month_rollover() {
+        let now_dt = (2026, 9, 23, 12, 0);
+        let phrase_date_only_de = format_reset_time_phrase(Some("25.09."), false, Language::German, now_dt);
+        let phrase_date_only_en = format_reset_time_phrase(Some("25.09."), false, Language::English, now_dt);
+        assert_eq!(phrase_date_only_de, "in ~48h (25.09.)");
+        assert_eq!(phrase_date_only_en, "in ~48h (25.09.)");
+
+        // Month boundary: Sept 30 20:00 to Oct 01 14:00 (18 hours)
+        let now_sept30 = (2026, 9, 30, 20, 0);
+        let phrase_oct_de = format_reset_time_phrase(Some("01.10. (14:00)"), false, Language::German, now_sept30);
+        let phrase_oct_en = format_reset_time_phrase(Some("01.10. (14:00)"), false, Language::English, now_sept30);
+        assert_eq!(phrase_oct_de, "in ~18h (01.10. 14:00)");
+        assert_eq!(phrase_oct_en, "in ~18h (01.10. 14:00)");
+    }
+
+    #[test]
+    fn test_format_reset_time_phrase_english_translations() {
+        let now_dt = (2026, 9, 23, 12, 36);
+
+        // No schedule
+        assert_eq!(format_reset_time_phrase(None, false, Language::German, now_dt), "nicht terminiert");
+        assert_eq!(format_reset_time_phrase(None, false, Language::English, now_dt), "no schedule");
+
+        // 5h > 300m
+        assert_eq!(format_reset_time_phrase(Some("18:00"), true, Language::German, (2026, 9, 23, 12, 0)), "um 18:00");
+        assert_eq!(format_reset_time_phrase(Some("18:00"), true, Language::English, (2026, 9, 23, 12, 0)), "at 18:00");
+
+        // Far future (>240h, e.g. monthly quota 20 days)
+        let phrase_monthly_de = format_reset_time_phrase(Some("13.10. (12:00)"), false, Language::German, now_dt);
+        let phrase_monthly_en = format_reset_time_phrase(Some("13.10. (12:00)"), false, Language::English, now_dt);
+        assert_eq!(phrase_monthly_de, "in ~20d (13.10. 12:00)");
+        assert_eq!(phrase_monthly_en, "in ~20d (13.10. 12:00)");
+
+        // Unparseable raw fallback
+        assert_eq!(format_reset_time_phrase(Some("unbekannt"), false, Language::German, now_dt), "in unbekannt");
+        assert_eq!(format_reset_time_phrase(Some("unknown"), false, Language::English, now_dt), "in unknown");
     }
 }
