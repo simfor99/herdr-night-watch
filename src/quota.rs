@@ -1642,10 +1642,8 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
         }
     }
     let codex_json = std::process::Command::new("python3")
-        .arg(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tools/fetch_codex_quota.py"),
-        )
+        .arg("-c")
+        .arg(include_str!("../tools/fetch_codex_quota.py"))
         .output().ok().filter(|output| output.status.success());
     update_snapshot_with_codex_json(
         &mut updated,
