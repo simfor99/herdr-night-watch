@@ -6,6 +6,30 @@
 use crate::language::Language;
 use std::time::Instant;
 
+#[cfg(windows)]
+#[repr(C)]
+#[allow(non_snake_case)]
+#[derive(Clone, Copy)]
+struct WinTimeZoneInformation {
+    Bias: i32,
+    StandardName: [u16; 32],
+    StandardDate: windows_sys::Win32::Foundation::SYSTEMTIME,
+    StandardBias: i32,
+    DaylightName: [u16; 32],
+    DaylightDate: windows_sys::Win32::Foundation::SYSTEMTIME,
+    DaylightBias: i32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SystemTimeToTzSpecificLocalTime(
+        time_zone_information: *const WinTimeZoneInformation,
+        universal_time: *const windows_sys::Win32::Foundation::SYSTEMTIME,
+        local_time: *mut windows_sys::Win32::Foundation::SYSTEMTIME,
+    ) -> i32;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderId {
     Glm,
@@ -556,6 +580,18 @@ pub fn current_hm() -> (u32, u32) {
     }
 }
 
+fn current_forecast_today() -> (i32, u32, u32) {
+    #[cfg(windows)]
+    {
+        let (year, month, day, _, _, _) = current_local_datetime();
+        (year as i32, month, day)
+    }
+    #[cfg(not(windows))]
+    {
+        current_ymd()
+    }
+}
+
 #[allow(dead_code)]
 pub fn current_local_datetime() -> (u32, u32, u32, u32, u32, u32) {
     #[cfg(windows)]
@@ -996,7 +1032,7 @@ pub fn pacing_forecast_for(
     custom_today: Option<(i32, u32, u32)>,
     custom_time: Option<(u32, u32)>,
 ) -> PacingForecast {
-    let today = custom_today.unwrap_or_else(current_ymd);
+    let today = custom_today.unwrap_or_else(current_forecast_today);
     let now_hm = custom_time.unwrap_or_else(current_hm);
 
     let five_hour_forecast = calculate_five_hour_forecast(five_hour_percent, five_hour_reset, now_hm);
@@ -1165,7 +1201,7 @@ impl Default for QuotaSnapshot {
 }
 
 impl QuotaSnapshot {
-    /// Baseline measured on 2026-09-18 (GLM 76%/75%, AGI 98%/100%, Codex 0% throttled).
+    /// Initial display until live provider data is available.
     pub fn measured_baseline() -> Self {
         let providers = vec![
             ProviderQuota::new(
@@ -1192,8 +1228,8 @@ impl QuotaSnapshot {
                 "OpenAI",
                 None,
                 None,
-                Some(0),
-                Some("23.09. (19:00)".into()),
+                None,
+                None,
             ),
             ProviderQuota::new(
                 ProviderId::Claude,
@@ -1385,6 +1421,146 @@ pub fn update_snapshot_with_glm_json(snapshot: &mut QuotaSnapshot, json_str: &st
 }
 
 #[cfg(windows)]
+fn utc_epoch_to_local_parts(
+    epoch: i64,
+    time_zone_information: Option<&WinTimeZoneInformation>,
+) -> Option<(u32, u32, u32, u32, u32)> {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+
+    let days = epoch.div_euclid(86_400);
+    let day_seconds = epoch.rem_euclid(86_400);
+    let (year, month, day) = days_to_ymd(days);
+    let universal_time = SYSTEMTIME {
+        wYear: u16::try_from(year).ok()?,
+        wMonth: month as u16,
+        wDayOfWeek: 0,
+        wDay: day as u16,
+        wHour: (day_seconds / 3_600) as u16,
+        wMinute: ((day_seconds % 3_600) / 60) as u16,
+        wSecond: (day_seconds % 60) as u16,
+        wMilliseconds: 0,
+    };
+    let mut local_time = SYSTEMTIME {
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    let zone_ptr = time_zone_information
+        .map_or(std::ptr::null(), |zone| zone as *const WinTimeZoneInformation);
+    let converted = unsafe {
+        SystemTimeToTzSpecificLocalTime(zone_ptr, &universal_time, &mut local_time)
+    };
+    if converted == 0 {
+        return None;
+    }
+    Some((
+        local_time.wYear as u32,
+        local_time.wMonth as u32,
+        local_time.wDay as u32,
+        local_time.wHour as u32,
+        local_time.wMinute as u32,
+    ))
+}
+
+fn format_codex_reset_local(key: &str, parts: (u32, u32, u32, u32, u32)) -> String {
+    let (_year, month, day, hour, minute) = parts;
+    if key == "five_hour" {
+        format!("{hour:02}:{minute:02}")
+    } else {
+        format!("{day:02}.{month:02}. ({hour:02}:{minute:02})")
+    }
+}
+
+#[cfg(windows)]
+fn codex_reset_epoch_to_local_with_timezone(
+    epoch: i64,
+    key: &str,
+    time_zone_information: Option<&WinTimeZoneInformation>,
+) -> String {
+    if let Some(parts) = utc_epoch_to_local_parts(epoch, time_zone_information) {
+        return format_codex_reset_local(key, parts);
+    }
+
+    // Keep a visible reset if Windows rejects an out-of-range timestamp.
+    let local_secs = epoch + local_timezone_offset_minutes() as i64 * 60;
+    let days = local_secs.div_euclid(86_400);
+    let day_seconds = local_secs.rem_euclid(86_400);
+    let (year, month, day) = days_to_ymd(days);
+    format_codex_reset_local(
+        key,
+        (
+            year as u32,
+            month,
+            day,
+            (day_seconds / 3_600) as u32,
+            ((day_seconds % 3_600) / 60) as u32,
+        ),
+    )
+}
+
+#[cfg(windows)]
+fn codex_reset_epoch_to_local(epoch: i64, key: &str) -> String {
+    codex_reset_epoch_to_local_with_timezone(epoch, key, None)
+}
+
+#[cfg(not(windows))]
+fn codex_reset_epoch_to_local(epoch: i64, key: &str) -> String {
+    // Non-Windows forecasts use UTC for both reset times and current time.
+    let days = epoch.div_euclid(86_400);
+    let day_seconds = epoch.rem_euclid(86_400);
+    let (year, month, day) = days_to_ymd(days);
+    format_codex_reset_local(
+        key,
+        (
+            year as u32,
+            month,
+            day,
+            (day_seconds / 3_600) as u32,
+            ((day_seconds % 3_600) / 60) as u32,
+        ),
+    )
+}
+
+pub fn update_snapshot_with_codex_json(snapshot: &mut QuotaSnapshot, json_str: &str) {
+    let value = serde_json::from_str::<serde_json::Value>(json_str).ok();
+    let codex = snapshot.providers.iter_mut().find(|p| p.id == ProviderId::Codex);
+    let Some(codex) = codex else { return };
+
+    // Every refresh replaces the observation. A missing or expired log must not
+    // leave a previous cycle displayed as a current throttling event.
+    codex.five_hour_percent = None;
+    codex.five_hour_reset = None;
+    codex.week_percent = None;
+    codex.week_reset = None;
+    for (key, percent, reset) in [
+        ("week", &mut codex.week_percent, &mut codex.week_reset),
+        ("five_hour", &mut codex.five_hour_percent, &mut codex.five_hour_reset),
+    ] {
+        if let Some(window) = value.as_ref().and_then(|v| v.get(key)) {
+            *percent = window.get("remaining_percent").and_then(|p| p.as_u64()).filter(|p| *p <= 100).map(|p| p as u8);
+            *reset = window
+                .get("reset_epoch")
+                .and_then(|value| value.as_i64())
+                .map(|epoch| codex_reset_epoch_to_local(epoch, key))
+                .or_else(|| {
+                    window
+                        .get("reset")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                });
+        }
+    }
+    codex.is_throttled = codex.week_percent == Some(0) || codex.five_hour_percent == Some(0);
+    snapshot.has_throttle = snapshot.providers.iter().any(|p| p.is_throttled);
+    snapshot.last_updated = Some(Instant::now());
+}
+
+#[cfg(windows)]
 pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
@@ -1426,6 +1602,21 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
         }
     }
 
+    let mut codex_cmd = Command::new("wsl.exe");
+    codex_cmd.creation_flags(CREATE_NO_WINDOW)
+        .arg("-d")
+        .arg(&distro)
+        .arg("--exec")
+        .arg("python3")
+        .arg("-c")
+        .arg(include_str!("../tools/fetch_codex_quota.py"));
+    let codex_json = codex_cmd.output().ok().filter(|output| output.status.success());
+    update_snapshot_with_codex_json(
+        &mut updated,
+        codex_json.as_ref().map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or("null"),
+    );
+
     updated
 }
 
@@ -1450,6 +1641,15 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
             update_snapshot_with_glm_json(&mut updated, &json);
         }
     }
+    let codex_json = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(include_str!("../tools/fetch_codex_quota.py"))
+        .output().ok().filter(|output| output.status.success());
+    update_snapshot_with_codex_json(
+        &mut updated,
+        codex_json.as_ref().map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or("null"),
+    );
     updated
 }
 
@@ -1461,7 +1661,7 @@ mod tests {
     fn test_quota_snapshot_baseline() {
         let snapshot = QuotaSnapshot::measured_baseline();
         assert_eq!(snapshot.providers.len(), 4);
-        assert!(snapshot.has_throttle);
+        assert!(!snapshot.has_throttle);
 
         let glm = snapshot.get(ProviderId::Glm).expect("GLM present");
         assert_eq!(glm.five_hour_percent, Some(76));
@@ -1469,10 +1669,10 @@ mod tests {
         assert!(!glm.is_throttled);
 
         let codex = snapshot.get(ProviderId::Codex).expect("Codex present");
-        assert_eq!(codex.week_percent, Some(0));
+        assert_eq!(codex.week_percent, None);
         assert_eq!(codex.five_hour_percent, None);
-        assert!(codex.is_throttled);
-        assert_eq!(codex.status_text(), "Drossel aktiv");
+        assert!(!codex.is_throttled);
+        assert_eq!(codex.week_reset, None);
 
         let claude = snapshot.get(ProviderId::Claude).expect("Claude present");
         assert_eq!(claude.week_percent, None);
@@ -1519,6 +1719,99 @@ mod tests {
         let (five_h, wk) = parse_codex_rate_limits(json).expect("valid parse");
         assert_eq!(five_h, None);
         assert_eq!(wk, Some(0));
+    }
+
+    #[test]
+    fn test_codex_live_observation_replaces_expired_cycle() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_codex_json(
+            &mut snapshot,
+            r#"{"week":{"remaining_percent":98,"reset_epoch":1790790254},"five_hour":{"remaining_percent":0,"reset_epoch":1790190000}}"#,
+        );
+        let codex = snapshot.get(ProviderId::Codex).unwrap();
+        assert_eq!(codex.week_percent, Some(98));
+        assert_eq!(codex.five_hour_percent, Some(0));
+        assert_eq!(
+            codex.week_reset,
+            Some(codex_reset_epoch_to_local(1790790254, "week"))
+        );
+        assert_eq!(
+            codex.five_hour_reset,
+            Some(codex_reset_epoch_to_local(1790190000, "five_hour"))
+        );
+        assert!(snapshot.has_throttle);
+        assert!(codex.pacing_forecast().five_hour_forecast.is_some());
+
+        update_snapshot_with_codex_json(&mut snapshot, "null");
+        let codex = snapshot.get(ProviderId::Codex).unwrap();
+        assert_eq!(codex.week_percent, None);
+        assert_eq!(codex.five_hour_percent, None);
+        assert_eq!(codex.week_reset, None);
+        assert!(!snapshot.has_throttle);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_reset_and_week_forecast_follow_the_timestamp_timezone_rules() {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+
+        let transition = |month, hour| SYSTEMTIME {
+            wYear: 0,
+            wMonth: month,
+            wDayOfWeek: 0,
+            wDay: 5,
+            wHour: hour,
+            wMinute: 0,
+            wSecond: 0,
+            wMilliseconds: 0,
+        };
+        let berlin = WinTimeZoneInformation {
+            Bias: -60,
+            StandardName: [0; 32],
+            StandardDate: transition(10, 3),
+            StandardBias: 0,
+            DaylightName: [0; 32],
+            DaylightDate: transition(3, 2),
+            DaylightBias: -60,
+        };
+
+        assert_eq!(
+            codex_reset_epoch_to_local_with_timezone(
+                1_792_891_800,
+                "five_hour",
+                Some(&berlin),
+            ),
+            "02:30"
+        );
+        assert_eq!(
+            codex_reset_epoch_to_local_with_timezone(
+                1_774_747_800,
+                "five_hour",
+                Some(&berlin),
+            ),
+            "03:30"
+        );
+
+        let local_after_utc_midnight =
+            utc_epoch_to_local_parts(1_790_116_200, Some(&berlin)).unwrap();
+        assert_eq!(local_after_utc_midnight, (2026, 9, 23, 0, 30));
+        let forecast = pacing_forecast_for(
+            false,
+            Some(98),
+            Some("30.09. (12:00)"),
+            None,
+            None,
+            Some((
+                local_after_utc_midnight.0 as i32,
+                local_after_utc_midnight.1,
+                local_after_utc_midnight.2,
+            )),
+            Some((local_after_utc_midnight.3, local_after_utc_midnight.4)),
+        );
+        assert_eq!(forecast.remaining_days, 7.0);
+
+        let (year, month, day, _, _, _) = current_local_datetime();
+        assert_eq!(current_forecast_today(), (year as i32, month, day));
     }
 
     #[test]
