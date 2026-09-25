@@ -179,7 +179,8 @@ pub struct Sampler {
 }
 
 struct CpuTemperatureSampler {
-    receiver: Receiver<CpuTemperatureUpdate>,
+    receiver: Option<Receiver<CpuTemperatureUpdate>>,
+    worker: Option<thread::Thread>,
     cached: Option<u8>,
     last_update: Option<Instant>,
 }
@@ -193,7 +194,7 @@ struct CpuTemperatureUpdate {
 impl CpuTemperatureSampler {
     fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
-        let _ = thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("herdr-cpu-temperature-sensor".to_owned())
             .spawn(move || {
                 let mut endpoints = Vec::new();
@@ -222,23 +223,32 @@ impl CpuTemperatureSampler {
                     {
                         break;
                     }
-                    thread::sleep(refresh_interval);
+                    thread::park_timeout(refresh_interval);
                 }
             });
-        Self::from_receiver(receiver)
+        Self {
+            receiver: Some(receiver),
+            worker: worker.ok().map(|handle| handle.thread().clone()),
+            cached: None,
+            last_update: None,
+        }
     }
 
     fn from_receiver(receiver: Receiver<CpuTemperatureUpdate>) -> Self {
         Self {
-            receiver,
+            receiver: Some(receiver),
+            worker: None,
             cached: None,
             last_update: None,
         }
     }
 
     fn sample(&mut self) -> Option<u8> {
+        let Some(receiver) = self.receiver.as_ref() else {
+            return None;
+        };
         loop {
-            match self.receiver.try_recv() {
+            match receiver.try_recv() {
                 Ok(update) => {
                     self.cached = update.value;
                     self.last_update = Some(update.sampled_at);
@@ -259,6 +269,15 @@ impl CpuTemperatureSampler {
             self.cached = None;
         }
         self.cached
+    }
+}
+
+impl Drop for CpuTemperatureSampler {
+    fn drop(&mut self) {
+        self.receiver.take();
+        if let Some(worker) = &self.worker {
+            worker.unpark();
+        }
     }
 }
 
@@ -990,6 +1009,45 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(sampler.sample().cpu_temperature_c, Some(72));
         drop(temperature_tx);
+    }
+
+    #[test]
+    fn dropping_cpu_temperature_sampler_wakes_worker() {
+        let (temperature_tx, temperature_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            thread::park_timeout(Duration::from_secs(30));
+            finished_tx
+                .send(
+                    temperature_tx
+                        .send(CpuTemperatureUpdate {
+                            value: Some(70),
+                            sampled_at: Instant::now(),
+                        })
+                        .is_err(),
+                )
+                .unwrap();
+        });
+        let worker_thread = worker.thread().clone();
+        let mut sampler = CpuTemperatureSampler::from_receiver(temperature_rx);
+        sampler.worker = Some(worker_thread.clone());
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(sampler);
+
+        let receiver_closed = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or(false);
+        if !receiver_closed {
+            worker_thread.unpark();
+        }
+        worker.join().unwrap();
+        assert!(
+            receiver_closed,
+            "dropping the sampler should wake and stop its worker"
+        );
     }
 
     #[test]
