@@ -4,6 +4,7 @@
 //! Herdr watcher and never participate in the shutdown decision.
 
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::mem::zeroed;
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -46,6 +47,16 @@ const LHM_CPU_TEMPERATURE_ENDPOINT_QUERY: &str = r#"
 $defaultPort = 8085
 $endpoints = [System.Collections.Generic.List[object]]::new()
 $endpointKeys = @{}
+$localAddresses = @('127.0.0.1', '::1')
+try {
+    foreach ($networkInterface in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        try {
+            foreach ($unicastAddress in $networkInterface.GetIPProperties().UnicastAddresses) {
+                $localAddresses += $unicastAddress.Address.ToString()
+            }
+        } catch { }
+    }
+} catch { }
 $addEndpoint = {
     param([string]$Address, [int]$Port)
     $key = "${Address}|${Port}"
@@ -123,14 +134,11 @@ foreach ($process in $processes) {
         foreach ($address in $addresses) { & $addEndpoint $address $port }
     } catch { }
 }
-$defaultAddresses = @('127.0.0.1')
-try {
-    foreach ($localAddress in [System.Net.Dns]::GetHostAddresses('localhost')) {
-        $defaultAddresses += $localAddress.ToString()
-    }
-} catch { }
-foreach ($address in $defaultAddresses) { & $addEndpoint $address $defaultPort }
-[Console]::Out.Write((ConvertTo-Json -InputObject ([object[]]$endpoints.ToArray()) -Compress -Depth 2))
+foreach ($address in @('127.0.0.1', '::1')) { & $addEndpoint $address $defaultPort }
+[Console]::Out.Write((ConvertTo-Json -InputObject ([pscustomobject]@{
+    endpoints = [object[]]$endpoints.ToArray()
+    localAddresses = [string[]]$localAddresses
+}) -Compress -Depth 3))
 "#;
 
 use windows_sys::Win32::Foundation::{BOOL, FILETIME};
@@ -556,13 +564,44 @@ fn discover_lhm_endpoints() -> Option<Vec<LhmEndpoint>> {
         LHM_CPU_TEMPERATURE_ENDPOINT_QUERY,
         CPU_TEMPERATURE_PROCESS_TIMEOUT,
     )?;
-    serde_json::from_slice(&output).ok()
+    let discovery: LhmEndpointDiscovery = serde_json::from_slice(&output).ok()?;
+    let local_addresses = discovery
+        .local_addresses
+        .into_iter()
+        .filter_map(|address| address.parse::<IpAddr>().ok())
+        .collect::<HashSet<_>>();
+    Some(retain_local_lhm_endpoints(
+        discovery.endpoints,
+        &local_addresses,
+    ))
+}
+
+#[derive(Deserialize)]
+struct LhmEndpointDiscovery {
+    endpoints: Vec<LhmEndpoint>,
+    #[serde(rename = "localAddresses")]
+    local_addresses: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct LhmEndpoint {
     address: String,
     port: u16,
+}
+
+fn retain_local_lhm_endpoints(
+    endpoints: Vec<LhmEndpoint>,
+    local_addresses: &HashSet<IpAddr>,
+) -> Vec<LhmEndpoint> {
+    endpoints
+        .into_iter()
+        .filter(|endpoint| {
+            endpoint
+                .address
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback() || local_addresses.contains(&address))
+        })
+        .collect()
 }
 
 fn run_powershell_query(script: &str, timeout: Duration) -> Option<Vec<u8>> {
@@ -967,6 +1006,38 @@ mod tests {
 
         payload["Children"][2]["RawValue"] = serde_json::json!("46,9 °C");
         assert_eq!(cpu_temperature_from_lhm_json(&payload), Some(47));
+    }
+
+    #[test]
+    fn lhm_endpoint_discovery_rejects_addresses_outside_local_interfaces() {
+        let local_address = IpAddr::from([192, 168, 1, 24]);
+        let discovery: LhmEndpointDiscovery = serde_json::from_value(serde_json::json!({
+            "endpoints": [
+                { "address": "127.0.0.1", "port": 8085 },
+                { "address": "::1", "port": 8085 },
+                { "address": local_address.to_string(), "port": 8085 },
+                { "address": "192.0.2.44", "port": 8085 },
+                { "address": "0.0.0.0", "port": 8085 },
+                { "address": "::", "port": 8085 }
+            ],
+            "localAddresses": [local_address.to_string()]
+        }))
+        .unwrap();
+        let local_addresses = discovery
+            .local_addresses
+            .into_iter()
+            .filter_map(|address| address.parse::<IpAddr>().ok())
+            .collect::<HashSet<_>>();
+
+        let retained = retain_local_lhm_endpoints(discovery.endpoints, &local_addresses);
+
+        assert_eq!(
+            retained
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .collect::<Vec<_>>(),
+            ["127.0.0.1", "::1", "192.168.1.24"]
+        );
     }
 
     #[test]

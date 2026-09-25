@@ -1665,10 +1665,7 @@ impl LiveStatusApp {
         let (quota_tx, quota_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut sampler = system_metrics::Sampler::new();
-            loop {
-                let _ = metrics_tx.send(sampler.sample());
-                thread::sleep(Duration::from_secs(2));
-            }
+            run_system_metrics_sampling_loop(metrics_tx, || sampler.sample(), thread::sleep);
         });
         Self {
             language: Language::current(),
@@ -2110,6 +2107,19 @@ impl LiveStatusApp {
                         });
                 });
         }
+    }
+}
+
+fn run_system_metrics_sampling_loop(
+    metrics_tx: Sender<SystemMetrics>,
+    mut sample: impl FnMut() -> SystemMetrics,
+    mut wait: impl FnMut(Duration),
+) {
+    loop {
+        if metrics_tx.send(sample()).is_err() {
+            break;
+        }
+        wait(Duration::from_secs(2));
     }
 }
 
@@ -8426,6 +8436,26 @@ mod tests {
     #[test]
     fn window_control_hood_is_fully_opaque() {
         assert_eq!(WINDOW_CONTROL_HOOD_FILL.to_array()[3], u8::MAX);
+    }
+
+    #[test]
+    fn system_metrics_sampling_stops_when_receiver_is_dropped() {
+        let (metrics_tx, metrics_rx) = mpsc::channel();
+        drop(metrics_rx);
+        let mut sample_count = 0;
+        let mut wait_count = 0;
+
+        run_system_metrics_sampling_loop(
+            metrics_tx,
+            || {
+                sample_count += 1;
+                SystemMetrics::default()
+            },
+            |_| wait_count += 1,
+        );
+
+        assert_eq!(sample_count, 1);
+        assert_eq!(wait_count, 0);
     }
 
     #[test]
