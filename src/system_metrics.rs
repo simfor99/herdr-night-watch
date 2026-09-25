@@ -3,14 +3,118 @@
 //! These values are informational only. They are deliberately kept outside the
 //! Herdr watcher and never participate in the shutdown decision.
 
+use serde::Deserialize;
+use std::io::{Read, Write};
 use std::mem::zeroed;
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::os::windows::process::CommandExt;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::ptr::null_mut;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const NVIDIA_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const CPU_TEMPERATURE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const CPU_TEMPERATURE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const CPU_TEMPERATURE_STALE_AFTER: Duration = Duration::from_secs(30);
+const CPU_TEMPERATURE_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+const CPU_TEMPERATURE_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+const CPU_TEMPERATURE_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CPU_TEMPERATURE_MAX_ENDPOINT_OUTPUT_BYTES: usize = 64 * 1024;
+const CPU_TEMPERATURE_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const CPU_TEMPERATURE_MAX_RESPONSE_HEADERS_BYTES: usize = 16 * 1024;
+const LHM_CPU_TEMPERATURE_ENDPOINT_QUERY: &str = r#"
+$defaultPort = 8085
+$endpoints = [System.Collections.Generic.List[object]]::new()
+$endpointKeys = @{}
+$addEndpoint = {
+    param([string]$Address, [int]$Port)
+    $key = "${Address}|${Port}"
+    if (-not $endpointKeys.ContainsKey($key)) {
+        $endpointKeys[$key] = $true
+        [void]$endpoints.Add([pscustomobject]@{ address = $Address; port = $Port })
+    }
+}
+$processes = @(Get-Process -Name 'LibreHardwareMonitor' -ErrorAction SilentlyContinue)
+if ($processes.Count -eq 0) { exit 1 }
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class HerdrNightWatchProcessImagePath {
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
+
+    [DllImport("kernel32.dll", EntryPoint = "QueryFullProcessImageNameW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    private static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder imageName, ref uint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static string GetPath(uint processId) {
+        IntPtr handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+        if (handle == IntPtr.Zero) return null;
+
+        try {
+            var imageName = new StringBuilder(32768);
+            uint size = (uint)imageName.Capacity;
+            return QueryFullProcessImageName(handle, 0, imageName, ref size) ? imageName.ToString() : null;
+        } finally {
+            CloseHandle(handle);
+        }
+    }
+}
+'@ -ErrorAction Stop
+} catch { }
+
+foreach ($process in $processes) {
+    try {
+        $processPath = [HerdrNightWatchProcessImagePath]::GetPath([uint32]$process.Id)
+        if ([string]::IsNullOrWhiteSpace($processPath)) { continue }
+
+        $configPath = [System.IO.Path]::ChangeExtension($processPath, '.config')
+        if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { continue }
+
+        [xml]$config = [System.IO.File]::ReadAllText($configPath)
+        $portSetting = $config.SelectSingleNode("/configuration/appSettings/add[@key='listenerPort']")
+        $port = $defaultPort
+        $configuredPort = 0
+        if ($null -ne $portSetting -and [int]::TryParse($portSetting.GetAttribute('value'), [ref]$configuredPort) -and $configuredPort -gt 0 -and $configuredPort -le 65535) {
+            $port = $configuredPort
+        }
+
+        $addresses = @('127.0.0.1')
+        try {
+            foreach ($localAddress in [System.Net.Dns]::GetHostAddresses('localhost')) {
+                $addresses += $localAddress.ToString()
+            }
+        } catch { }
+        $addressSetting = $config.SelectSingleNode("/configuration/appSettings/add[@key='listenerIp']")
+        if ($null -ne $addressSetting) {
+            $configuredAddress = $null
+            $addressText = $addressSetting.GetAttribute('value')
+            if ([System.Net.IPAddress]::TryParse($addressText, [ref]$configuredAddress) -and $configuredAddress.ToString() -notin @('0.0.0.0', '::')) {
+                $addresses = @($configuredAddress.ToString()) + $addresses
+            }
+        }
+        foreach ($address in $addresses) { & $addEndpoint $address $port }
+    } catch { }
+}
+$defaultAddresses = @('127.0.0.1')
+try {
+    foreach ($localAddress in [System.Net.Dns]::GetHostAddresses('localhost')) {
+        $defaultAddresses += $localAddress.ToString()
+    }
+} catch { }
+foreach ($address in $defaultAddresses) { & $addEndpoint $address $defaultPort }
+[Console]::Out.Write((ConvertTo-Json -InputObject ([object[]]$endpoints.ToArray()) -Compress -Depth 2))
+"#;
 
 use windows_sys::Win32::Foundation::{BOOL, FILETIME};
 use windows_sys::Win32::System::Performance::{
@@ -27,6 +131,8 @@ pub struct SystemMetrics {
     pub gpu_percent: Option<u8>,
     pub vram_percent: Option<u8>,
     pub ram_percent: Option<u8>,
+    pub cpu_temperature_c: Option<u8>,
+    pub gpu_temperature_c: Option<u8>,
     pub gpu_watts: Option<u16>,
     pub gpu_power_percent: Option<u8>,
 }
@@ -44,6 +150,93 @@ pub struct Sampler {
     nvidia_available: bool,
     nvidia_last_read: Option<Instant>,
     nvidia_cached: Option<NvidiaTelemetry>,
+    cpu_temperature: CpuTemperatureSampler,
+}
+
+struct CpuTemperatureSampler {
+    receiver: Receiver<CpuTemperatureUpdate>,
+    cached: Option<u8>,
+    last_update: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+struct CpuTemperatureUpdate {
+    value: Option<u8>,
+    sampled_at: Instant,
+}
+
+impl CpuTemperatureSampler {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let _ = thread::Builder::new()
+            .name("herdr-cpu-temperature-sensor".to_owned())
+            .spawn(move || {
+                let mut endpoints = Vec::new();
+                loop {
+                    if endpoints.is_empty() {
+                        endpoints = discover_lhm_endpoints().unwrap_or_default();
+                    }
+                    let sampled_at = Instant::now();
+                    let value = if endpoints.is_empty() {
+                        None
+                    } else {
+                        match read_cpu_temperature_from_lhm(&endpoints) {
+                            Ok(value) => value,
+                            Err(()) => {
+                                endpoints.clear();
+                                None
+                            }
+                        }
+                    };
+                    let refresh_interval = if value.is_some() {
+                        CPU_TEMPERATURE_REFRESH_INTERVAL
+                    } else {
+                        CPU_TEMPERATURE_RETRY_INTERVAL
+                    };
+                    if sender
+                        .send(CpuTemperatureUpdate { value, sampled_at })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    thread::sleep(refresh_interval);
+                }
+            });
+        Self::from_receiver(receiver)
+    }
+
+    fn from_receiver(receiver: Receiver<CpuTemperatureUpdate>) -> Self {
+        Self {
+            receiver,
+            cached: None,
+            last_update: None,
+        }
+    }
+
+    fn sample(&mut self) -> Option<u8> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(update) => {
+                    self.cached = update.value;
+                    self.last_update = Some(update.sampled_at);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.cached = None;
+                    self.last_update = None;
+                    return None;
+                }
+            }
+        }
+
+        if self
+            .last_update
+            .is_some_and(|last_update| last_update.elapsed() >= CPU_TEMPERATURE_STALE_AFTER)
+        {
+            self.cached = None;
+        }
+        self.cached
+    }
 }
 
 impl Sampler {
@@ -54,6 +247,7 @@ impl Sampler {
             nvidia_available: true,
             nvidia_last_read: None,
             nvidia_cached: None,
+            cpu_temperature: CpuTemperatureSampler::new(),
         }
     }
 
@@ -80,6 +274,10 @@ impl Sampler {
         self.nvidia_cached
     }
 
+    fn sample_cpu_temperature(&mut self) -> Option<u8> {
+        self.cpu_temperature.sample()
+    }
+
     pub fn sample(&mut self) -> SystemMetrics {
         let cpu_percent = sample_cpu(&mut self.cpu_previous);
         let ram_percent = sample_ram();
@@ -89,6 +287,7 @@ impl Sampler {
             .map(PdhQuery::sample)
             .unwrap_or_default();
         let nvidia = self.sample_nvidia();
+        let cpu_temperature_c = self.sample_cpu_temperature();
         let gpu_watts = nvidia.as_ref().and_then(|telemetry| telemetry.power_watts);
         let gpu_power_percent = nvidia
             .as_ref()
@@ -98,6 +297,10 @@ impl Sampler {
             gpu_percent,
             vram_percent: nvidia.as_ref().and_then(|telemetry| telemetry.vram_percent),
             ram_percent,
+            cpu_temperature_c,
+            gpu_temperature_c: nvidia
+                .as_ref()
+                .and_then(|telemetry| telemetry.temperature_c),
             gpu_watts,
             gpu_power_percent,
         }
@@ -259,6 +462,7 @@ fn percentage(value: f64) -> u8 {
 
 #[derive(Clone, Copy)]
 struct NvidiaTelemetry {
+    temperature_c: Option<u8>,
     power_watts: Option<u16>,
     power_percent: Option<u8>,
     vram_percent: Option<u8>,
@@ -268,7 +472,7 @@ fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
     let output = Command::new("nvidia-smi.exe")
         .creation_flags(CREATE_NO_WINDOW)
         .args([
-            "--query-gpu=power.draw,power.limit,memory.used,memory.total",
+            "--query-gpu=temperature.gpu,power.draw,power.limit,memory.used,memory.total",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -279,17 +483,28 @@ fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
     let mut power_watts = 0.0;
     let mut power_found = false;
     let mut power_limit_watts = 0.0;
+    let mut temperature_c = None;
     let mut vram_used_mib = 0.0;
     let mut vram_total_mib = 0.0;
     let mut found = false;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut columns = line.split(',').map(str::trim);
+        let temperature = columns.next().and_then(|value| value.parse::<f64>().ok());
         let power = columns.next().and_then(|value| value.parse::<f64>().ok());
         let power_limit = columns.next().and_then(|value| value.parse::<f64>().ok());
         let used = columns.next().and_then(|value| value.parse::<f64>().ok());
         let total = columns.next().and_then(|value| value.parse::<f64>().ok());
-        if power.is_some() || power_limit.is_some() || used.is_some() || total.is_some() {
+        if temperature.is_some()
+            || power.is_some()
+            || power_limit.is_some()
+            || used.is_some()
+            || total.is_some()
+        {
             found = true;
+        }
+        if let Some(value) = temperature {
+            let value = value.round().clamp(0.0, f64::from(u8::MAX)) as u8;
+            temperature_c = Some(temperature_c.map_or(value, |current: u8| current.max(value)));
         }
         if let Some(value) = power {
             power_watts += value.max(0.0);
@@ -313,6 +528,7 @@ fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
     let power_percent =
         (power_limit_watts > 0.0).then(|| percentage(power_watts / power_limit_watts * 100.0));
     Some(NvidiaTelemetry {
+        temperature_c,
         power_watts: power_found
             .then(|| power_watts.round().clamp(0.0, f64::from(u16::MAX)) as u16),
         power_percent,
@@ -320,6 +536,492 @@ fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
     })
 }
 
+fn discover_lhm_endpoints() -> Option<Vec<LhmEndpoint>> {
+    let output = run_powershell_query(
+        LHM_CPU_TEMPERATURE_ENDPOINT_QUERY,
+        CPU_TEMPERATURE_PROCESS_TIMEOUT,
+    )?;
+    serde_json::from_slice(&output).ok()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LhmEndpoint {
+    address: String,
+    port: u16,
+}
+
+fn run_powershell_query(script: &str, timeout: Duration) -> Option<Vec<u8>> {
+    let mut child = Command::new("powershell.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    loop {
+        if started.elapsed() >= timeout {
+            stop_child(&mut child);
+            return None;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let stdout = child.stdout.take()?;
+                let mut output = Vec::new();
+                stdout
+                    .take((CPU_TEMPERATURE_MAX_ENDPOINT_OUTPUT_BYTES + 1) as u64)
+                    .read_to_end(&mut output)
+                    .ok()?;
+                return (output.len() <= CPU_TEMPERATURE_MAX_ENDPOINT_OUTPUT_BYTES)
+                    .then_some(output);
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                thread::sleep(CPU_TEMPERATURE_PROCESS_POLL_INTERVAL.min(remaining));
+            }
+            Err(_) => {
+                stop_child(&mut child);
+                return None;
+            }
+        }
+    }
+}
+
+fn stop_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn read_cpu_temperature_from_lhm(endpoints: &[LhmEndpoint]) -> Result<Option<u8>, ()> {
+    let mut endpoint_responded = false;
+    for endpoint in endpoints {
+        let payload = match read_lhm_payload(endpoint) {
+            Ok(payload) => {
+                endpoint_responded = true;
+                payload
+            }
+            Err(_) => continue,
+        };
+        if let Some(value) = cpu_temperature_from_lhm_json(&payload) {
+            return Ok(Some(value));
+        }
+    }
+    if endpoint_responded {
+        Ok(None)
+    } else {
+        Err(())
+    }
+}
+
+fn read_lhm_payload(endpoint: &LhmEndpoint) -> Result<serde_json::Value, String> {
+    let address = endpoint
+        .address
+        .parse::<IpAddr>()
+        .map_err(|error| format!("invalid sensor address: {error}"))?;
+    let socket_address = SocketAddr::new(address, endpoint.port);
+    let deadline = Instant::now() + CPU_TEMPERATURE_HTTP_TIMEOUT;
+    let connect_timeout = deadline.saturating_duration_since(Instant::now());
+    if connect_timeout.is_zero() {
+        return Err("sensor connection deadline expired".to_owned());
+    }
+    let mut stream = TcpStream::connect_timeout(&socket_address, connect_timeout)
+        .map_err(|error| format!("sensor connection failed: {error}"))?;
+    let host = match address {
+        IpAddr::V4(value) => value.to_string(),
+        IpAddr::V6(value) => format!("[{value}]"),
+    };
+    let write_timeout = deadline.saturating_duration_since(Instant::now());
+    if write_timeout.is_zero() {
+        return Err("sensor request deadline expired".to_owned());
+    }
+    stream
+        .set_write_timeout(Some(write_timeout))
+        .map_err(|error| format!("sensor write timeout setup failed: {error}"))?;
+    write!(
+        stream,
+        "GET /data.json HTTP/1.0\r\nHost: {host}:{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        endpoint.port
+    )
+    .map_err(|error| format!("sensor request write failed: {error}"))?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("sensor response deadline expired".to_owned());
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| format!("sensor read timeout setup failed: {error}"))?;
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                if response.len().saturating_add(bytes_read) > CPU_TEMPERATURE_MAX_RESPONSE_BYTES {
+                    return Err("sensor response exceeded size limit".to_owned());
+                }
+                response.extend_from_slice(&buffer[..bytes_read]);
+                if let Some(headers) = parse_lhm_http_headers(&response)
+                    .map_err(|_| "invalid sensor response headers".to_owned())?
+                {
+                    if !headers.chunked
+                        && headers.content_length.is_some_and(|length| {
+                            response.len() >= headers.body_start.saturating_add(length)
+                        })
+                    {
+                        break;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("sensor response read failed: {error}")),
+        }
+    }
+    let body =
+        parse_lhm_http_body(&response).map_err(|_| "invalid sensor response body".to_owned())?;
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("sensor response contained invalid JSON: {error}"))
+}
+
+#[derive(Clone, Copy)]
+struct LhmHttpHeaders {
+    body_start: usize,
+    content_length: Option<usize>,
+    chunked: bool,
+}
+
+fn parse_lhm_http_headers(response: &[u8]) -> Result<Option<LhmHttpHeaders>, ()> {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        if response.len() > CPU_TEMPERATURE_MAX_RESPONSE_HEADERS_BYTES {
+            return Err(());
+        }
+        return Ok(None);
+    };
+    if header_end > CPU_TEMPERATURE_MAX_RESPONSE_HEADERS_BYTES {
+        return Err(());
+    }
+    let header_text = std::str::from_utf8(&response[..header_end]).map_err(|_| ())?;
+    let mut lines = header_text.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or(())?;
+    if status != 200 {
+        return Err(());
+    }
+    let mut content_length = None;
+    let mut chunked = false;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (name, value) = line.split_once(':').ok_or(())?;
+        if name.eq_ignore_ascii_case("content-length") {
+            let length = value.trim().parse::<usize>().map_err(|_| ())?;
+            if length > CPU_TEMPERATURE_MAX_RESPONSE_BYTES {
+                return Err(());
+            }
+            content_length = Some(length);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"));
+        }
+    }
+    Ok(Some(LhmHttpHeaders {
+        body_start: header_end + 4,
+        content_length,
+        chunked,
+    }))
+}
+
+fn parse_lhm_http_body(response: &[u8]) -> Result<Vec<u8>, ()> {
+    let headers = parse_lhm_http_headers(response)?.ok_or(())?;
+    let body = response.get(headers.body_start..).ok_or(())?;
+    if headers.chunked {
+        return decode_lhm_chunked_body(body);
+    }
+    if let Some(length) = headers.content_length {
+        return Ok(body.get(..length).ok_or(())?.to_vec());
+    }
+    Ok(body.to_vec())
+}
+
+fn decode_lhm_chunked_body(mut body: &[u8]) -> Result<Vec<u8>, ()> {
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = body
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or(())?;
+        let size = std::str::from_utf8(&body[..line_end])
+            .map_err(|_| ())?
+            .split(';')
+            .next()
+            .ok_or(())?
+            .trim();
+        let size = usize::from_str_radix(size, 16).map_err(|_| ())?;
+        body = body.get(line_end + 2..).ok_or(())?;
+        if size == 0 {
+            return Ok(decoded);
+        }
+        let chunk = body.get(..size).ok_or(())?;
+        if decoded.len().saturating_add(size) > CPU_TEMPERATURE_MAX_RESPONSE_BYTES {
+            return Err(());
+        }
+        decoded.extend_from_slice(chunk);
+        body = body.get(size..).ok_or(())?;
+        if !body.starts_with(b"\r\n") {
+            return Err(());
+        }
+        body = body.get(2..).ok_or(())?;
+    }
+}
+
+fn cpu_temperature_from_lhm_json(payload: &serde_json::Value) -> Option<u8> {
+    let mut pending: Vec<&serde_json::Value> = payload
+        .get("Children")
+        .and_then(serde_json::Value::as_array)
+        .map(|children| children.iter().collect())
+        .unwrap_or_default();
+    let mut readings = Vec::new();
+    while let Some(node) = pending.pop() {
+        let is_temperature =
+            node.get("Type").and_then(serde_json::Value::as_str) == Some("Temperature");
+        let sensor_id = node
+            .get("SensorId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if is_temperature
+            && (sensor_id.starts_with("/amdcpu/0/temperature/")
+                || sensor_id.starts_with("/intelcpu/0/temperature/"))
+        {
+            if let Some(value) = node.get("RawValue").and_then(parse_lhm_temperature_value) {
+                let name = node
+                    .get("Text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                readings.push((name, value));
+            }
+        }
+        if let Some(children) = node.get("Children").and_then(serde_json::Value::as_array) {
+            pending.extend(children.iter());
+        }
+    }
+
+    let preferred = readings.iter().find(|(name, _)| {
+        let name = name.to_ascii_lowercase();
+        name.contains("tctl/tdie") || name.contains("cpu package")
+    });
+    let selected = preferred.or_else(|| {
+        readings
+            .iter()
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+    });
+    selected.map(|(_, value)| value.round().clamp(0.0, f64::from(u8::MAX)) as u8)
+}
+
+fn parse_lhm_temperature_value(raw_value: &serde_json::Value) -> Option<f64> {
+    let value = if let Some(value) = raw_value.as_f64() {
+        value
+    } else {
+        let raw_text = raw_value.as_str()?.trim();
+        let suffix_start = raw_text.len().checked_sub("°C".len());
+        let raw_text = suffix_start
+            .and_then(|index| raw_text.get(index..).map(|suffix| (index, suffix)))
+            .filter(|(_, suffix)| suffix.eq_ignore_ascii_case("°C"))
+            .map_or(raw_text, |(index, _)| raw_text[..index].trim_end());
+        raw_text.parse::<f64>().ok()?
+    };
+    value.is_finite().then_some(value)
+}
+
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn blocked_temperature_worker_does_not_block_metric_sampling() {
+        let (temperature_tx, temperature_rx) = mpsc::channel();
+        let worker_temperature_tx = temperature_tx.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            worker_temperature_tx
+                .send(CpuTemperatureUpdate {
+                    value: Some(72),
+                    sampled_at: Instant::now(),
+                })
+                .unwrap();
+        });
+        let mut sampler = Sampler {
+            cpu_previous: None,
+            query: None,
+            nvidia_available: false,
+            nvidia_last_read: None,
+            nvidia_cached: None,
+            cpu_temperature: CpuTemperatureSampler::from_receiver(temperature_rx),
+        };
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        assert_eq!(sampler.sample().cpu_temperature_c, None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(sampler.sample().cpu_temperature_c, Some(72));
+        drop(temperature_tx);
+    }
+
+    #[test]
+    fn unavailable_and_stale_temperatures_are_not_reported() {
+        let (temperature_tx, temperature_rx) = mpsc::channel();
+        let mut sampler = CpuTemperatureSampler::from_receiver(temperature_rx);
+
+        temperature_tx
+            .send(CpuTemperatureUpdate {
+                value: Some(68),
+                sampled_at: Instant::now(),
+            })
+            .unwrap();
+        assert_eq!(sampler.sample(), Some(68));
+
+        temperature_tx
+            .send(CpuTemperatureUpdate {
+                value: None,
+                sampled_at: Instant::now(),
+            })
+            .unwrap();
+        assert_eq!(sampler.sample(), None);
+
+        temperature_tx
+            .send(CpuTemperatureUpdate {
+                value: Some(69),
+                sampled_at: Instant::now() - CPU_TEMPERATURE_STALE_AFTER - Duration::from_millis(1),
+            })
+            .unwrap();
+        assert_eq!(sampler.sample(), None);
+    }
+
+    #[test]
+    fn cpu_temperature_parser_prefers_cpu_package_and_ignores_gpu_sensors() {
+        let payload = serde_json::json!({
+            "Children": [
+                {
+                    "Type": "Temperature",
+                    "SensorId": "/amdcpu/0/temperature/0",
+                    "Text": "CPU Core",
+                    "RawValue": 88.0,
+                    "Children": []
+                },
+                {
+                    "Type": "Temperature",
+                    "SensorId": "/gpu/0/temperature/0",
+                    "Text": "GPU",
+                    "RawValue": 96.0,
+                    "Children": []
+                },
+                {
+                    "Type": "Temperature",
+                    "SensorId": "/amdcpu/0/temperature/1",
+                    "Text": "Tctl/Tdie",
+                    "RawValue": "46.9 °C",
+                    "Children": []
+                }
+            ]
+        });
+
+        assert_eq!(cpu_temperature_from_lhm_json(&payload), Some(47));
+    }
+
+    #[test]
+    fn direct_http_query_reads_lhm_temperature_json() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let payload = serde_json::json!({
+            "Children": [{
+                "Type": "Temperature",
+                "SensorId": "/intelcpu/0/temperature/0",
+                "Text": "CPU Package",
+                "RawValue": 62.4,
+                "Children": []
+            }]
+        });
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut stream = loop {
+                if stop_rx.try_recv().is_ok() {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("local HTTP fixture accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let body = serde_json::to_vec(&payload).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let endpoint = LhmEndpoint {
+            address: "127.0.0.1".to_owned(),
+            port,
+        };
+        let result = read_lhm_payload(&endpoint);
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+        let payload = result.unwrap_or_else(|error| panic!("direct HTTP query failed: {error}"));
+        assert_eq!(cpu_temperature_from_lhm_json(&payload), Some(62));
+    }
+
+    #[test]
+    fn powershell_query_timeout_kills_and_reaps_the_child() {
+        let availability = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSVersion.Major",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        assert!(
+            availability.is_ok(),
+            "Windows PowerShell is required for the sensor query"
+        );
+
+        let started = Instant::now();
+        let result = run_powershell_query("Start-Sleep -Seconds 30", Duration::from_millis(100));
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(15));
+    }
 }

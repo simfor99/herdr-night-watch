@@ -5570,59 +5570,71 @@ fn glowing_metric_text(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Co
 
 fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Language) -> f32 {
     let available = ui.available_width();
-    let spacing = 7.0;
-    let item_width = ((available - spacing * 4.0) / 5.0).max(52.0);
-    let power_value = metrics.gpu_watts.map(|value| format!("{value:>3}W"));
+    let spacing = 10.0;
+    let cpu_value = metrics.cpu_percent.map(|value| format!("{value}%"));
+    let ram_value = metrics.ram_percent.map(|value| format!("{value}%"));
+    let gpu_value = metrics.gpu_percent.map(|value| format!("{value}%"));
+    let vram_value = metrics.vram_percent.map(|value| format!("{value}%"));
+    let power_value = metrics.gpu_watts.map(|value| format!("{value}W"));
+    let desired_widths = system_metric_badge_widths(ui, metrics);
+    let spare_width = (available - spacing * 4.0 - desired_widths.iter().sum::<f32>()).max(0.0)
+        / desired_widths.len() as f32;
+    let item_widths = desired_widths.map(|width| width + spare_width);
     let old_spacing = ui.spacing().item_spacing.x;
     ui.spacing_mut().item_spacing.x = spacing;
     let power_rect = ui
         .horizontal(|ui| {
             system_metric_badge(
                 ui,
-                item_width,
+                item_widths[0],
                 MetricIcon::Cpu,
                 "CPU",
-                metrics.cpu_percent.map(|value| format!("{value:>2}%")),
+                cpu_value,
+                metrics.cpu_temperature_c,
                 metric_color(metrics.cpu_percent),
                 language,
                 false,
             );
             system_metric_badge(
                 ui,
-                item_width,
+                item_widths[1],
                 MetricIcon::Ram,
                 "RAM",
-                metrics.ram_percent.map(|value| format!("{value:>2}%")),
+                ram_value,
+                None,
                 metric_color(metrics.ram_percent),
                 language,
                 false,
             );
             system_metric_badge(
                 ui,
-                item_width,
+                item_widths[2],
                 MetricIcon::Gpu,
                 "GPU",
-                metrics.gpu_percent.map(|value| format!("{value:>2}%")),
+                gpu_value,
+                metrics.gpu_temperature_c,
                 metric_color(metrics.gpu_percent),
                 language,
                 false,
             );
             system_metric_badge(
                 ui,
-                item_width,
+                item_widths[3],
                 MetricIcon::Vram,
                 "VRAM",
-                metrics.vram_percent.map(|value| format!("{value:>2}%")),
+                vram_value,
+                None,
                 metric_color(metrics.vram_percent),
                 language,
                 false,
             );
             system_metric_badge(
                 ui,
-                item_width,
+                item_widths[4],
                 MetricIcon::Power,
                 "",
                 power_value.clone(),
+                None,
                 metric_color(metrics.gpu_power_percent),
                 language,
                 true,
@@ -5641,6 +5653,97 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Langu
         .size()
         .x;
     power_rect.center().x - 5.0 + power_text_width / 2.0
+}
+
+fn system_metric_badge_widths(ui: &egui::Ui, metrics: SystemMetrics) -> [f32; 5] {
+    // Reserve the sampler's bounded value ranges so sensor updates cannot move later badges.
+    const MAX_PERCENT_VALUE: &str = "100%";
+    const MAX_TEMPERATURE_C: u8 = u8::MAX;
+    const MAX_POWER_VALUE: &str = "65535W";
+    [
+        system_metric_badge_width(
+            ui,
+            "CPU",
+            Some(MAX_PERCENT_VALUE),
+            Some(MAX_TEMPERATURE_C),
+            metric_color(metrics.cpu_percent),
+            false,
+        ),
+        system_metric_badge_width(
+            ui,
+            "RAM",
+            Some(MAX_PERCENT_VALUE),
+            None,
+            metric_color(metrics.ram_percent),
+            false,
+        ),
+        system_metric_badge_width(
+            ui,
+            "GPU",
+            Some(MAX_PERCENT_VALUE),
+            Some(MAX_TEMPERATURE_C),
+            metric_color(metrics.gpu_percent),
+            false,
+        ),
+        system_metric_badge_width(
+            ui,
+            "VRAM",
+            Some(MAX_PERCENT_VALUE),
+            None,
+            metric_color(metrics.vram_percent),
+            false,
+        ),
+        system_metric_badge_width(
+            ui,
+            "",
+            Some(MAX_POWER_VALUE),
+            None,
+            metric_color(metrics.gpu_power_percent),
+            true,
+        ),
+    ]
+}
+
+fn system_metric_badge_width(
+    ui: &egui::Ui,
+    label: &str,
+    value: Option<&str>,
+    temperature_c: Option<u8>,
+    color: egui::Color32,
+    center_content: bool,
+) -> f32 {
+    let text = system_metric_display_text(label, value, temperature_c);
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(text, egui::FontId::proportional(11.0), color)
+        .size()
+        .x;
+
+    if center_content {
+        text_width + 38.0
+    } else {
+        // Keep a clear 6-point gap before the next metric icon with the 10-point row spacing.
+        text_width + 10.0
+    }
+}
+
+fn system_metric_display_text(
+    label: &str,
+    value: Option<&str>,
+    temperature_c: Option<u8>,
+) -> String {
+    let value = match (value, temperature_c) {
+        (Some(value), Some(temperature)) => format!("{value} · {temperature}°"),
+        (Some(value), None) => value.to_owned(),
+        (None, Some(temperature)) => format!("— · {temperature}°"),
+        (None, None) => "—".into(),
+    };
+
+    if label.is_empty() {
+        value
+    } else {
+        format!("{label} {value}")
+    }
 }
 
 fn media_info_row(
@@ -7995,54 +8098,60 @@ fn system_metric_badge(
     icon: MetricIcon,
     label: &str,
     value: Option<String>,
+    temperature_c: Option<u8>,
     color: egui::Color32,
     language: Language,
     center_content: bool,
 ) -> egui::Rect {
-    let tooltip = match value.as_deref() {
-        Some(value) if matches!(icon, MetricIcon::Vram) => {
+    let tooltip = match (value.as_deref(), temperature_c) {
+        (value, Some(temperature)) => {
+            let utilization =
+                value.unwrap_or_else(|| language.text("nicht verfügbar", "unavailable"));
+            format!(
+                "{label} {}: {utilization}\n{label} {}: {temperature}°C",
+                language.text("Auslastung", "utilization"),
+                language.text("Temperatur", "temperature")
+            )
+        }
+        (Some(value), None) if matches!(icon, MetricIcon::Vram) => {
             format!(
                 "{}{}",
                 language.text("VRAM-Auslastung: ", "VRAM utilization: "),
                 value
             )
         }
-        Some(value) if label.is_empty() => {
+        (Some(value), None) if label.is_empty() => {
             format!(
                 "{}{}",
                 language.text("Grafikkartenverbrauch: ", "GPU power draw: "),
                 value
             )
         }
-        Some(value) => format!(
+        (Some(value), None) => format!(
             "{label} {}: {value}",
             language.text("Auslastung", "utilization")
         ),
-        None if matches!(icon, MetricIcon::Vram) => language
+        (None, None) if matches!(icon, MetricIcon::Vram) => language
             .text(
                 "VRAM-Wert ist momentan nicht verfügbar.",
                 "VRAM value is currently unavailable.",
             )
             .into(),
-        None if label.is_empty() => language
+        (None, None) if label.is_empty() => language
             .text(
                 "Grafikkartenverbrauch ist für diese Hardware nicht verfügbar.",
                 "GPU power draw is unavailable on this hardware.",
             )
             .into(),
-        None => format!(
+        (None, None) => format!(
             "{label} {}",
             language.text("ist momentan nicht verfügbar.", "is currently unavailable.")
         ),
     };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
-    let has_value = value.is_some();
-    let value = value.unwrap_or_else(|| "—".into());
-    let text = if label.is_empty() {
-        value.clone()
-    } else {
-        format!("{label} {value}")
-    };
+    let has_value = value.is_some() || temperature_c.is_some();
+    let value = value.as_deref();
+    let text = system_metric_display_text(label, value, temperature_c);
     let text_width = ui
         .painter()
         .layout_no_wrap(
@@ -8226,6 +8335,55 @@ mod tests {
     #[test]
     fn window_control_hood_is_fully_opaque() {
         assert_eq!(WINDOW_CONTROL_HOOD_FILL.to_array()[3], u8::MAX);
+    }
+
+    #[test]
+    fn system_metric_column_widths_stay_fixed_across_sensor_updates() {
+        let context = egui::Context::default();
+        let maximum = SystemMetrics {
+            cpu_percent: Some(100),
+            gpu_percent: Some(100),
+            vram_percent: Some(100),
+            ram_percent: Some(100),
+            cpu_temperature_c: Some(u8::MAX),
+            gpu_temperature_c: Some(u8::MAX),
+            gpu_watts: Some(u16::MAX),
+            gpu_power_percent: Some(100),
+        };
+        let mut measured_widths = None;
+
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let unavailable_widths = system_metric_badge_widths(ui, SystemMetrics::default());
+            let maximum_widths = system_metric_badge_widths(ui, maximum);
+            let text_width = |label: &str, value: Option<&str>, temperature: Option<u8>| {
+                ui.painter()
+                    .layout_no_wrap(
+                        system_metric_display_text(label, value, temperature),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+            };
+            let maximum_text_widths = [
+                text_width("CPU", Some("100%"), Some(u8::MAX)) + 10.0,
+                text_width("RAM", Some("100%"), None) + 10.0,
+                text_width("GPU", Some("100%"), Some(u8::MAX)) + 10.0,
+                text_width("VRAM", Some("100%"), None) + 10.0,
+                text_width("", Some(&format!("{}W", u16::MAX)), None) + 38.0,
+            ];
+            assert!(
+                unavailable_widths
+                    .iter()
+                    .zip(maximum_text_widths)
+                    .all(|(reserved, actual)| reserved >= &actual),
+                "metric columns must fit their full formatted value ranges"
+            );
+            measured_widths = Some((unavailable_widths, maximum_widths));
+        });
+
+        let (unavailable, maximum) = measured_widths.expect("metric widths were measured");
+        assert_eq!(unavailable, maximum);
     }
 
     fn assert_fixture_output(output: std::process::Output, fixture: &str) {
