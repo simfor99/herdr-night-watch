@@ -613,30 +613,78 @@ fn run_powershell_query(script: &str, timeout: Duration) -> Option<Vec<u8>> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    read_child_stdout_with_timeout(
+        &mut child,
+        timeout,
+        CPU_TEMPERATURE_MAX_ENDPOINT_OUTPUT_BYTES,
+    )
+}
+
+fn read_child_stdout_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+    maximum_output_bytes: usize,
+) -> Option<Vec<u8>> {
+    let Some(stdout) = child.stdout.take() else {
+        stop_child(child);
+        return None;
+    };
+    let (output_tx, output_rx) = mpsc::sync_channel(1);
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout
+            .take(maximum_output_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut output);
+        let _ = output_tx.send(result.map(|_| output));
+    });
+    let mut captured_output = None;
     let started = Instant::now();
     loop {
+        match output_rx.try_recv() {
+            Ok(Ok(output)) if output.len() > maximum_output_bytes => {
+                stop_child(child);
+                let _ = stdout_reader.join();
+                return None;
+            }
+            Ok(Ok(output)) => captured_output = Some(output),
+            Ok(Err(_)) => {
+                stop_child(child);
+                let _ = stdout_reader.join();
+                return None;
+            }
+            Err(TryRecvError::Disconnected) if captured_output.is_some() => {}
+            Err(TryRecvError::Disconnected) => {
+                stop_child(child);
+                let _ = stdout_reader.join();
+                return None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
         if started.elapsed() >= timeout {
-            stop_child(&mut child);
+            stop_child(child);
+            let _ = stdout_reader.join();
             return None;
         }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
-                let stdout = child.stdout.take()?;
-                let mut output = Vec::new();
-                stdout
-                    .take((CPU_TEMPERATURE_MAX_ENDPOINT_OUTPUT_BYTES + 1) as u64)
-                    .read_to_end(&mut output)
-                    .ok()?;
-                return (output.len() <= CPU_TEMPERATURE_MAX_ENDPOINT_OUTPUT_BYTES)
-                    .then_some(output);
+                stdout_reader.join().ok()?;
+                let output = match captured_output {
+                    Some(output) => output,
+                    None => output_rx.try_recv().ok()?.ok()?,
+                };
+                return (output.len() <= maximum_output_bytes).then_some(output);
             }
-            Ok(Some(_)) => return None,
+            Ok(Some(_)) => {
+                let _ = stdout_reader.join();
+                return None;
+            }
             Ok(None) => {
                 let remaining = timeout.saturating_sub(started.elapsed());
                 thread::sleep(CPU_TEMPERATURE_PROCESS_POLL_INTERVAL.min(remaining));
             }
             Err(_) => {
-                stop_child(&mut child);
+                stop_child(child);
+                let _ = stdout_reader.join();
                 return None;
             }
         }
@@ -1189,5 +1237,23 @@ mod tests {
         let result = run_powershell_query("Start-Sleep -Seconds 30", Duration::from_millis(100));
         assert!(result.is_none());
         assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    #[test]
+    fn powershell_query_drains_large_stdout_before_waiting_for_exit() {
+        let output = run_powershell_query("Write-Output ('x' * 60000)", Duration::from_secs(10))
+            .expect("large PowerShell stdout should be drained while the child runs");
+
+        assert!(output.len() > 32 * 1024);
+        assert!(output.len() <= CPU_TEMPERATURE_MAX_ENDPOINT_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn powershell_query_rejects_stdout_over_the_configured_limit() {
+        let started = Instant::now();
+        let result = run_powershell_query("Write-Output ('x' * 262144)", Duration::from_secs(10));
+
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
