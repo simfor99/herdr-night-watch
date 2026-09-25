@@ -5739,8 +5739,8 @@ fn system_metric_badge_width(
     if center_content {
         text_width + 38.0
     } else {
-        // Keep a clear 6-point gap before the next metric icon with the 10-point row spacing.
-        text_width + 10.0
+        // Account for the leading icon and keep all text inside its badge rectangle.
+        text_width + 18.0
     }
 }
 
@@ -5760,6 +5760,60 @@ fn system_metric_display_text(
         value
     } else {
         format!("{label} {value}")
+    }
+}
+
+fn system_metric_compact_display_text(value: Option<&str>, temperature_c: Option<u8>) -> String {
+    match (value, temperature_c) {
+        (Some(value), Some(temperature)) => format!("{value}·{temperature}°"),
+        (Some(value), None) => value.to_owned(),
+        (None, Some(temperature)) => format!("—·{temperature}°"),
+        (None, None) => "—".into(),
+    }
+}
+
+fn system_metric_badge_text_layout(
+    painter: &egui::Painter,
+    full_text: String,
+    compact_text: String,
+    color: egui::Color32,
+    available_width: f32,
+) -> (String, egui::FontId) {
+    const FONT_SIZE: f32 = 11.0;
+    const MIN_FONT_SIZE: f32 = 8.0;
+
+    let available_width = available_width.max(0.0);
+    let text_width = |text: &str, font_size: f32| {
+        painter
+            .layout_no_wrap(
+                text.to_owned(),
+                egui::FontId::proportional(font_size),
+                color,
+            )
+            .size()
+            .x
+    };
+
+    if text_width(&full_text, FONT_SIZE) <= available_width {
+        return (full_text, egui::FontId::proportional(FONT_SIZE));
+    }
+    if text_width(&compact_text, FONT_SIZE) <= available_width {
+        return (compact_text, egui::FontId::proportional(FONT_SIZE));
+    }
+
+    let compact_width = text_width(&compact_text, FONT_SIZE);
+    if compact_width > f32::EPSILON {
+        let scaled_font_size = (FONT_SIZE * available_width / compact_width).min(FONT_SIZE);
+        if scaled_font_size >= MIN_FONT_SIZE {
+            return (compact_text, egui::FontId::proportional(scaled_font_size));
+        }
+    }
+
+    let ellipsis = "…";
+    if text_width(ellipsis, FONT_SIZE) <= available_width {
+        (ellipsis.into(), egui::FontId::proportional(FONT_SIZE))
+    } else {
+        (String::new(), egui::FontId::proportional(FONT_SIZE))
     }
 }
 
@@ -8168,14 +8222,33 @@ fn system_metric_badge(
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
     let has_value = value.is_some() || temperature_c.is_some();
     let value = value.as_deref();
-    let text = system_metric_display_text(label, value, temperature_c);
-    let text_width = ui
+    let text_color = if has_value { color } else { GRAY };
+    let full_text = system_metric_display_text(label, value, temperature_c);
+    let full_text_width = ui
         .painter()
         .layout_no_wrap(
-            text.clone(),
+            full_text.clone(),
             egui::FontId::proportional(11.0),
-            if has_value { color } else { GRAY },
+            text_color,
         )
+        .size()
+        .x;
+    let center_content = center_content && width >= full_text_width + 34.0;
+    let available_text_width = if center_content {
+        width - 34.0
+    } else {
+        width - 18.0
+    };
+    let (text, font) = system_metric_badge_text_layout(
+        ui.painter(),
+        full_text,
+        system_metric_compact_display_text(value, temperature_c),
+        text_color,
+        available_text_width,
+    );
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(text.clone(), font.clone(), text_color)
         .size()
         .x;
     let text_left = if center_content {
@@ -8194,12 +8267,12 @@ fn system_metric_badge(
         egui::pos2(icon_x, rect.center().y),
         color,
     );
-    ui.painter().text(
+    ui.painter().with_clip_rect(rect).text(
         egui::pos2(text_left, rect.center().y),
         egui::Align2::LEFT_CENTER,
         text,
-        egui::FontId::proportional(11.0),
-        if has_value { color } else { GRAY },
+        font,
+        text_color,
     );
     let _ = response.on_hover_text(tooltip);
     rect
@@ -8383,10 +8456,10 @@ mod tests {
                     .x
             };
             let maximum_text_widths = [
-                text_width("CPU", Some("100%"), Some(u8::MAX)) + 10.0,
-                text_width("RAM", Some("100%"), None) + 10.0,
-                text_width("GPU", Some("100%"), Some(u8::MAX)) + 10.0,
-                text_width("VRAM", Some("100%"), None) + 10.0,
+                text_width("CPU", Some("100%"), Some(u8::MAX)) + 18.0,
+                text_width("RAM", Some("100%"), None) + 18.0,
+                text_width("GPU", Some("100%"), Some(u8::MAX)) + 18.0,
+                text_width("VRAM", Some("100%"), None) + 18.0,
                 text_width("", Some(&format!("{}W", u16::MAX)), None) + 38.0,
             ];
             assert!(
@@ -8428,6 +8501,158 @@ mod tests {
                 .all(|(actual, desired)| (actual - desired - spare_per_item).abs() < 0.0001)
         );
         assert!((wide.iter().sum::<f32>() + spacing * 4.0 - wide_available).abs() < 0.0001);
+    }
+
+    #[test]
+    fn system_metric_badge_text_stays_inside_narrow_rectangles_before_next_icon() {
+        let context = egui::Context::default();
+        let metrics = SystemMetrics {
+            cpu_percent: Some(100),
+            ram_percent: Some(100),
+            gpu_percent: Some(100),
+            vram_percent: Some(100),
+            cpu_temperature_c: Some(u8::MAX),
+            gpu_temperature_c: Some(u8::MAX),
+            gpu_watts: Some(u16::MAX),
+            gpu_power_percent: Some(100),
+        };
+        let mut badge_rects = None;
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(330.0, 40.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let spacing = 10.0;
+                let desired_widths = system_metric_badge_widths(ui, metrics);
+                let item_widths =
+                    system_metric_item_widths(ui.available_width(), desired_widths, spacing);
+                ui.spacing_mut().item_spacing.x = spacing;
+                badge_rects = Some(
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = spacing;
+                        [
+                            system_metric_badge(
+                                ui,
+                                item_widths[0],
+                                MetricIcon::Cpu,
+                                "CPU",
+                                Some("100%".into()),
+                                Some(u8::MAX),
+                                PASTEL_GREEN,
+                                Language::English,
+                                false,
+                            ),
+                            system_metric_badge(
+                                ui,
+                                item_widths[1],
+                                MetricIcon::Ram,
+                                "RAM",
+                                Some("100%".into()),
+                                None,
+                                PASTEL_GREEN,
+                                Language::English,
+                                false,
+                            ),
+                            system_metric_badge(
+                                ui,
+                                item_widths[2],
+                                MetricIcon::Gpu,
+                                "GPU",
+                                Some("100%".into()),
+                                Some(u8::MAX),
+                                PASTEL_GREEN,
+                                Language::English,
+                                false,
+                            ),
+                            system_metric_badge(
+                                ui,
+                                item_widths[3],
+                                MetricIcon::Vram,
+                                "VRAM",
+                                Some("100%".into()),
+                                None,
+                                PASTEL_GREEN,
+                                Language::English,
+                                false,
+                            ),
+                            system_metric_badge(
+                                ui,
+                                item_widths[4],
+                                MetricIcon::Power,
+                                "",
+                                Some(format!("{}W", u16::MAX)),
+                                None,
+                                PASTEL_GREEN,
+                                Language::English,
+                                true,
+                            ),
+                        ]
+                    })
+                    .inner,
+                );
+            },
+        );
+
+        let badge_rects = badge_rects.expect("metric badges were drawn");
+        let metric_text_shapes = output
+            .shapes
+            .iter()
+            .filter_map(|clipped_shape| match &clipped_shape.shape {
+                egui::Shape::Text(text_shape) if text_shape.galley.text() != "GPU" => {
+                    Some((clipped_shape, text_shape))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metric_text_shapes.len(), 5);
+
+        for (index, (clipped_shape, text_shape)) in metric_text_shapes.iter().enumerate() {
+            let text_bounds = text_shape.visual_bounding_rect();
+            let badge_rect = badge_rects[index];
+            assert!(
+                text_bounds.min.x >= badge_rect.min.x - 0.01,
+                "metric text {index} starts before its badge: {text_bounds:?} vs {badge_rect:?}"
+            );
+            assert!(
+                text_bounds.max.x <= badge_rect.max.x + 0.01,
+                "metric text {index} extends past its badge: {text_bounds:?} vs {badge_rect:?}"
+            );
+            assert!(
+                text_bounds.min.x >= clipped_shape.clip_rect.min.x - 0.01
+                    && text_bounds.max.x <= clipped_shape.clip_rect.max.x + 0.01,
+                "metric text {index} was clipped: {text_bounds:?} vs {:?}",
+                clipped_shape.clip_rect
+            );
+            if index < 4 {
+                let next_badge = badge_rects[index + 1];
+                let icon_probe = egui::Rect::from_min_max(
+                    egui::pos2(next_badge.left(), next_badge.center().y - 8.0),
+                    egui::pos2(next_badge.left() + 16.0, next_badge.center().y + 8.0),
+                );
+                let next_icon_left = output
+                    .shapes
+                    .iter()
+                    .filter_map(|clipped_shape| {
+                        if matches!(clipped_shape.shape, egui::Shape::Text(_)) {
+                            return None;
+                        }
+                        let icon_bounds = clipped_shape.shape.visual_bounding_rect();
+                        icon_bounds
+                            .intersects(icon_probe)
+                            .then_some(icon_bounds.left())
+                    })
+                    .min_by(f32::total_cmp)
+                    .expect("next badge icon shapes were drawn");
+                assert!(
+                    text_bounds.max.x < next_icon_left,
+                    "metric text {index} reaches the following icon at {next_icon_left}: {text_bounds:?}"
+                );
+            }
+        }
     }
 
     fn assert_fixture_output(output: std::process::Output, fixture: &str) {
