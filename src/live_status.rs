@@ -5577,9 +5577,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Langu
     let vram_value = metrics.vram_percent.map(|value| format!("{value}%"));
     let power_value = metrics.gpu_watts.map(|value| format!("{value}W"));
     let desired_widths = system_metric_badge_widths(ui, metrics);
-    let spare_width = (available - spacing * 4.0 - desired_widths.iter().sum::<f32>()).max(0.0)
-        / desired_widths.len() as f32;
-    let item_widths = desired_widths.map(|width| width + spare_width);
+    let item_widths = system_metric_item_widths(available, desired_widths, spacing);
     let old_spacing = ui.spacing().item_spacing.x;
     ui.spacing_mut().item_spacing.x = spacing;
     let power_rect = ui
@@ -5653,6 +5651,25 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Langu
         .size()
         .x;
     power_rect.center().x - 5.0 + power_text_width / 2.0
+}
+
+fn system_metric_item_widths(
+    available_width: f32,
+    desired_widths: [f32; 5],
+    spacing: f32,
+) -> [f32; 5] {
+    let item_count = desired_widths.len() as f32;
+    let spacing_count = (desired_widths.len() - 1) as f32;
+    let content_width = (available_width - spacing * spacing_count).max(0.0);
+    let desired_total = desired_widths.iter().sum::<f32>();
+
+    if desired_total > content_width {
+        let scale = content_width / desired_total;
+        desired_widths.map(|width| width * scale)
+    } else {
+        let spare_width = (content_width - desired_total) / item_count;
+        desired_widths.map(|width| width + spare_width)
+    }
 }
 
 fn system_metric_badge_widths(ui: &egui::Ui, metrics: SystemMetrics) -> [f32; 5] {
@@ -8384,6 +8401,33 @@ mod tests {
 
         let (unavailable, maximum) = measured_widths.expect("metric widths were measured");
         assert_eq!(unavailable, maximum);
+    }
+
+    #[test]
+    fn system_metric_item_widths_fit_narrow_rows_and_distribute_spare_width() {
+        let desired = [90.0, 60.0, 90.0, 60.0, 80.0];
+        let spacing = 10.0;
+        let narrow_available = 330.0;
+        let narrow = system_metric_item_widths(narrow_available, desired, spacing);
+        let narrow_total = narrow.iter().sum::<f32>() + spacing * 4.0;
+        let scale = narrow[0] / desired[0];
+
+        assert!(narrow_total <= narrow_available + f32::EPSILON * narrow_available);
+        for (actual, desired) in narrow.iter().zip(desired) {
+            assert!((actual / desired - scale).abs() < 0.0001);
+        }
+
+        let wide_available = 500.0;
+        let wide = system_metric_item_widths(wide_available, desired, spacing);
+        let spare_per_item =
+            (wide_available - spacing * 4.0 - desired.iter().sum::<f32>()) / desired.len() as f32;
+
+        assert!(
+            wide.iter()
+                .zip(desired)
+                .all(|(actual, desired)| (actual - desired - spare_per_item).abs() < 0.0001)
+        );
+        assert!((wide.iter().sum::<f32>() + spacing * 4.0 - wide_available).abs() < 0.0001);
     }
 
     fn assert_fixture_output(output: std::process::Output, fixture: &str) {

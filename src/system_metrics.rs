@@ -18,6 +18,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const NVIDIA_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const CPU_TEMPERATURE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const CPU_TEMPERATURE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const CPU_TEMPERATURE_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CPU_TEMPERATURE_STALE_AFTER: Duration = Duration::from_secs(30);
 const CPU_TEMPERATURE_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const CPU_TEMPERATURE_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -25,6 +26,22 @@ const CPU_TEMPERATURE_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25
 const CPU_TEMPERATURE_MAX_ENDPOINT_OUTPUT_BYTES: usize = 64 * 1024;
 const CPU_TEMPERATURE_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CPU_TEMPERATURE_MAX_RESPONSE_HEADERS_BYTES: usize = 16 * 1024;
+
+fn cpu_temperature_refresh_interval(
+    value_available: bool,
+    retry_interval: &mut Duration,
+) -> Duration {
+    if value_available {
+        *retry_interval = CPU_TEMPERATURE_RETRY_INTERVAL;
+        CPU_TEMPERATURE_REFRESH_INTERVAL
+    } else {
+        let interval = *retry_interval;
+        *retry_interval = interval
+            .saturating_mul(2)
+            .min(CPU_TEMPERATURE_MAX_RETRY_INTERVAL);
+        interval
+    }
+}
 const LHM_CPU_TEMPERATURE_ENDPOINT_QUERY: &str = r#"
 $defaultPort = 8085
 $endpoints = [System.Collections.Generic.List[object]]::new()
@@ -172,6 +189,7 @@ impl CpuTemperatureSampler {
             .name("herdr-cpu-temperature-sensor".to_owned())
             .spawn(move || {
                 let mut endpoints = Vec::new();
+                let mut retry_interval = CPU_TEMPERATURE_RETRY_INTERVAL;
                 loop {
                     if endpoints.is_empty() {
                         endpoints = discover_lhm_endpoints().unwrap_or_default();
@@ -188,11 +206,8 @@ impl CpuTemperatureSampler {
                             }
                         }
                     };
-                    let refresh_interval = if value.is_some() {
-                        CPU_TEMPERATURE_REFRESH_INTERVAL
-                    } else {
-                        CPU_TEMPERATURE_RETRY_INTERVAL
-                    };
+                    let refresh_interval =
+                        cpu_temperature_refresh_interval(value.is_some(), &mut retry_interval);
                     if sender
                         .send(CpuTemperatureUpdate { value, sampled_at })
                         .is_err()
@@ -800,7 +815,11 @@ fn cpu_temperature_from_lhm_json(payload: &serde_json::Value) -> Option<u8> {
             && (sensor_id.starts_with("/amdcpu/0/temperature/")
                 || sensor_id.starts_with("/intelcpu/0/temperature/"))
         {
-            if let Some(value) = node.get("RawValue").and_then(parse_lhm_temperature_value) {
+            let value = node
+                .get("RawValue")
+                .and_then(parse_lhm_temperature_value)
+                .or_else(|| node.get("Value").and_then(parse_lhm_temperature_value));
+            if let Some(value) = value {
                 let name = node
                     .get("Text")
                     .and_then(serde_json::Value::as_str)
@@ -836,7 +855,7 @@ fn parse_lhm_temperature_value(raw_value: &serde_json::Value) -> Option<f64> {
             .and_then(|index| raw_text.get(index..).map(|suffix| (index, suffix)))
             .filter(|(_, suffix)| suffix.eq_ignore_ascii_case("°C"))
             .map_or(raw_text, |(index, _)| raw_text[..index].trim_end());
-        raw_text.parse::<f64>().ok()?
+        raw_text.replace(',', ".").parse::<f64>().ok()?
     };
     value.is_finite().then_some(value)
 }
@@ -917,8 +936,8 @@ mod tests {
     }
 
     #[test]
-    fn cpu_temperature_parser_prefers_cpu_package_and_ignores_gpu_sensors() {
-        let payload = serde_json::json!({
+    fn cpu_temperature_parser_prefers_cpu_package_ignores_gpu_and_parses_decimal_comma() {
+        let mut payload = serde_json::json!({
             "Children": [
                 {
                     "Type": "Temperature",
@@ -945,6 +964,69 @@ mod tests {
         });
 
         assert_eq!(cpu_temperature_from_lhm_json(&payload), Some(47));
+
+        payload["Children"][2]["RawValue"] = serde_json::json!("46,9 °C");
+        assert_eq!(cpu_temperature_from_lhm_json(&payload), Some(47));
+    }
+
+    #[test]
+    fn cpu_temperature_parser_falls_back_to_display_value() {
+        let mut payload = serde_json::json!({
+            "Children": [{
+                "Type": "Temperature",
+                "SensorId": "/intelcpu/0/temperature/0",
+                "Text": "CPU Package",
+                "RawValue": "not available",
+                "Value": "51,6 °C",
+                "Children": []
+            }]
+        });
+
+        assert_eq!(cpu_temperature_from_lhm_json(&payload), Some(52));
+
+        payload["Children"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("RawValue");
+        assert_eq!(cpu_temperature_from_lhm_json(&payload), Some(52));
+    }
+
+    #[test]
+    fn cpu_temperature_retry_interval_backs_off_caps_and_resets_after_success() {
+        let mut retry_interval = CPU_TEMPERATURE_RETRY_INTERVAL;
+
+        assert_eq!(
+            cpu_temperature_refresh_interval(false, &mut retry_interval),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            cpu_temperature_refresh_interval(false, &mut retry_interval),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            cpu_temperature_refresh_interval(false, &mut retry_interval),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            cpu_temperature_refresh_interval(false, &mut retry_interval),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            cpu_temperature_refresh_interval(false, &mut retry_interval),
+            CPU_TEMPERATURE_MAX_RETRY_INTERVAL
+        );
+        assert_eq!(
+            cpu_temperature_refresh_interval(false, &mut retry_interval),
+            CPU_TEMPERATURE_MAX_RETRY_INTERVAL
+        );
+        assert_eq!(
+            cpu_temperature_refresh_interval(true, &mut retry_interval),
+            CPU_TEMPERATURE_REFRESH_INTERVAL
+        );
+        assert_eq!(
+            cpu_temperature_refresh_interval(false, &mut retry_interval),
+            CPU_TEMPERATURE_RETRY_INTERVAL
+        );
     }
 
     #[test]
@@ -979,8 +1061,21 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 256];
+            loop {
+                let bytes_read = stream.read(&mut buffer).unwrap();
+                assert_ne!(bytes_read, 0, "local HTTP request ended before its headers");
+                request.extend_from_slice(&buffer[..bytes_read]);
+                assert!(
+                    request.len() <= 1024,
+                    "local HTTP request exceeded its limit"
+                );
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(request.starts_with(b"GET /data.json HTTP/1.0\r\n"));
             let body = serde_json::to_vec(&payload).unwrap();
             write!(
                 stream,
