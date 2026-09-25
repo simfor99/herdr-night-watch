@@ -5580,7 +5580,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Langu
     let item_widths = system_metric_item_widths(available, desired_widths, spacing);
     let old_spacing = ui.spacing().item_spacing.x;
     ui.spacing_mut().item_spacing.x = spacing;
-    let power_rect = ui
+    let power_layout = ui
         .horizontal(|ui| {
             system_metric_badge(
                 ui,
@@ -5640,17 +5640,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Langu
         })
         .inner;
     ui.spacing_mut().item_spacing.x = old_spacing;
-    let power_text = power_value.unwrap_or_else(|| "—".into());
-    let power_text_width = ui
-        .painter()
-        .layout_no_wrap(
-            power_text,
-            egui::FontId::proportional(11.0),
-            metric_color(metrics.gpu_power_percent),
-        )
-        .size()
-        .x;
-    power_rect.center().x - 5.0 + power_text_width / 2.0
+    power_layout.text_right
 }
 
 fn system_metric_item_widths(
@@ -8162,6 +8152,12 @@ enum MetricIcon {
     Power,
 }
 
+#[derive(Clone, Copy)]
+struct SystemMetricBadgeLayout {
+    rect: egui::Rect,
+    text_right: f32,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn system_metric_badge(
     ui: &mut egui::Ui,
@@ -8173,7 +8169,7 @@ fn system_metric_badge(
     color: egui::Color32,
     language: Language,
     center_content: bool,
-) -> egui::Rect {
+) -> SystemMetricBadgeLayout {
     let tooltip = match (value.as_deref(), temperature_c) {
         (value, Some(temperature)) => {
             let utilization =
@@ -8267,15 +8263,20 @@ fn system_metric_badge(
         egui::pos2(icon_x, rect.center().y),
         color,
     );
-    ui.painter().with_clip_rect(rect).text(
-        egui::pos2(text_left, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        text,
-        font,
+    let text_galley = ui.painter().layout_no_wrap(text, font, text_color);
+    let text_shape = egui::epaint::TextShape::new(
+        egui::pos2(text_left, rect.center().y - text_galley.size().y / 2.0),
+        text_galley,
         text_color,
     );
+    let text_right = if text_shape.galley.is_empty() {
+        text_left
+    } else {
+        text_shape.visual_bounding_rect().right().min(rect.right())
+    };
+    ui.painter().with_clip_rect(rect).add(text_shape);
     let _ = response.on_hover_text(tooltip);
-    rect
+    SystemMetricBadgeLayout { rect, text_right }
 }
 
 fn draw_metric_icon(
@@ -8612,7 +8613,14 @@ mod tests {
 
         for (index, (clipped_shape, text_shape)) in metric_text_shapes.iter().enumerate() {
             let text_bounds = text_shape.visual_bounding_rect();
-            let badge_rect = badge_rects[index];
+            let badge_layout = badge_rects[index];
+            let badge_rect = badge_layout.rect;
+            assert!(
+                (badge_layout.text_right - text_bounds.max.x).abs() < 0.01,
+                "metric {index} reports a different text right edge than it rendered: {} vs {}",
+                badge_layout.text_right,
+                text_bounds.max.x
+            );
             assert!(
                 text_bounds.min.x >= badge_rect.min.x - 0.01,
                 "metric text {index} starts before its badge: {text_bounds:?} vs {badge_rect:?}"
@@ -8628,7 +8636,7 @@ mod tests {
                 clipped_shape.clip_rect
             );
             if index < 4 {
-                let next_badge = badge_rects[index + 1];
+                let next_badge = badge_rects[index + 1].rect;
                 let icon_probe = egui::Rect::from_min_max(
                     egui::pos2(next_badge.left(), next_badge.center().y - 8.0),
                     egui::pos2(next_badge.left() + 16.0, next_badge.center().y + 8.0),
@@ -8653,6 +8661,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn narrow_system_metrics_row_returns_rendered_power_text_right_edge() {
+        let context = egui::Context::default();
+        let metrics = SystemMetrics {
+            cpu_percent: Some(100),
+            ram_percent: Some(100),
+            gpu_percent: Some(100),
+            vram_percent: Some(100),
+            cpu_temperature_c: Some(u8::MAX),
+            gpu_temperature_c: Some(u8::MAX),
+            gpu_watts: Some(u16::MAX),
+            gpu_power_percent: Some(100),
+        };
+        let mut reported_text_right = None;
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(330.0, 40.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                reported_text_right = Some(system_metrics_row(ui, metrics, Language::English));
+            },
+        );
+
+        let reported_text_right = reported_text_right.expect("system metrics row was drawn");
+        let rendered_power_text = output
+            .shapes
+            .iter()
+            .filter_map(|clipped_shape| match &clipped_shape.shape {
+                egui::Shape::Text(text_shape) if text_shape.galley.text() != "GPU" => {
+                    Some(text_shape)
+                }
+                _ => None,
+            })
+            .last()
+            .expect("GPU power text was drawn");
+        let rendered_text_right = rendered_power_text.visual_bounding_rect().right();
+
+        assert!(
+            (reported_text_right - rendered_text_right).abs() < 0.01,
+            "media timeline endpoint must follow visible GPU power text: {reported_text_right} vs {rendered_text_right}"
+        );
     }
 
     fn assert_fixture_output(output: std::process::Output, fixture: &str) {
