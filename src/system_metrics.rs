@@ -11,12 +11,17 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::ptr::null_mut;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const NVIDIA_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const NVIDIA_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const NVIDIA_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const CPU_TEMPERATURE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const CPU_TEMPERATURE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const CPU_TEMPERATURE_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -24,6 +29,8 @@ const CPU_TEMPERATURE_STALE_AFTER: Duration = Duration::from_secs(30);
 const CPU_TEMPERATURE_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const CPU_TEMPERATURE_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const CPU_TEMPERATURE_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CPU_TEMPERATURE_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const CPU_TEMPERATURE_HTTP_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CPU_TEMPERATURE_MAX_ENDPOINT_OUTPUT_BYTES: usize = 64 * 1024;
 const CPU_TEMPERATURE_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CPU_TEMPERATURE_MAX_RESPONSE_HEADERS_BYTES: usize = 16 * 1024;
@@ -162,6 +169,49 @@ pub struct SystemMetrics {
     pub gpu_power_percent: Option<u8>,
 }
 
+pub struct CancellationToken {
+    cancelled: AtomicBool,
+    wait_lock: Mutex<()>,
+    wake: Condvar,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            wait_lock: Mutex::new(()),
+            wake: Condvar::new(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        let guard = self.wait_lock.lock().ok();
+        self.cancelled.store(true, Ordering::Release);
+        self.wake.notify_all();
+        drop(guard);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        if self.is_cancelled() {
+            return true;
+        }
+        let Ok(guard) = self.wait_lock.lock() else {
+            return self.is_cancelled();
+        };
+        if self.is_cancelled() {
+            return true;
+        }
+        let _ = self
+            .wake
+            .wait_timeout_while(guard, timeout, |_| !self.is_cancelled());
+        self.is_cancelled()
+    }
+}
+
 #[derive(Default)]
 struct CpuSample {
     idle: u64,
@@ -170,6 +220,7 @@ struct CpuSample {
 }
 
 pub struct Sampler {
+    cancellation: Arc<CancellationToken>,
     cpu_previous: Option<CpuSample>,
     query: Option<PdhQuery>,
     nvidia_available: bool,
@@ -180,7 +231,7 @@ pub struct Sampler {
 
 struct CpuTemperatureSampler {
     receiver: Option<Receiver<CpuTemperatureUpdate>>,
-    worker: Option<thread::Thread>,
+    cancelled: Option<Arc<CancellationToken>>,
     cached: Option<u8>,
     last_update: Option<Instant>,
 }
@@ -192,29 +243,32 @@ struct CpuTemperatureUpdate {
 }
 
 impl CpuTemperatureSampler {
-    fn new() -> Self {
+    fn new(cancellation: Arc<CancellationToken>) -> Self {
         let (sender, receiver) = mpsc::channel();
-        let worker = thread::Builder::new()
+        let worker_cancellation = Arc::clone(&cancellation);
+        let _ = thread::Builder::new()
             .name("herdr-cpu-temperature-sensor".to_owned())
             .spawn(move || {
-                let mut endpoints = Vec::new();
                 let mut retry_interval = CPU_TEMPERATURE_RETRY_INTERVAL;
                 loop {
-                    if endpoints.is_empty() {
-                        endpoints = discover_lhm_endpoints().unwrap_or_default();
+                    if worker_cancellation.is_cancelled() {
+                        break;
+                    }
+                    let endpoints =
+                        discover_lhm_endpoints(&worker_cancellation.cancelled).unwrap_or_default();
+                    if worker_cancellation.is_cancelled() {
+                        break;
                     }
                     let sampled_at = Instant::now();
                     let value = if endpoints.is_empty() {
                         None
                     } else {
-                        match read_cpu_temperature_from_lhm(&endpoints) {
-                            Ok(value) => value,
-                            Err(()) => {
-                                endpoints.clear();
-                                None
-                            }
-                        }
+                        read_cpu_temperature_from_lhm(&endpoints, &worker_cancellation.cancelled)
+                            .unwrap_or_default()
                     };
+                    if worker_cancellation.is_cancelled() {
+                        break;
+                    }
                     let refresh_interval =
                         cpu_temperature_refresh_interval(value.is_some(), &mut retry_interval);
                     if sender
@@ -223,30 +277,31 @@ impl CpuTemperatureSampler {
                     {
                         break;
                     }
-                    thread::park_timeout(refresh_interval);
+                    if worker_cancellation.wait_timeout(refresh_interval) {
+                        break;
+                    }
                 }
             });
         Self {
             receiver: Some(receiver),
-            worker: worker.ok().map(|handle| handle.thread().clone()),
+            cancelled: Some(cancellation),
             cached: None,
             last_update: None,
         }
     }
 
+    #[cfg(test)]
     fn from_receiver(receiver: Receiver<CpuTemperatureUpdate>) -> Self {
         Self {
             receiver: Some(receiver),
-            worker: None,
+            cancelled: None,
             cached: None,
             last_update: None,
         }
     }
 
     fn sample(&mut self) -> Option<u8> {
-        let Some(receiver) = self.receiver.as_ref() else {
-            return None;
-        };
+        let receiver = self.receiver.as_ref()?;
         loop {
             match receiver.try_recv() {
                 Ok(update) => {
@@ -274,26 +329,30 @@ impl CpuTemperatureSampler {
 
 impl Drop for CpuTemperatureSampler {
     fn drop(&mut self) {
-        self.receiver.take();
-        if let Some(worker) = &self.worker {
-            worker.unpark();
+        if let Some(cancelled) = &self.cancelled {
+            cancelled.cancel();
         }
+        self.receiver.take();
     }
 }
 
 impl Sampler {
-    pub fn new() -> Self {
+    pub fn new_with_cancellation(cancellation: Arc<CancellationToken>) -> Self {
         Self {
+            cancellation: Arc::clone(&cancellation),
             cpu_previous: None,
             query: PdhQuery::new(),
             nvidia_available: true,
             nvidia_last_read: None,
             nvidia_cached: None,
-            cpu_temperature: CpuTemperatureSampler::new(),
+            cpu_temperature: CpuTemperatureSampler::new(cancellation),
         }
     }
 
     fn sample_nvidia(&mut self) -> Option<NvidiaTelemetry> {
+        if self.cancellation.is_cancelled() {
+            return None;
+        }
         if !self.nvidia_available {
             return self.nvidia_cached;
         }
@@ -304,7 +363,7 @@ impl Sampler {
             return self.nvidia_cached;
         }
         self.nvidia_last_read = Some(Instant::now());
-        match read_nvidia_gpu_telemetry() {
+        match read_nvidia_gpu_telemetry(&self.cancellation.cancelled) {
             Some(telemetry) => {
                 self.nvidia_cached = Some(telemetry);
             }
@@ -321,6 +380,9 @@ impl Sampler {
     }
 
     pub fn sample(&mut self) -> SystemMetrics {
+        if self.cancellation.is_cancelled() {
+            return SystemMetrics::default();
+        }
         let cpu_percent = sample_cpu(&mut self.cpu_previous);
         let ram_percent = sample_ram();
         let gpu_percent = self
@@ -328,7 +390,13 @@ impl Sampler {
             .as_mut()
             .map(PdhQuery::sample)
             .unwrap_or_default();
+        if self.cancellation.is_cancelled() {
+            return SystemMetrics::default();
+        }
         let nvidia = self.sample_nvidia();
+        if self.cancellation.is_cancelled() {
+            return SystemMetrics::default();
+        }
         let cpu_temperature_c = self.sample_cpu_temperature();
         let gpu_watts = nvidia.as_ref().and_then(|telemetry| telemetry.power_watts);
         let gpu_power_percent = nvidia
@@ -510,18 +578,28 @@ struct NvidiaTelemetry {
     vram_percent: Option<u8>,
 }
 
-fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
-    let output = Command::new("nvidia-smi.exe")
+fn read_nvidia_gpu_telemetry(cancelled: &AtomicBool) -> Option<NvidiaTelemetry> {
+    let mut child = Command::new("nvidia-smi.exe")
         .creation_flags(CREATE_NO_WINDOW)
         .args([
             "--query-gpu=temperature.gpu,power.draw,power.limit,memory.used,memory.total",
             "--format=csv,noheader,nounits",
         ])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let output = read_child_stdout_with_timeout(
+        &mut child,
+        NVIDIA_QUERY_TIMEOUT,
+        NVIDIA_MAX_OUTPUT_BYTES,
+        cancelled,
+    )?;
+    parse_nvidia_gpu_telemetry(&output)
+}
+
+fn parse_nvidia_gpu_telemetry(output: &[u8]) -> Option<NvidiaTelemetry> {
     let mut power_watts = 0.0;
     let mut power_found = false;
     let mut power_limit_watts = 0.0;
@@ -529,7 +607,7 @@ fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
     let mut vram_used_mib = 0.0;
     let mut vram_total_mib = 0.0;
     let mut found = false;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in String::from_utf8_lossy(output).lines() {
         let mut columns = line.split(',').map(str::trim);
         let temperature = columns.next().and_then(|value| value.parse::<f64>().ok());
         let power = columns.next().and_then(|value| value.parse::<f64>().ok());
@@ -578,11 +656,15 @@ fn read_nvidia_gpu_telemetry() -> Option<NvidiaTelemetry> {
     })
 }
 
-fn discover_lhm_endpoints() -> Option<Vec<LhmEndpoint>> {
-    let output = run_powershell_query(
+fn discover_lhm_endpoints(cancelled: &AtomicBool) -> Option<Vec<LhmEndpoint>> {
+    let output = run_powershell_query_with_cancel(
         LHM_CPU_TEMPERATURE_ENDPOINT_QUERY,
         CPU_TEMPERATURE_PROCESS_TIMEOUT,
+        cancelled,
     )?;
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
     let discovery: LhmEndpointDiscovery = serde_json::from_slice(&output).ok()?;
     let local_addresses = discovery
         .local_addresses
@@ -623,7 +705,19 @@ fn retain_local_lhm_endpoints(
         .collect()
 }
 
+#[cfg(test)]
 fn run_powershell_query(script: &str, timeout: Duration) -> Option<Vec<u8>> {
+    run_powershell_query_with_cancel(script, timeout, &AtomicBool::new(false))
+}
+
+fn run_powershell_query_with_cancel(
+    script: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Option<Vec<u8>> {
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
     let mut child = Command::new("powershell.exe")
         .creation_flags(CREATE_NO_WINDOW)
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -636,6 +730,7 @@ fn run_powershell_query(script: &str, timeout: Duration) -> Option<Vec<u8>> {
         &mut child,
         timeout,
         CPU_TEMPERATURE_MAX_ENDPOINT_OUTPUT_BYTES,
+        cancelled,
     )
 }
 
@@ -643,6 +738,7 @@ fn read_child_stdout_with_timeout(
     child: &mut Child,
     timeout: Duration,
     maximum_output_bytes: usize,
+    cancelled: &AtomicBool,
 ) -> Option<Vec<u8>> {
     let Some(stdout) = child.stdout.take() else {
         stop_child(child);
@@ -659,6 +755,11 @@ fn read_child_stdout_with_timeout(
     let mut captured_output = None;
     let started = Instant::now();
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            stop_child(child);
+            let _ = stdout_reader.join();
+            return None;
+        }
         match output_rx.try_recv() {
             Ok(Ok(output)) if output.len() > maximum_output_bytes => {
                 stop_child(child);
@@ -715,10 +816,16 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn read_cpu_temperature_from_lhm(endpoints: &[LhmEndpoint]) -> Result<Option<u8>, ()> {
+fn read_cpu_temperature_from_lhm(
+    endpoints: &[LhmEndpoint],
+    cancelled: &AtomicBool,
+) -> Result<Option<u8>, ()> {
     let mut endpoint_responded = false;
     for endpoint in endpoints {
-        let payload = match read_lhm_payload(endpoint) {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(());
+        }
+        let payload = match read_lhm_payload_with_cancel(endpoint, cancelled) {
             Ok(payload) => {
                 endpoint_responded = true;
                 payload
@@ -736,24 +843,42 @@ fn read_cpu_temperature_from_lhm(endpoints: &[LhmEndpoint]) -> Result<Option<u8>
     }
 }
 
+#[cfg(test)]
 fn read_lhm_payload(endpoint: &LhmEndpoint) -> Result<serde_json::Value, String> {
+    read_lhm_payload_with_cancel(endpoint, &AtomicBool::new(false))
+}
+
+fn read_lhm_payload_with_cancel(
+    endpoint: &LhmEndpoint,
+    cancelled: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err("sensor request cancelled".to_owned());
+    }
     let address = endpoint
         .address
         .parse::<IpAddr>()
         .map_err(|error| format!("invalid sensor address: {error}"))?;
     let socket_address = SocketAddr::new(address, endpoint.port);
     let deadline = Instant::now() + CPU_TEMPERATURE_HTTP_TIMEOUT;
-    let connect_timeout = deadline.saturating_duration_since(Instant::now());
+    let connect_timeout = deadline
+        .saturating_duration_since(Instant::now())
+        .min(CPU_TEMPERATURE_HTTP_CONNECT_TIMEOUT);
     if connect_timeout.is_zero() {
         return Err("sensor connection deadline expired".to_owned());
     }
     let mut stream = TcpStream::connect_timeout(&socket_address, connect_timeout)
         .map_err(|error| format!("sensor connection failed: {error}"))?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err("sensor request cancelled".to_owned());
+    }
     let host = match address {
         IpAddr::V4(value) => value.to_string(),
         IpAddr::V6(value) => format!("[{value}]"),
     };
-    let write_timeout = deadline.saturating_duration_since(Instant::now());
+    let write_timeout = deadline
+        .saturating_duration_since(Instant::now())
+        .min(CPU_TEMPERATURE_HTTP_CANCEL_POLL_INTERVAL);
     if write_timeout.is_zero() {
         return Err("sensor request deadline expired".to_owned());
     }
@@ -770,12 +895,17 @@ fn read_lhm_payload(endpoint: &LhmEndpoint) -> Result<serde_json::Value, String>
     let mut response = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("sensor request cancelled".to_owned());
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("sensor response deadline expired".to_owned());
         }
         stream
-            .set_read_timeout(Some(remaining))
+            .set_read_timeout(Some(
+                remaining.min(CPU_TEMPERATURE_HTTP_CANCEL_POLL_INTERVAL),
+            ))
             .map_err(|error| format!("sensor read timeout setup failed: {error}"))?;
         match stream.read(&mut buffer) {
             Ok(0) => break,
@@ -786,17 +916,24 @@ fn read_lhm_payload(endpoint: &LhmEndpoint) -> Result<serde_json::Value, String>
                 response.extend_from_slice(&buffer[..bytes_read]);
                 if let Some(headers) = parse_lhm_http_headers(&response)
                     .map_err(|_| "invalid sensor response headers".to_owned())?
+                    && !headers.chunked
+                    && headers.content_length.is_some_and(|length| {
+                        response.len() >= headers.body_start.saturating_add(length)
+                    })
                 {
-                    if !headers.chunked
-                        && headers.content_length.is_some_and(|length| {
-                            response.len() >= headers.body_start.saturating_add(length)
-                        })
-                    {
-                        break;
-                    }
+                    break;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
             Err(error) => return Err(format!("sensor response read failed: {error}")),
         }
     }
@@ -976,6 +1113,17 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
+    fn nvidia_gpu_telemetry_extracts_temperature_power_and_vram_usage() {
+        let telemetry = parse_nvidia_gpu_telemetry(b"46, 115.5, 250.0, 4096, 8192\n")
+            .expect("nvidia-smi output should contain telemetry");
+
+        assert_eq!(telemetry.temperature_c, Some(46));
+        assert_eq!(telemetry.power_watts, Some(116));
+        assert_eq!(telemetry.power_percent, Some(46));
+        assert_eq!(telemetry.vram_percent, Some(50));
+    }
+
+    #[test]
     fn blocked_temperature_worker_does_not_block_metric_sampling() {
         let (temperature_tx, temperature_rx) = mpsc::channel();
         let worker_temperature_tx = temperature_tx.clone();
@@ -992,6 +1140,7 @@ mod tests {
                 .unwrap();
         });
         let mut sampler = Sampler {
+            cancellation: Arc::new(CancellationToken::new()),
             cpu_previous: None,
             query: None,
             nvidia_available: false,
@@ -1016,37 +1165,41 @@ mod tests {
         let (temperature_tx, temperature_rx) = mpsc::channel();
         let (started_tx, started_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
+        let cancellation = Arc::new(CancellationToken::new());
+        let worker_cancellation = Arc::clone(&cancellation);
         let worker = thread::spawn(move || {
             started_tx.send(()).unwrap();
-            thread::park_timeout(Duration::from_secs(30));
+            let cancellation_requested = worker_cancellation.wait_timeout(Duration::from_secs(30));
             finished_tx
-                .send(
+                .send((
+                    cancellation_requested,
                     temperature_tx
                         .send(CpuTemperatureUpdate {
                             value: Some(70),
                             sampled_at: Instant::now(),
                         })
                         .is_err(),
-                )
+                ))
                 .unwrap();
         });
-        let worker_thread = worker.thread().clone();
         let mut sampler = CpuTemperatureSampler::from_receiver(temperature_rx);
-        sampler.worker = Some(worker_thread.clone());
+        sampler.cancelled = Some(Arc::clone(&cancellation));
 
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         drop(sampler);
 
-        let receiver_closed = finished_rx
+        let (cancellation_requested, receiver_closed) = finished_rx
             .recv_timeout(Duration::from_secs(1))
-            .unwrap_or(false);
-        if !receiver_closed {
-            worker_thread.unpark();
-        }
+            .unwrap_or((false, false));
         worker.join().unwrap();
+        assert!(cancellation.is_cancelled());
         assert!(
             receiver_closed,
             "dropping the sampler should wake and stop its worker"
+        );
+        assert!(
+            cancellation_requested,
+            "dropping the sampler should signal cancellation before waking its worker"
         );
     }
 
@@ -1135,7 +1288,8 @@ mod tests {
             .filter_map(|address| address.parse::<IpAddr>().ok())
             .collect::<HashSet<_>>();
 
-        let retained = retain_local_lhm_endpoints(discovery.endpoints, &local_addresses);
+        let discovered_endpoints = discovery.endpoints;
+        let retained = retain_local_lhm_endpoints(discovered_endpoints.clone(), &local_addresses);
 
         assert_eq!(
             retained
@@ -1143,6 +1297,16 @@ mod tests {
                 .map(|endpoint| endpoint.address.as_str())
                 .collect::<Vec<_>>(),
             ["127.0.0.1", "::1", "192.168.1.24"]
+        );
+
+        let current_local_addresses = HashSet::from([IpAddr::from([10, 0, 0, 8])]);
+        let refreshed = retain_local_lhm_endpoints(discovered_endpoints, &current_local_addresses);
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .collect::<Vec<_>>(),
+            ["127.0.0.1", "::1"]
         );
     }
 
@@ -1275,6 +1439,59 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_sensor_http_read_stops_before_response_arrives() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_received_tx, request_received_rx) = mpsc::channel();
+        let (release_server_tx, release_server_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 256];
+            loop {
+                let bytes_read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_received_tx.send(()).unwrap();
+            let _ = release_server_rx.recv_timeout(Duration::from_secs(2));
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let query_cancelled = Arc::clone(&cancelled);
+        let endpoint = LhmEndpoint {
+            address: "127.0.0.1".to_owned(),
+            port,
+        };
+        let (query_result_tx, query_result_rx) = mpsc::channel();
+        let query = thread::spawn(move || {
+            query_result_tx
+                .send(read_lhm_payload_with_cancel(&endpoint, &query_cancelled))
+                .unwrap();
+        });
+
+        request_received_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sensor request should reach the local endpoint");
+        let cancelled_at = Instant::now();
+        cancelled.store(true, Ordering::Release);
+        let result = query_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled sensor read should stop before its request timeout");
+        let _ = release_server_tx.send(());
+        query.join().unwrap();
+        server.join().unwrap();
+
+        assert!(result.is_err());
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn powershell_query_timeout_kills_and_reaps_the_child() {
         let availability = Command::new("powershell.exe")
             .args([
@@ -1295,6 +1512,41 @@ mod tests {
         let result = run_powershell_query("Start-Sleep -Seconds 30", Duration::from_millis(100));
         assert!(result.is_none());
         assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    #[test]
+    fn powershell_query_cancellation_kills_and_reaps_the_child() {
+        let availability = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSVersion.Major",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        assert!(
+            availability.is_ok(),
+            "Windows PowerShell is required for the sensor query"
+        );
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_after_start = Arc::clone(&cancelled);
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel_after_start.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = run_powershell_query_with_cancel(
+            "Start-Sleep -Seconds 30",
+            Duration::from_secs(10),
+            &cancelled,
+        );
+        canceller.join().unwrap();
+
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

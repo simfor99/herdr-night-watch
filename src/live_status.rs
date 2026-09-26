@@ -1577,6 +1577,7 @@ struct LiveStatusApp {
     warning_seconds_input: String,
     editing_warning_seconds: bool,
     metrics_rx: Receiver<SystemMetrics>,
+    metrics_cancellation: Arc<system_metrics::CancellationToken>,
     metrics: SystemMetrics,
     media_command_tx: Sender<MediaCommand>,
     media_rx: Receiver<Result<Option<MediaSnapshot>, String>>,
@@ -1651,6 +1652,7 @@ pub enum ConfigTab {
 
 impl Drop for LiveStatusApp {
     fn drop(&mut self) {
+        self.metrics_cancellation.cancel();
         let _ = self.media_command_tx.send(MediaCommand::Shutdown);
     }
 }
@@ -1660,12 +1662,20 @@ impl LiveStatusApp {
         let (status_tx, status_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         let (metrics_tx, metrics_rx) = mpsc::channel();
+        let metrics_cancellation = Arc::new(system_metrics::CancellationToken::new());
         let (media_command_tx, media_rx) = media::spawn_worker();
         let (weather_tx, weather_rx) = mpsc::channel();
         let (quota_tx, quota_rx) = mpsc::channel();
+        let worker_cancellation = Arc::clone(&metrics_cancellation);
         thread::spawn(move || {
-            let mut sampler = system_metrics::Sampler::new();
-            run_system_metrics_sampling_loop(metrics_tx, || sampler.sample(), thread::sleep);
+            let mut sampler =
+                system_metrics::Sampler::new_with_cancellation(Arc::clone(&worker_cancellation));
+            run_system_metrics_sampling_loop(
+                metrics_tx,
+                &worker_cancellation,
+                || sampler.sample(),
+                |timeout| worker_cancellation.wait_timeout(timeout),
+            );
         });
         Self {
             language: Language::current(),
@@ -1687,6 +1697,7 @@ impl LiveStatusApp {
             warning_seconds_input: "300".into(),
             editing_warning_seconds: false,
             metrics_rx,
+            metrics_cancellation,
             metrics: SystemMetrics::default(),
             media_command_tx,
             media_rx,
@@ -2112,14 +2123,21 @@ impl LiveStatusApp {
 
 fn run_system_metrics_sampling_loop(
     metrics_tx: Sender<SystemMetrics>,
+    cancellation: &system_metrics::CancellationToken,
     mut sample: impl FnMut() -> SystemMetrics,
-    mut wait: impl FnMut(Duration),
+    mut wait: impl FnMut(Duration) -> bool,
 ) {
     loop {
-        if metrics_tx.send(sample()).is_err() {
+        if cancellation.is_cancelled() {
             break;
         }
-        wait(Duration::from_secs(2));
+        let metrics = sample();
+        if cancellation.is_cancelled() || metrics_tx.send(metrics).is_err() {
+            break;
+        }
+        if wait(Duration::from_secs(2)) || cancellation.is_cancelled() {
+            break;
+        }
     }
 }
 
@@ -8441,21 +8459,52 @@ mod tests {
     #[test]
     fn system_metrics_sampling_stops_when_receiver_is_dropped() {
         let (metrics_tx, metrics_rx) = mpsc::channel();
+        let cancellation = system_metrics::CancellationToken::new();
         drop(metrics_rx);
         let mut sample_count = 0;
         let mut wait_count = 0;
 
         run_system_metrics_sampling_loop(
             metrics_tx,
+            &cancellation,
             || {
                 sample_count += 1;
                 SystemMetrics::default()
             },
-            |_| wait_count += 1,
+            |_| {
+                wait_count += 1;
+                false
+            },
         );
 
         assert_eq!(sample_count, 1);
         assert_eq!(wait_count, 0);
+    }
+
+    #[test]
+    fn system_metrics_sampling_stops_when_cancelled_during_sample() {
+        let (metrics_tx, metrics_rx) = mpsc::channel();
+        let cancellation = system_metrics::CancellationToken::new();
+        let mut sample_count = 0;
+        let mut wait_count = 0;
+
+        run_system_metrics_sampling_loop(
+            metrics_tx,
+            &cancellation,
+            || {
+                sample_count += 1;
+                cancellation.cancel();
+                SystemMetrics::default()
+            },
+            |_| {
+                wait_count += 1;
+                false
+            },
+        );
+
+        assert_eq!(sample_count, 1);
+        assert_eq!(wait_count, 0);
+        assert!(metrics_rx.try_recv().is_err());
     }
 
     #[test]
