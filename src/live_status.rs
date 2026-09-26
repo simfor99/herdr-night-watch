@@ -1577,6 +1577,7 @@ struct LiveStatusApp {
     warning_seconds_input: String,
     editing_warning_seconds: bool,
     metrics_rx: Receiver<SystemMetrics>,
+    metrics_cancellation: Arc<system_metrics::CancellationToken>,
     metrics: SystemMetrics,
     media_command_tx: Sender<MediaCommand>,
     media_rx: Receiver<Result<Option<MediaSnapshot>, String>>,
@@ -1651,6 +1652,7 @@ pub enum ConfigTab {
 
 impl Drop for LiveStatusApp {
     fn drop(&mut self) {
+        self.metrics_cancellation.cancel();
         let _ = self.media_command_tx.send(MediaCommand::Shutdown);
     }
 }
@@ -1660,15 +1662,20 @@ impl LiveStatusApp {
         let (status_tx, status_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         let (metrics_tx, metrics_rx) = mpsc::channel();
+        let metrics_cancellation = Arc::new(system_metrics::CancellationToken::new());
         let (media_command_tx, media_rx) = media::spawn_worker();
         let (weather_tx, weather_rx) = mpsc::channel();
         let (quota_tx, quota_rx) = mpsc::channel();
+        let worker_cancellation = Arc::clone(&metrics_cancellation);
         thread::spawn(move || {
-            let mut sampler = system_metrics::Sampler::new();
-            loop {
-                let _ = metrics_tx.send(sampler.sample());
-                thread::sleep(Duration::from_secs(2));
-            }
+            let mut sampler =
+                system_metrics::Sampler::new_with_cancellation(Arc::clone(&worker_cancellation));
+            run_system_metrics_sampling_loop(
+                metrics_tx,
+                &worker_cancellation,
+                || sampler.sample(),
+                |timeout| worker_cancellation.wait_timeout(timeout),
+            );
         });
         Self {
             language: Language::current(),
@@ -1690,6 +1697,7 @@ impl LiveStatusApp {
             warning_seconds_input: "300".into(),
             editing_warning_seconds: false,
             metrics_rx,
+            metrics_cancellation,
             metrics: SystemMetrics::default(),
             media_command_tx,
             media_rx,
@@ -2109,6 +2117,26 @@ impl LiveStatusApp {
                             ui.label(egui::RichText::new(&toast.message).strong().color(TEXT));
                         });
                 });
+        }
+    }
+}
+
+fn run_system_metrics_sampling_loop(
+    metrics_tx: Sender<SystemMetrics>,
+    cancellation: &system_metrics::CancellationToken,
+    mut sample: impl FnMut() -> SystemMetrics,
+    mut wait: impl FnMut(Duration) -> bool,
+) {
+    loop {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let metrics = sample();
+        if cancellation.is_cancelled() || metrics_tx.send(metrics).is_err() {
+            break;
+        }
+        if wait(Duration::from_secs(2)) || cancellation.is_cancelled() {
+            break;
         }
     }
 }
@@ -5570,59 +5598,69 @@ fn glowing_metric_text(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Co
 
 fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Language) -> f32 {
     let available = ui.available_width();
-    let spacing = 7.0;
-    let item_width = ((available - spacing * 4.0) / 5.0).max(52.0);
-    let power_value = metrics.gpu_watts.map(|value| format!("{value:>3}W"));
+    let spacing = 10.0;
+    let cpu_value = metrics.cpu_percent.map(|value| format!("{value}%"));
+    let ram_value = metrics.ram_percent.map(|value| format!("{value}%"));
+    let gpu_value = metrics.gpu_percent.map(|value| format!("{value}%"));
+    let vram_value = metrics.vram_percent.map(|value| format!("{value}%"));
+    let power_value = metrics.gpu_watts.map(|value| format!("{value}W"));
+    let desired_widths = system_metric_badge_widths(ui, metrics);
+    let item_widths = system_metric_item_widths(available, desired_widths, spacing);
     let old_spacing = ui.spacing().item_spacing.x;
     ui.spacing_mut().item_spacing.x = spacing;
-    let power_rect = ui
+    let power_layout = ui
         .horizontal(|ui| {
             system_metric_badge(
                 ui,
-                item_width,
+                item_widths[0],
                 MetricIcon::Cpu,
                 "CPU",
-                metrics.cpu_percent.map(|value| format!("{value:>2}%")),
+                cpu_value,
+                metrics.cpu_temperature_c,
                 metric_color(metrics.cpu_percent),
                 language,
                 false,
             );
             system_metric_badge(
                 ui,
-                item_width,
+                item_widths[1],
                 MetricIcon::Ram,
                 "RAM",
-                metrics.ram_percent.map(|value| format!("{value:>2}%")),
+                ram_value,
+                None,
                 metric_color(metrics.ram_percent),
                 language,
                 false,
             );
             system_metric_badge(
                 ui,
-                item_width,
+                item_widths[2],
                 MetricIcon::Gpu,
                 "GPU",
-                metrics.gpu_percent.map(|value| format!("{value:>2}%")),
+                gpu_value,
+                metrics.gpu_temperature_c,
                 metric_color(metrics.gpu_percent),
                 language,
                 false,
             );
             system_metric_badge(
                 ui,
-                item_width,
+                item_widths[3],
                 MetricIcon::Vram,
                 "VRAM",
-                metrics.vram_percent.map(|value| format!("{value:>2}%")),
+                vram_value,
+                None,
                 metric_color(metrics.vram_percent),
                 language,
                 false,
             );
             system_metric_badge(
                 ui,
-                item_width,
+                item_widths[4],
                 MetricIcon::Power,
                 "",
                 power_value.clone(),
+                None,
                 metric_color(metrics.gpu_power_percent),
                 language,
                 true,
@@ -5630,17 +5668,171 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Langu
         })
         .inner;
     ui.spacing_mut().item_spacing.x = old_spacing;
-    let power_text = power_value.unwrap_or_else(|| "—".into());
-    let power_text_width = ui
-        .painter()
-        .layout_no_wrap(
-            power_text,
-            egui::FontId::proportional(11.0),
+    power_layout.text_right
+}
+
+fn system_metric_item_widths(
+    available_width: f32,
+    desired_widths: [f32; 5],
+    spacing: f32,
+) -> [f32; 5] {
+    let item_count = desired_widths.len() as f32;
+    let spacing_count = (desired_widths.len() - 1) as f32;
+    let content_width = (available_width - spacing * spacing_count).max(0.0);
+    let desired_total = desired_widths.iter().sum::<f32>();
+
+    if desired_total > content_width {
+        let scale = content_width / desired_total;
+        desired_widths.map(|width| width * scale)
+    } else {
+        let spare_width = (content_width - desired_total) / item_count;
+        desired_widths.map(|width| width + spare_width)
+    }
+}
+
+fn system_metric_badge_widths(ui: &egui::Ui, metrics: SystemMetrics) -> [f32; 5] {
+    // Reserve the sampler's bounded value ranges so sensor updates cannot move later badges.
+    const MAX_PERCENT_VALUE: &str = "100%";
+    const MAX_TEMPERATURE_C: u8 = u8::MAX;
+    const MAX_POWER_VALUE: &str = "65535W";
+    [
+        system_metric_badge_width(
+            ui,
+            "CPU",
+            Some(MAX_PERCENT_VALUE),
+            Some(MAX_TEMPERATURE_C),
+            metric_color(metrics.cpu_percent),
+            false,
+        ),
+        system_metric_badge_width(
+            ui,
+            "RAM",
+            Some(MAX_PERCENT_VALUE),
+            None,
+            metric_color(metrics.ram_percent),
+            false,
+        ),
+        system_metric_badge_width(
+            ui,
+            "GPU",
+            Some(MAX_PERCENT_VALUE),
+            Some(MAX_TEMPERATURE_C),
+            metric_color(metrics.gpu_percent),
+            false,
+        ),
+        system_metric_badge_width(
+            ui,
+            "VRAM",
+            Some(MAX_PERCENT_VALUE),
+            None,
+            metric_color(metrics.vram_percent),
+            false,
+        ),
+        system_metric_badge_width(
+            ui,
+            "",
+            Some(MAX_POWER_VALUE),
+            None,
             metric_color(metrics.gpu_power_percent),
-        )
+            true,
+        ),
+    ]
+}
+
+fn system_metric_badge_width(
+    ui: &egui::Ui,
+    label: &str,
+    value: Option<&str>,
+    temperature_c: Option<u8>,
+    color: egui::Color32,
+    center_content: bool,
+) -> f32 {
+    let text = system_metric_display_text(label, value, temperature_c);
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(text, egui::FontId::proportional(11.0), color)
         .size()
         .x;
-    power_rect.center().x - 5.0 + power_text_width / 2.0
+
+    if center_content {
+        text_width + 38.0
+    } else {
+        // Account for the leading icon and keep all text inside its badge rectangle.
+        text_width + 18.0
+    }
+}
+
+fn system_metric_display_text(
+    label: &str,
+    value: Option<&str>,
+    temperature_c: Option<u8>,
+) -> String {
+    let value = match (value, temperature_c) {
+        (Some(value), Some(temperature)) => format!("{value} · {temperature}°"),
+        (Some(value), None) => value.to_owned(),
+        (None, Some(temperature)) => format!("— · {temperature}°"),
+        (None, None) => "—".into(),
+    };
+
+    if label.is_empty() {
+        value
+    } else {
+        format!("{label} {value}")
+    }
+}
+
+fn system_metric_compact_display_text(value: Option<&str>, temperature_c: Option<u8>) -> String {
+    match (value, temperature_c) {
+        (Some(value), Some(temperature)) => format!("{value}·{temperature}°"),
+        (Some(value), None) => value.to_owned(),
+        (None, Some(temperature)) => format!("—·{temperature}°"),
+        (None, None) => "—".into(),
+    }
+}
+
+fn system_metric_badge_text_layout(
+    painter: &egui::Painter,
+    full_text: String,
+    compact_text: String,
+    color: egui::Color32,
+    available_width: f32,
+) -> (String, egui::FontId) {
+    const FONT_SIZE: f32 = 11.0;
+    const MIN_FONT_SIZE: f32 = 8.0;
+
+    let available_width = available_width.max(0.0);
+    let text_width = |text: &str, font_size: f32| {
+        painter
+            .layout_no_wrap(
+                text.to_owned(),
+                egui::FontId::proportional(font_size),
+                color,
+            )
+            .size()
+            .x
+    };
+
+    if text_width(&full_text, FONT_SIZE) <= available_width {
+        return (full_text, egui::FontId::proportional(FONT_SIZE));
+    }
+    if text_width(&compact_text, FONT_SIZE) <= available_width {
+        return (compact_text, egui::FontId::proportional(FONT_SIZE));
+    }
+
+    let compact_width = text_width(&compact_text, FONT_SIZE);
+    if compact_width > f32::EPSILON {
+        let scaled_font_size = (FONT_SIZE * available_width / compact_width).min(FONT_SIZE);
+        if scaled_font_size >= MIN_FONT_SIZE {
+            return (compact_text, egui::FontId::proportional(scaled_font_size));
+        }
+    }
+
+    let ellipsis = "…";
+    if text_width(ellipsis, FONT_SIZE) <= available_width {
+        (ellipsis.into(), egui::FontId::proportional(FONT_SIZE))
+    } else {
+        (String::new(), egui::FontId::proportional(FONT_SIZE))
+    }
 }
 
 fn media_info_row(
@@ -7988,6 +8180,12 @@ enum MetricIcon {
     Power,
 }
 
+#[derive(Clone, Copy)]
+struct SystemMetricBadgeLayout {
+    rect: egui::Rect,
+    text_right: f32,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn system_metric_badge(
     ui: &mut egui::Ui,
@@ -7995,61 +8193,86 @@ fn system_metric_badge(
     icon: MetricIcon,
     label: &str,
     value: Option<String>,
+    temperature_c: Option<u8>,
     color: egui::Color32,
     language: Language,
     center_content: bool,
-) -> egui::Rect {
-    let tooltip = match value.as_deref() {
-        Some(value) if matches!(icon, MetricIcon::Vram) => {
+) -> SystemMetricBadgeLayout {
+    let tooltip = match (value.as_deref(), temperature_c) {
+        (value, Some(temperature)) => {
+            let utilization =
+                value.unwrap_or_else(|| language.text("nicht verfügbar", "unavailable"));
+            format!(
+                "{label} {}: {utilization}\n{label} {}: {temperature}°C",
+                language.text("Auslastung", "utilization"),
+                language.text("Temperatur", "temperature")
+            )
+        }
+        (Some(value), None) if matches!(icon, MetricIcon::Vram) => {
             format!(
                 "{}{}",
                 language.text("VRAM-Auslastung: ", "VRAM utilization: "),
                 value
             )
         }
-        Some(value) if label.is_empty() => {
+        (Some(value), None) if label.is_empty() => {
             format!(
                 "{}{}",
                 language.text("Grafikkartenverbrauch: ", "GPU power draw: "),
                 value
             )
         }
-        Some(value) => format!(
+        (Some(value), None) => format!(
             "{label} {}: {value}",
             language.text("Auslastung", "utilization")
         ),
-        None if matches!(icon, MetricIcon::Vram) => language
+        (None, None) if matches!(icon, MetricIcon::Vram) => language
             .text(
                 "VRAM-Wert ist momentan nicht verfügbar.",
                 "VRAM value is currently unavailable.",
             )
             .into(),
-        None if label.is_empty() => language
+        (None, None) if label.is_empty() => language
             .text(
                 "Grafikkartenverbrauch ist für diese Hardware nicht verfügbar.",
                 "GPU power draw is unavailable on this hardware.",
             )
             .into(),
-        None => format!(
+        (None, None) => format!(
             "{label} {}",
             language.text("ist momentan nicht verfügbar.", "is currently unavailable.")
         ),
     };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
-    let has_value = value.is_some();
-    let value = value.unwrap_or_else(|| "—".into());
-    let text = if label.is_empty() {
-        value.clone()
-    } else {
-        format!("{label} {value}")
-    };
-    let text_width = ui
+    let has_value = value.is_some() || temperature_c.is_some();
+    let value = value.as_deref();
+    let text_color = if has_value { color } else { GRAY };
+    let full_text = system_metric_display_text(label, value, temperature_c);
+    let full_text_width = ui
         .painter()
         .layout_no_wrap(
-            text.clone(),
+            full_text.clone(),
             egui::FontId::proportional(11.0),
-            if has_value { color } else { GRAY },
+            text_color,
         )
+        .size()
+        .x;
+    let center_content = center_content && width >= full_text_width + 34.0;
+    let available_text_width = if center_content {
+        width - 34.0
+    } else {
+        width - 18.0
+    };
+    let (text, font) = system_metric_badge_text_layout(
+        ui.painter(),
+        full_text,
+        system_metric_compact_display_text(value, temperature_c),
+        text_color,
+        available_text_width,
+    );
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(text.clone(), font.clone(), text_color)
         .size()
         .x;
     let text_left = if center_content {
@@ -8068,15 +8291,20 @@ fn system_metric_badge(
         egui::pos2(icon_x, rect.center().y),
         color,
     );
-    ui.painter().text(
-        egui::pos2(text_left, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        text,
-        egui::FontId::proportional(11.0),
-        if has_value { color } else { GRAY },
+    let text_galley = ui.painter().layout_no_wrap(text, font, text_color);
+    let text_shape = egui::epaint::TextShape::new(
+        egui::pos2(text_left, rect.center().y - text_galley.size().y / 2.0),
+        text_galley,
+        text_color,
     );
+    let text_right = if text_shape.galley.is_empty() {
+        text_left
+    } else {
+        text_shape.visual_bounding_rect().right().min(rect.right())
+    };
+    ui.painter().with_clip_rect(rect).add(text_shape);
     let _ = response.on_hover_text(tooltip);
-    rect
+    SystemMetricBadgeLayout { rect, text_right }
 }
 
 fn draw_metric_icon(
@@ -8226,6 +8454,339 @@ mod tests {
     #[test]
     fn window_control_hood_is_fully_opaque() {
         assert_eq!(WINDOW_CONTROL_HOOD_FILL.to_array()[3], u8::MAX);
+    }
+
+    #[test]
+    fn system_metrics_sampling_stops_when_receiver_is_dropped() {
+        let (metrics_tx, metrics_rx) = mpsc::channel();
+        let cancellation = system_metrics::CancellationToken::new();
+        drop(metrics_rx);
+        let mut sample_count = 0;
+        let mut wait_count = 0;
+
+        run_system_metrics_sampling_loop(
+            metrics_tx,
+            &cancellation,
+            || {
+                sample_count += 1;
+                SystemMetrics::default()
+            },
+            |_| {
+                wait_count += 1;
+                false
+            },
+        );
+
+        assert_eq!(sample_count, 1);
+        assert_eq!(wait_count, 0);
+    }
+
+    #[test]
+    fn system_metrics_sampling_stops_when_cancelled_during_sample() {
+        let (metrics_tx, metrics_rx) = mpsc::channel();
+        let cancellation = system_metrics::CancellationToken::new();
+        let mut sample_count = 0;
+        let mut wait_count = 0;
+
+        run_system_metrics_sampling_loop(
+            metrics_tx,
+            &cancellation,
+            || {
+                sample_count += 1;
+                cancellation.cancel();
+                SystemMetrics::default()
+            },
+            |_| {
+                wait_count += 1;
+                false
+            },
+        );
+
+        assert_eq!(sample_count, 1);
+        assert_eq!(wait_count, 0);
+        assert!(metrics_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn system_metric_column_widths_stay_fixed_across_sensor_updates() {
+        let context = egui::Context::default();
+        let maximum = SystemMetrics {
+            cpu_percent: Some(100),
+            gpu_percent: Some(100),
+            vram_percent: Some(100),
+            ram_percent: Some(100),
+            cpu_temperature_c: Some(u8::MAX),
+            gpu_temperature_c: Some(u8::MAX),
+            gpu_watts: Some(u16::MAX),
+            gpu_power_percent: Some(100),
+        };
+        let mut measured_widths = None;
+
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let unavailable_widths = system_metric_badge_widths(ui, SystemMetrics::default());
+            let maximum_widths = system_metric_badge_widths(ui, maximum);
+            let text_width = |label: &str, value: Option<&str>, temperature: Option<u8>| {
+                ui.painter()
+                    .layout_no_wrap(
+                        system_metric_display_text(label, value, temperature),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+            };
+            let maximum_text_widths = [
+                text_width("CPU", Some("100%"), Some(u8::MAX)) + 18.0,
+                text_width("RAM", Some("100%"), None) + 18.0,
+                text_width("GPU", Some("100%"), Some(u8::MAX)) + 18.0,
+                text_width("VRAM", Some("100%"), None) + 18.0,
+                text_width("", Some(&format!("{}W", u16::MAX)), None) + 38.0,
+            ];
+            assert!(
+                unavailable_widths
+                    .iter()
+                    .zip(maximum_text_widths)
+                    .all(|(reserved, actual)| reserved >= &actual),
+                "metric columns must fit their full formatted value ranges"
+            );
+            measured_widths = Some((unavailable_widths, maximum_widths));
+        });
+
+        let (unavailable, maximum) = measured_widths.expect("metric widths were measured");
+        assert_eq!(unavailable, maximum);
+    }
+
+    #[test]
+    fn system_metric_item_widths_fit_narrow_rows_and_distribute_spare_width() {
+        let desired = [90.0, 60.0, 90.0, 60.0, 80.0];
+        let spacing = 10.0;
+        let narrow_available = 330.0;
+        let narrow = system_metric_item_widths(narrow_available, desired, spacing);
+        let narrow_total = narrow.iter().sum::<f32>() + spacing * 4.0;
+        let scale = narrow[0] / desired[0];
+
+        assert!(narrow_total <= narrow_available + f32::EPSILON * narrow_available);
+        for (actual, desired) in narrow.iter().zip(desired) {
+            assert!((actual / desired - scale).abs() < 0.0001);
+        }
+
+        let wide_available = 500.0;
+        let wide = system_metric_item_widths(wide_available, desired, spacing);
+        let spare_per_item =
+            (wide_available - spacing * 4.0 - desired.iter().sum::<f32>()) / desired.len() as f32;
+
+        assert!(
+            wide.iter()
+                .zip(desired)
+                .all(|(actual, desired)| (actual - desired - spare_per_item).abs() < 0.0001)
+        );
+        assert!((wide.iter().sum::<f32>() + spacing * 4.0 - wide_available).abs() < 0.0001);
+    }
+
+    #[test]
+    fn system_metric_badge_text_stays_inside_narrow_rectangles_before_next_icon() {
+        let context = egui::Context::default();
+        let metrics = SystemMetrics {
+            cpu_percent: Some(100),
+            ram_percent: Some(100),
+            gpu_percent: Some(100),
+            vram_percent: Some(100),
+            cpu_temperature_c: Some(u8::MAX),
+            gpu_temperature_c: Some(u8::MAX),
+            gpu_watts: Some(u16::MAX),
+            gpu_power_percent: Some(100),
+        };
+        let mut badge_rects = None;
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(330.0, 40.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let spacing = 10.0;
+                let desired_widths = system_metric_badge_widths(ui, metrics);
+                let item_widths =
+                    system_metric_item_widths(ui.available_width(), desired_widths, spacing);
+                ui.spacing_mut().item_spacing.x = spacing;
+                badge_rects = Some(
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = spacing;
+                        [
+                            system_metric_badge(
+                                ui,
+                                item_widths[0],
+                                MetricIcon::Cpu,
+                                "CPU",
+                                Some("100%".into()),
+                                Some(u8::MAX),
+                                PASTEL_GREEN,
+                                Language::English,
+                                false,
+                            ),
+                            system_metric_badge(
+                                ui,
+                                item_widths[1],
+                                MetricIcon::Ram,
+                                "RAM",
+                                Some("100%".into()),
+                                None,
+                                PASTEL_GREEN,
+                                Language::English,
+                                false,
+                            ),
+                            system_metric_badge(
+                                ui,
+                                item_widths[2],
+                                MetricIcon::Gpu,
+                                "GPU",
+                                Some("100%".into()),
+                                Some(u8::MAX),
+                                PASTEL_GREEN,
+                                Language::English,
+                                false,
+                            ),
+                            system_metric_badge(
+                                ui,
+                                item_widths[3],
+                                MetricIcon::Vram,
+                                "VRAM",
+                                Some("100%".into()),
+                                None,
+                                PASTEL_GREEN,
+                                Language::English,
+                                false,
+                            ),
+                            system_metric_badge(
+                                ui,
+                                item_widths[4],
+                                MetricIcon::Power,
+                                "",
+                                Some(format!("{}W", u16::MAX)),
+                                None,
+                                PASTEL_GREEN,
+                                Language::English,
+                                true,
+                            ),
+                        ]
+                    })
+                    .inner,
+                );
+            },
+        );
+
+        let badge_rects = badge_rects.expect("metric badges were drawn");
+        let metric_text_shapes = output
+            .shapes
+            .iter()
+            .filter_map(|clipped_shape| match &clipped_shape.shape {
+                egui::Shape::Text(text_shape) if text_shape.galley.text() != "GPU" => {
+                    Some((clipped_shape, text_shape))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metric_text_shapes.len(), 5);
+
+        for (index, (clipped_shape, text_shape)) in metric_text_shapes.iter().enumerate() {
+            let text_bounds = text_shape.visual_bounding_rect();
+            let badge_layout = badge_rects[index];
+            let badge_rect = badge_layout.rect;
+            assert!(
+                (badge_layout.text_right - text_bounds.max.x).abs() < 0.01,
+                "metric {index} reports a different text right edge than it rendered: {} vs {}",
+                badge_layout.text_right,
+                text_bounds.max.x
+            );
+            assert!(
+                text_bounds.min.x >= badge_rect.min.x - 0.01,
+                "metric text {index} starts before its badge: {text_bounds:?} vs {badge_rect:?}"
+            );
+            assert!(
+                text_bounds.max.x <= badge_rect.max.x + 0.01,
+                "metric text {index} extends past its badge: {text_bounds:?} vs {badge_rect:?}"
+            );
+            assert!(
+                text_bounds.min.x >= clipped_shape.clip_rect.min.x - 0.01
+                    && text_bounds.max.x <= clipped_shape.clip_rect.max.x + 0.01,
+                "metric text {index} was clipped: {text_bounds:?} vs {:?}",
+                clipped_shape.clip_rect
+            );
+            if index < 4 {
+                let next_badge = badge_rects[index + 1].rect;
+                let icon_probe = egui::Rect::from_min_max(
+                    egui::pos2(next_badge.left(), next_badge.center().y - 8.0),
+                    egui::pos2(next_badge.left() + 16.0, next_badge.center().y + 8.0),
+                );
+                let next_icon_left = output
+                    .shapes
+                    .iter()
+                    .filter_map(|clipped_shape| {
+                        if matches!(clipped_shape.shape, egui::Shape::Text(_)) {
+                            return None;
+                        }
+                        let icon_bounds = clipped_shape.shape.visual_bounding_rect();
+                        icon_bounds
+                            .intersects(icon_probe)
+                            .then_some(icon_bounds.left())
+                    })
+                    .min_by(f32::total_cmp)
+                    .expect("next badge icon shapes were drawn");
+                assert!(
+                    text_bounds.max.x < next_icon_left,
+                    "metric text {index} reaches the following icon at {next_icon_left}: {text_bounds:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_system_metrics_row_returns_rendered_power_text_right_edge() {
+        let context = egui::Context::default();
+        let metrics = SystemMetrics {
+            cpu_percent: Some(100),
+            ram_percent: Some(100),
+            gpu_percent: Some(100),
+            vram_percent: Some(100),
+            cpu_temperature_c: Some(u8::MAX),
+            gpu_temperature_c: Some(u8::MAX),
+            gpu_watts: Some(u16::MAX),
+            gpu_power_percent: Some(100),
+        };
+        let mut reported_text_right = None;
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(330.0, 40.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                reported_text_right = Some(system_metrics_row(ui, metrics, Language::English));
+            },
+        );
+
+        let reported_text_right = reported_text_right.expect("system metrics row was drawn");
+        let rendered_power_text = output
+            .shapes
+            .iter()
+            .filter_map(|clipped_shape| match &clipped_shape.shape {
+                egui::Shape::Text(text_shape) if text_shape.galley.text() != "GPU" => {
+                    Some(text_shape)
+                }
+                _ => None,
+            })
+            .last()
+            .expect("GPU power text was drawn");
+        let rendered_text_right = rendered_power_text.visual_bounding_rect().right();
+
+        assert!(
+            (reported_text_right - rendered_text_right).abs() < 0.01,
+            "media timeline endpoint must follow visible GPU power text: {reported_text_right} vs {rendered_text_right}"
+        );
     }
 
     fn assert_fixture_output(output: std::process::Output, fixture: &str) {
