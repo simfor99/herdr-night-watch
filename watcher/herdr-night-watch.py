@@ -930,8 +930,9 @@ def request_windows_shutdown_now() -> None:
         raise RuntimeError("powershell.exe is unavailable; refusing immediate shutdown.")
     command = (
         "$ErrorActionPreference = 'Stop'; "
-        "& shutdown.exe /s /t 0 /d p:4:1 "
-        "/c 'Herdr night watch: completion confirmed.'"
+        "& shutdown.exe /s /f /t 0 /d p:4:1 "
+        "/c 'Herdr night watch: completion confirmed.'; "
+        "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
     )
     completed = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", command],

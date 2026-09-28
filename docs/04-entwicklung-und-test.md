@@ -28,6 +28,7 @@ Diese Regeln sind Testspezifikation, nicht bloß Beschreibung:
 - Ein Start ohne explizites `-WarningSeconds` übernimmt den im Live-Fenster gespeicherten Wert; ein Skript-Default darf ihn nicht auf 300 zurücksetzen.
 - Energiesparmodus darf weder `shutdown.exe /s` noch `shutdown.exe /a` ausführen.
 - Nur eine positive Benutzerbestätigung der eigenen aktiven Warnung darf Energiesparmodus oder Herunterfahren vor Ablauf der Warnfrist auslösen.
+- Nach bestätigtem oder abgelaufenem Herunterfahren schließt Windows offene Apps mit `/f`, damit sie den Shutdown nicht blockieren. Die Warnung weist auf das Schließen ohne Rückfrage hin; ein echter Windows-Shutdown wird ausschließlich über gemockte Prozessaufrufe geprüft.
 - Internet-Ausfall löst erst nach fünf Minuten und nur über dieselbe sichtbare Warnfrist aus; Rückkehr der Verbindung bricht diese Warnung ab.
 - `completion-history.csv` protokolliert die angeforderten Energieaktionen des WSL-Wächters. Der Datensatz wird vor einer bestätigten Schlaf- oder Shutdown-Aktion dauerhaft geschrieben; bei einem Schreibfehler wird keine Energieaktion angefordert. `tray-history.csv` protokolliert erkannte unplanmäßige Tray-Enden. Der Log-Viewer zeigt beide Dateien in getrennten Bereichen und höchstens 30 Einträge je Bereich.
 - `cancellation-history.csv` darf höchstens 30 Ereignisse enthalten und muss die konkrete Abbruchquelle speichern.
