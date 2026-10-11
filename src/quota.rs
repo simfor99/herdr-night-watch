@@ -1,4 +1,4 @@
-//! KI-Budget-Limits (GLM, Agy, Codex) Telemetry & Management for Herdr Night Watch.
+//! KI-Budget-Limits (GLM, Agy, Codex, Claude) Telemetry & Management for Herdr Night Watch.
 //!
 //! Provides data structures, parsers, and background sampling for provider quotas.
 //! Fail-closed: values are strictly informational and never participate in shutdown decisions.
@@ -445,7 +445,7 @@ impl PacingForecast {
                 }
             }
         } else {
-            language.text("Reicht >30 Tage", "Lasts >30 days").to_string()
+            String::new()
         }
     }
 
@@ -823,6 +823,24 @@ pub fn parse_remaining_days(reset_str: Option<&str>, today: (i32, u32, u32)) -> 
     None
 }
 
+fn remaining_days_at(
+    reset_str: Option<&str>,
+    today: (i32, u32, u32),
+    now: (u32, u32),
+) -> Option<f32> {
+    let (target, time) = parse_target_datetime(reset_str?, today)?;
+    if let Some((hour, minute)) = time {
+        let days = ymd_to_days(target.0, target.1, target.2)
+            - ymd_to_days(today.0, today.1, today.2);
+        let minutes = days * 1440 + hour as i64 * 60 + minute as i64
+            - now.0 as i64 * 60 - now.1 as i64;
+        Some((minutes as f32 / 1440.0).max(0.0))
+    } else {
+        // Date-only providers do not supply enough precision for an hourly pace.
+        parse_remaining_days(reset_str, today)
+    }
+}
+
 pub fn parse_target_datetime(raw: &str, today: (i32, u32, u32)) -> Option<((i32, u32, u32), Option<(u32, u32)>)> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -964,6 +982,20 @@ pub fn format_reset_time_phrase(
     let total_hours = ((diff_mins as f64) / 60.0).round() as u64;
     let total_hours = total_hours.max(1);
 
+    if has_exact_time && total_hours > 24 && total_hours <= 240 {
+        let days = total_hours / 24;
+        let hours = total_hours % 24;
+        let duration = if hours == 0 {
+            format!("~{days}d")
+        } else {
+            format!("~{days}d {hours}h")
+        };
+        let (th, tm) = time_opt.expect("exact reset time was checked above");
+        return format!(
+            "in {duration} ({target_d:02}.{target_m:02}. {th:02}:{tm:02})"
+        );
+    }
+
     if target_days == now_days {
         return match time_opt {
             Some((th, tm)) => {
@@ -1065,7 +1097,7 @@ pub fn pacing_forecast_for(
     };
 
     if week_is_exhausted {
-        let rem_days = parse_remaining_days(week_reset, today).unwrap_or(5.0);
+        let rem_days = remaining_days_at(week_reset, today, now_hm).unwrap_or(5.0);
         let mut fc = PacingForecast {
             pace_ratio: None,
             runway_days: Some(0.0),
@@ -1084,9 +1116,40 @@ pub fn pacing_forecast_for(
         return fc;
     }
 
-    let remaining_days = parse_remaining_days(week_reset, today).unwrap_or(7.0).max(0.1);
+    // A remaining percentage alone does not reveal how much of the quota
+    // period has elapsed. Without a usable reset date, a burn-rate forecast
+    // would have to invent the elapsed time and can produce wildly misleading
+    // runway and pace values.
+    let remaining_days = match remaining_days_at(week_reset, today, now_hm) {
+        Some(days) => days.max(1.0 / 1440.0),
+        None if week_percent.is_some() => {
+            let mut fc = PacingForecast {
+                pace_ratio: None,
+                runway_days: None,
+                delta_days: None,
+                remaining_days: 0.0,
+                health: PacingHealth::Surplus,
+                badge_text: String::new(),
+                summary_text: String::new(),
+                five_hour_forecast,
+                week_exhaustion_date: None,
+                reset_str: saved_reset,
+                today,
+            };
+            fc.badge_text = fc.localized_upper_line(Language::German);
+            fc.summary_text = fc.localized_lower_line(Language::German);
+            return fc;
+        }
+        None => 7.0,
+    };
     let total_days = if remaining_days > 7.5 { 30.0 } else { 7.0 };
-    let elapsed_days = (total_days - remaining_days).max(0.2);
+    let has_reset_time = week_reset
+        .and_then(|raw| parse_target_datetime(raw, today))
+        .is_some_and(|(_, time)| time.is_some());
+    // Exact reset times reveal the actual cycle age. A fixed 4.8-hour floor
+    // invents consumption history near the start of a weekly period.
+    let min_elapsed = if has_reset_time { 1.0 / 1440.0 } else { 0.2 };
+    let elapsed_days = (total_days - remaining_days).max(min_elapsed);
     let consumed_pct = (100u8.saturating_sub(rem_pct)) as f32;
 
     let allowed_rate = 100.0 / total_days;
@@ -1121,7 +1184,7 @@ pub fn pacing_forecast_for(
         let week_exhaustion_date = runway_days.and_then(|rw| {
             if rw < 30.0 {
                 let today_days = ymd_to_days(today.0, today.1, today.2);
-                let add_days = rw.round() as i64;
+                let add_days = (rw + (now_hm.0 * 60 + now_hm.1) as f32 / 1440.0).floor() as i64;
                 let (_y, ex_m, ex_d) = days_to_ymd(today_days + add_days);
                 Some((ex_m, ex_d))
             } else {
@@ -1149,7 +1212,7 @@ pub fn pacing_forecast_for(
 
     let runway_days = (rem_pct as f32) / burn_rate;
     let today_days = ymd_to_days(today.0, today.1, today.2);
-    let add_days = runway_days.round() as i64;
+    let add_days = (runway_days + (now_hm.0 * 60 + now_hm.1) as f32 / 1440.0).floor() as i64;
     let (_y, ex_m, ex_d) = days_to_ymd(today_days + add_days);
     let week_exhaustion_date = Some((ex_m, ex_d));
     let delta_days = Some((runway_days - remaining_days).round() as i32);
@@ -1560,6 +1623,54 @@ pub fn update_snapshot_with_codex_json(snapshot: &mut QuotaSnapshot, json_str: &
     snapshot.last_updated = Some(Instant::now());
 }
 
+pub fn update_snapshot_with_claude_json(snapshot: &mut QuotaSnapshot, json_str: &str) {
+    let value = serde_json::from_str::<serde_json::Value>(json_str).ok();
+    let claude = snapshot
+        .providers
+        .iter_mut()
+        .find(|p| p.id == ProviderId::Claude);
+    let Some(claude) = claude else { return };
+
+    // A missing or stale capture must not leave an older quota looking current.
+    claude.five_hour_percent = None;
+    claude.five_hour_reset = None;
+    claude.week_percent = None;
+    claude.week_reset = None;
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    for (key, percent, reset) in [
+        (
+            "five_hour",
+            &mut claude.five_hour_percent,
+            &mut claude.five_hour_reset,
+        ),
+        ("week", &mut claude.week_percent, &mut claude.week_reset),
+    ] {
+        let Some(window) = value.as_ref().and_then(|value| value.get(key)) else {
+            continue;
+        };
+        *percent = window
+            .get("used_percentage")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|used| (0.0..=100.0).contains(used))
+            .map(|used| (100.0 - used.round()).clamp(0.0, 100.0) as u8);
+        *reset = window
+            .get("resets_at")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|epoch| *epoch > now_epoch)
+            .map(|epoch| codex_reset_epoch_to_local(epoch, key));
+    }
+    claude.is_throttled = claude.week_percent == Some(0) || claude.five_hour_percent == Some(0);
+    snapshot.has_throttle = snapshot
+        .providers
+        .iter()
+        .any(|provider| provider.is_throttled);
+    snapshot.last_updated = Some(Instant::now());
+}
+
 #[cfg(windows)]
 pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
     use std::os::windows::process::CommandExt;
@@ -1617,6 +1728,27 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
             .and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or("null"),
     );
 
+    let claude_json = Command::new("wsl.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg("-d")
+        .arg(&distro)
+        .arg("--exec")
+        .arg("python3")
+        .arg("-c")
+        .arg(include_str!("../tools/fetch_claude_quota.py"))
+        .arg("--read")
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    update_snapshot_with_claude_json(
+        &mut updated,
+        claude_json
+            .as_ref()
+            .map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or("null"),
+    );
+
     updated
 }
 
@@ -1649,6 +1781,21 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
         &mut updated,
         codex_json.as_ref().map(|output| output.stdout.as_slice())
             .and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or("null"),
+    );
+    let claude_json = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(include_str!("../tools/fetch_claude_quota.py"))
+        .arg("--read")
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    update_snapshot_with_claude_json(
+        &mut updated,
+        claude_json
+            .as_ref()
+            .map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or("null"),
     );
     updated
 }
@@ -1683,6 +1830,47 @@ mod tests {
         let claude_fc = claude.pacing_forecast();
         assert_eq!(claude_fc.localized_badge_text(Language::German), "Bereit");
         assert_eq!(claude_fc.localized_summary_text(Language::German), "Telemetrie ausstehend");
+    }
+
+    #[test]
+    fn claude_rate_limits_convert_used_percent_to_remaining_percent() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_claude_json(
+            &mut snapshot,
+            r#"{
+                "five_hour": {"used_percentage": 32.4, "resets_at": 2000000000},
+                "week": {"used_percentage": 4, "resets_at": 2000100000}
+            }"#,
+        );
+
+        let claude = snapshot.get(ProviderId::Claude).expect("Claude present");
+        assert_eq!(claude.five_hour_percent, Some(68));
+        assert_eq!(claude.week_percent, Some(96));
+        assert!(claude.five_hour_reset.is_some());
+        assert!(claude.week_reset.is_some());
+        assert!(!claude.is_throttled);
+    }
+
+    #[test]
+    fn missing_claude_rate_limits_clear_old_values_instead_of_showing_unlimited() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_claude_json(
+            &mut snapshot,
+            r#"{"five_hour":{"used_percentage":0},"week":{"used_percentage":5}}"#,
+        );
+        assert_eq!(
+            snapshot.get(ProviderId::Claude).unwrap().five_hour_percent,
+            Some(100)
+        );
+
+        update_snapshot_with_claude_json(&mut snapshot, "null");
+
+        let claude = snapshot.get(ProviderId::Claude).expect("Claude present");
+        assert_eq!(claude.five_hour_percent, None);
+        assert_eq!(claude.week_percent, None);
+        assert_eq!(claude.five_hour_reset, None);
+        assert_eq!(claude.week_reset, None);
+        assert!(!claude.is_throttled);
     }
 
     #[test]
@@ -1808,7 +1996,7 @@ mod tests {
             )),
             Some((local_after_utc_midnight.3, local_after_utc_midnight.4)),
         );
-        assert_eq!(forecast.remaining_days, 7.0);
+        assert!((forecast.remaining_days - (7.0 + 11.5 / 24.0)).abs() < 0.0001);
 
         let (year, month, day, _, _, _) = current_local_datetime();
         assert_eq!(current_forecast_today(), (year as i32, month, day));
@@ -2173,9 +2361,9 @@ mod tests {
             Some(now),
         );
         let week_de = fc.week_runway_text(Language::German);
-        assert_eq!(week_de, "Reicht noch 4.9 Tage (27.09)");
+        assert_eq!(week_de, "Reicht noch 4.8 Tage (27.09)");
         let week_en = fc.week_runway_text(Language::English);
-        assert_eq!(week_en, "Lasts 4.9 days (27.09)");
+        assert_eq!(week_en, "Lasts 4.8 days (27.09)");
     }
 
     #[test]
@@ -2189,20 +2377,111 @@ mod tests {
     }
 
     #[test]
+    fn missing_week_reset_does_not_invent_a_runway_or_pace() {
+        let fc = pacing_forecast_for(
+            false,
+            Some(80),
+            None,
+            None,
+            None,
+            Some((2026, 9, 24)),
+            Some((10, 17)),
+        );
+
+        assert_eq!(fc.pace_ratio, None);
+        assert_eq!(fc.runway_days, None);
+        assert_eq!(fc.week_runway_text(Language::German), "");
+        assert_eq!(fc.week_pace_text(Language::German), "");
+    }
+
+    #[test]
+    fn codex_weekly_forecast_uses_known_reset_for_simon_screenshot() {
+        let fc = pacing_forecast_for(
+            false,
+            Some(80),
+            Some("30.09. (19:44)"),
+            None,
+            None,
+            Some((2026, 9, 24)),
+            Some((10, 17)),
+        );
+
+        let elapsed = (24.0 - (19.0 + 44.0 / 60.0) + 10.0 + 17.0 / 60.0) / 24.0;
+        assert!((fc.runway_days.unwrap() - 4.0 * elapsed).abs() < 0.0001);
+        assert!((fc.pace_ratio.unwrap() - 1.4 / elapsed).abs() < 0.0001);
+        assert_eq!(fc.week_runway_text(Language::German), "Reicht noch 2.4 Tage (26.09)");
+        assert!(fc.week_pace_text(Language::German).contains("-4d Defizit"));
+    }
+
+    #[test]
+    fn codex_october_screenshot_has_reserve_instead_of_three_day_deficit() {
+        let fc = pacing_forecast_for(
+            false, Some(95), Some("18.10. (07:35)"), None, None,
+            Some((2026, 10, 11)), Some((18, 4)),
+        );
+        let elapsed = 629.0 / 1440.0; // 07:35 to 18:04 on cycle day one.
+        assert!((fc.remaining_days - (7.0 - elapsed)).abs() < 0.0001);
+        assert!((fc.pace_ratio.unwrap() - 0.35 / elapsed).abs() < 0.0001);
+        assert!((fc.runway_days.unwrap() - 19.0 * elapsed).abs() < 0.0001);
+        assert_eq!(fc.health, PacingHealth::Surplus);
+        assert!(!fc.week_is_deficit());
+        assert_eq!(fc.week_pace_text(Language::German), "Pace: 0.80x · +2d Reserve");
+        assert_eq!(fc.week_runway_text(Language::German), "Reicht noch 8.3 Tage (20.10)");
+    }
+
+    #[test]
+    fn weekly_pace_uses_actual_first_hour_instead_of_fixed_elapsed_floor() {
+        let fc = pacing_forecast_for(
+            false, Some(95), Some("18.10. (07:35)"), None, None,
+            Some((2026, 10, 11)), Some((8, 35)),
+        );
+        assert!((fc.pace_ratio.unwrap() - 8.4).abs() < 0.001);
+        assert!((fc.runway_days.unwrap() - 19.0 / 24.0).abs() < 0.0001);
+        assert!(fc.week_is_deficit());
+    }
+
+    #[test]
+    fn exact_weekly_reset_handles_year_boundary_and_same_day() {
+        assert!((remaining_days_at(Some("02.01. (06:00)"), (2026, 12, 31), (18, 0))
+            .unwrap() - 1.5).abs() < 0.0001);
+        assert!((remaining_days_at(Some("11.10. (19:00)"), (2026, 10, 11), (18, 0))
+            .unwrap() - 1.0 / 24.0).abs() < 0.0001);
+    }
+
+    #[test]
     fn test_format_reset_time_phrase_tomorrow_and_over_weekend() {
         let now_dt = (2026, 9, 23, 12, 36); // Wednesday noon
 
-        // Tomorrow at 19:00 -> in ~30h
+        // Tomorrow at 19:00 -> in ~1d 6h
         let phrase_tomorrow = format_reset_time_phrase(Some("24.09. (19:00)"), false, Language::German, now_dt);
-        assert_eq!(phrase_tomorrow, "in ~30h (24.09. 19:00)");
+        assert_eq!(phrase_tomorrow, "in ~1d 6h (24.09. 19:00)");
 
-        // Friday at 12:53 -> in ~48h
+        // Friday at 12:53 -> in ~2d
         let phrase_fri = format_reset_time_phrase(Some("25.09. (12:53)"), false, Language::German, now_dt);
-        assert_eq!(phrase_fri, "in ~48h (25.09. 12:53)");
+        assert_eq!(phrase_fri, "in ~2d (25.09. 12:53)");
 
-        // Over the weekend to Monday 19:00 -> in ~126h
+        // Over the weekend to Monday 19:00 -> in ~5d 6h
         let phrase_mon = format_reset_time_phrase(Some("28.09. (19:00)"), false, Language::German, now_dt);
-        assert_eq!(phrase_mon, "in ~126h (28.09. 19:00)");
+        assert_eq!(phrase_mon, "in ~5d 6h (28.09. 19:00)");
+    }
+
+    #[test]
+    fn test_format_reset_time_phrase_shows_days_and_hours() {
+        let now_dt = (2026, 9, 24, 10, 28);
+        let phrase_de = format_reset_time_phrase(
+            Some("30.09. (19:44)"),
+            false,
+            Language::German,
+            now_dt,
+        );
+        let phrase_en = format_reset_time_phrase(
+            Some("30.09. (19:44)"),
+            false,
+            Language::English,
+            now_dt,
+        );
+        assert_eq!(phrase_de, "in ~6d 9h (30.09. 19:44)");
+        assert_eq!(phrase_en, "in ~6d 9h (30.09. 19:44)");
     }
 
     #[test]

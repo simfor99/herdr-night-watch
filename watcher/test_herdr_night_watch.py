@@ -56,6 +56,36 @@ class LiveScopeEvaluationTests(unittest.TestCase):
 
 
 class CompletionActionTests(unittest.TestCase):
+    def test_shutdown_forces_open_apps_closed_and_checks_windows_exit_code(self) -> None:
+        with (
+            patch.object(WATCHER.shutil, "which", return_value="powershell.exe"),
+            patch.object(
+                WATCHER.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=0, stderr="", stdout=""),
+            ) as run,
+            patch.object(WATCHER, "log"),
+        ):
+            WATCHER.request_windows_shutdown_now()
+
+        command = run.call_args.args[0]
+        powershell_script = command[-1]
+        self.assertIn("shutdown.exe /s /f /t 0", powershell_script)
+        self.assertIn("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }", powershell_script)
+        self.assertFalse(any("shutdown.exe" in str(argument) for argument in command[:-1]))
+
+    def test_shutdown_reports_windows_command_failure(self) -> None:
+        with (
+            patch.object(WATCHER.shutil, "which", return_value="powershell.exe"),
+            patch.object(
+                WATCHER.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=5, stderr="access denied", stdout=""),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "access denied"):
+                WATCHER.request_windows_shutdown_now()
+
     def test_unknown_settings_fail_closed_to_shutdown(self) -> None:
         self.assertEqual(WATCHER.completion_action("sleep"), "sleep")
         self.assertEqual(WATCHER.completion_action("shutdown"), "shutdown")

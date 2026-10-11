@@ -13,6 +13,17 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(iter::once(0)).collect()
 }
 
+fn forced_shutdown_warning(language: Language, action: CompletionAction) -> &'static str {
+    if action == CompletionAction::Shutdown {
+        language.text(
+            "Offene Apps werden ohne Rückfrage geschlossen. Speichere deine Arbeit oder klicke auf Abbrechen.",
+            "Open apps will be closed without prompting. Save your work or click Cancel.",
+        )
+    } else {
+        ""
+    }
+}
+
 pub fn completion_notice(
     language: Language,
     demo: bool,
@@ -75,7 +86,26 @@ pub fn completion_notice(
         } else {
             ""
         };
-        (language.text("Herdr-Nachtwächter", "Herdr Night Watch"), format!("{network_note}{}\n\n{action}\n\n{}\n{abort}", language.text("Alle überwachten Herdr-Agenten sind fertig oder können ohne Internet nicht weiterarbeiten.", "All monitored Herdr agents are finished or cannot continue without internet."), language.text("Klicke auf OK, um die Aktion sofort auszuführen.", "Click OK to execute the action immediately.")))
+        let forced_warning = forced_shutdown_warning(language, completion_action);
+        let warning_break = if forced_warning.is_empty() {
+            ""
+        } else {
+            "\n\n"
+        };
+        (
+            language.text("Herdr-Nachtwächter", "Herdr Night Watch"),
+            format!(
+                "{network_note}{}\n\n{action}\n\n{}\n\n{forced_warning}{warning_break}{abort}",
+                language.text(
+                    "Alle überwachten Herdr-Agenten sind fertig oder können ohne Internet nicht weiterarbeiten.",
+                    "All monitored Herdr agents are finished or cannot continue without internet.",
+                ),
+                language.text(
+                    "Klicke auf OK, um die Aktion sofort auszuführen.",
+                    "Click OK to execute the action immediately.",
+                ),
+            ),
+        )
     };
     let title = wide(title);
     let text = wide(&text);
@@ -99,12 +129,26 @@ fn notice_action_from_result(result: i32) -> NoticeAction {
 
 #[cfg(test)]
 mod tests {
-    use super::{NoticeAction, notice_action_from_result};
+    use super::{NoticeAction, forced_shutdown_warning, notice_action_from_result};
+    use crate::{backend::CompletionAction, language::Language};
     use windows_sys::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDOK};
     #[test]
     fn only_explicit_ok_confirms() {
         assert_eq!(notice_action_from_result(IDOK), NoticeAction::Confirm);
         assert_eq!(notice_action_from_result(IDCANCEL), NoticeAction::Cancel);
         assert_eq!(notice_action_from_result(0), NoticeAction::Cancel);
+    }
+
+    #[test]
+    fn forced_shutdown_warning_explains_that_apps_close_without_prompt() {
+        assert!(
+            forced_shutdown_warning(Language::German, CompletionAction::Shutdown)
+                .contains("ohne Rückfrage")
+        );
+        assert!(
+            forced_shutdown_warning(Language::English, CompletionAction::Shutdown)
+                .contains("without prompting")
+        );
+        assert!(forced_shutdown_warning(Language::German, CompletionAction::Sleep).is_empty());
     }
 }

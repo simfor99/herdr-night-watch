@@ -7556,6 +7556,10 @@ fn draw_smooth_limit_block(
     }
 }
 
+fn quota_unavailable_label(language: Language) -> &'static str {
+    language.text("Keine aktuellen Daten", "No current data")
+}
+
 fn draw_provider_card(
     painter: &egui::Painter,
     card_rect: egui::Rect,
@@ -7740,11 +7744,7 @@ fn draw_provider_card(
             language,
         );
     } else {
-        let empty_label = if quota.id == ProviderId::Codex {
-            language.text("Keine aktuellen Daten", "No current data")
-        } else {
-            language.text("Kein Limit aktiv · Unbegrenzt", "No limit active · Unlimited")
-        };
+        let empty_label = quota_unavailable_label(language);
         let none_galley = painter.layout_no_wrap(
             empty_label.into(),
             egui::FontId::monospace(11.0),
@@ -9582,6 +9582,18 @@ mod tests {
         let agy = ProviderQuota::new(ProviderId::Agy, "AGY", "Google", Some(73), Some("19:45".into()), Some(85), Some("137h".into()));
         assert_eq!(provider_card_height(&agy), 104.0);
         assert_eq!(quota_satellite_design_height(&[glm, agy], false), 38.0 + 68.0 + 104.0 + 6.0 + 8.0);
+    }
+
+    #[test]
+    fn missing_quota_data_is_not_described_as_unlimited() {
+        assert_eq!(
+            quota_unavailable_label(Language::German),
+            "Keine aktuellen Daten"
+        );
+        assert_eq!(
+            quota_unavailable_label(Language::English),
+            "No current data"
+        );
     }
 
     #[test]
