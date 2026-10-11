@@ -1,5 +1,11 @@
 # Changelog - Herdr-Nachtwächter
 
+## [2026-10-11] - Korrektes Wochen-Pacing v0.1.41
+
+- Das Wochen-Pacing berücksichtigt die Reset-Uhrzeit und die tatsächlich vergangene Zykluszeit. Ein künstliches 3-Tage-Defizit bei 95 % Restbudget entfällt.
+- Das Erschöpfungsdatum berücksichtigt die aktuelle Tageszeit. Die Reichweite bleibt eine Hochrechnung bei gleichbleibendem durchschnittlichem Verbrauch.
+- Regressionstests decken den gemeldeten Codex-Fall, die erste Zyklusstunde und den Jahreswechsel ab.
+
 ## [2026-09-18] - KI-Limits-Dock, Pacing-Radar & synchrone Vorschau v0.1.34
 
 - **Magnetisches Limits-Satellitendock** - Neues an- und abdockbares Satellitenfenster für KI-Budget-Telemetrie (GLM, AGY, Codex) mit 0-Pixel-Nahtstelle und magnetischem Einrasten.

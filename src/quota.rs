@@ -823,6 +823,24 @@ pub fn parse_remaining_days(reset_str: Option<&str>, today: (i32, u32, u32)) -> 
     None
 }
 
+fn remaining_days_at(
+    reset_str: Option<&str>,
+    today: (i32, u32, u32),
+    now: (u32, u32),
+) -> Option<f32> {
+    let (target, time) = parse_target_datetime(reset_str?, today)?;
+    if let Some((hour, minute)) = time {
+        let days = ymd_to_days(target.0, target.1, target.2)
+            - ymd_to_days(today.0, today.1, today.2);
+        let minutes = days * 1440 + hour as i64 * 60 + minute as i64
+            - now.0 as i64 * 60 - now.1 as i64;
+        Some((minutes as f32 / 1440.0).max(0.0))
+    } else {
+        // Date-only providers do not supply enough precision for an hourly pace.
+        parse_remaining_days(reset_str, today)
+    }
+}
+
 pub fn parse_target_datetime(raw: &str, today: (i32, u32, u32)) -> Option<((i32, u32, u32), Option<(u32, u32)>)> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -1079,7 +1097,7 @@ pub fn pacing_forecast_for(
     };
 
     if week_is_exhausted {
-        let rem_days = parse_remaining_days(week_reset, today).unwrap_or(5.0);
+        let rem_days = remaining_days_at(week_reset, today, now_hm).unwrap_or(5.0);
         let mut fc = PacingForecast {
             pace_ratio: None,
             runway_days: Some(0.0),
@@ -1102,8 +1120,8 @@ pub fn pacing_forecast_for(
     // period has elapsed. Without a usable reset date, a burn-rate forecast
     // would have to invent the elapsed time and can produce wildly misleading
     // runway and pace values.
-    let remaining_days = match parse_remaining_days(week_reset, today) {
-        Some(days) => days.max(0.1),
+    let remaining_days = match remaining_days_at(week_reset, today, now_hm) {
+        Some(days) => days.max(1.0 / 1440.0),
         None if week_percent.is_some() => {
             let mut fc = PacingForecast {
                 pace_ratio: None,
@@ -1125,7 +1143,13 @@ pub fn pacing_forecast_for(
         None => 7.0,
     };
     let total_days = if remaining_days > 7.5 { 30.0 } else { 7.0 };
-    let elapsed_days = (total_days - remaining_days).max(0.2);
+    let has_reset_time = week_reset
+        .and_then(|raw| parse_target_datetime(raw, today))
+        .is_some_and(|(_, time)| time.is_some());
+    // Exact reset times reveal the actual cycle age. A fixed 4.8-hour floor
+    // invents consumption history near the start of a weekly period.
+    let min_elapsed = if has_reset_time { 1.0 / 1440.0 } else { 0.2 };
+    let elapsed_days = (total_days - remaining_days).max(min_elapsed);
     let consumed_pct = (100u8.saturating_sub(rem_pct)) as f32;
 
     let allowed_rate = 100.0 / total_days;
@@ -1160,7 +1184,7 @@ pub fn pacing_forecast_for(
         let week_exhaustion_date = runway_days.and_then(|rw| {
             if rw < 30.0 {
                 let today_days = ymd_to_days(today.0, today.1, today.2);
-                let add_days = rw.round() as i64;
+                let add_days = (rw + (now_hm.0 * 60 + now_hm.1) as f32 / 1440.0).floor() as i64;
                 let (_y, ex_m, ex_d) = days_to_ymd(today_days + add_days);
                 Some((ex_m, ex_d))
             } else {
@@ -1188,7 +1212,7 @@ pub fn pacing_forecast_for(
 
     let runway_days = (rem_pct as f32) / burn_rate;
     let today_days = ymd_to_days(today.0, today.1, today.2);
-    let add_days = runway_days.round() as i64;
+    let add_days = (runway_days + (now_hm.0 * 60 + now_hm.1) as f32 / 1440.0).floor() as i64;
     let (_y, ex_m, ex_d) = days_to_ymd(today_days + add_days);
     let week_exhaustion_date = Some((ex_m, ex_d));
     let delta_days = Some((runway_days - remaining_days).round() as i32);
@@ -1972,7 +1996,7 @@ mod tests {
             )),
             Some((local_after_utc_midnight.3, local_after_utc_midnight.4)),
         );
-        assert_eq!(forecast.remaining_days, 7.0);
+        assert!((forecast.remaining_days - (7.0 + 11.5 / 24.0)).abs() < 0.0001);
 
         let (year, month, day, _, _, _) = current_local_datetime();
         assert_eq!(current_forecast_today(), (year as i32, month, day));
@@ -2337,9 +2361,9 @@ mod tests {
             Some(now),
         );
         let week_de = fc.week_runway_text(Language::German);
-        assert_eq!(week_de, "Reicht noch 4.9 Tage (27.09)");
+        assert_eq!(week_de, "Reicht noch 4.8 Tage (27.09)");
         let week_en = fc.week_runway_text(Language::English);
-        assert_eq!(week_en, "Lasts 4.9 days (27.09)");
+        assert_eq!(week_en, "Lasts 4.8 days (27.09)");
     }
 
     #[test]
@@ -2382,10 +2406,46 @@ mod tests {
             Some((10, 17)),
         );
 
-        assert_eq!(fc.runway_days, Some(4.0));
-        assert_eq!(fc.pace_ratio, Some(1.4));
-        assert_eq!(fc.week_runway_text(Language::German), "Reicht noch 4.0 Tage (28.09)");
-        assert!(fc.week_pace_text(Language::German).contains("-2d Defizit"));
+        let elapsed = (24.0 - (19.0 + 44.0 / 60.0) + 10.0 + 17.0 / 60.0) / 24.0;
+        assert!((fc.runway_days.unwrap() - 4.0 * elapsed).abs() < 0.0001);
+        assert!((fc.pace_ratio.unwrap() - 1.4 / elapsed).abs() < 0.0001);
+        assert_eq!(fc.week_runway_text(Language::German), "Reicht noch 2.4 Tage (26.09)");
+        assert!(fc.week_pace_text(Language::German).contains("-4d Defizit"));
+    }
+
+    #[test]
+    fn codex_october_screenshot_has_reserve_instead_of_three_day_deficit() {
+        let fc = pacing_forecast_for(
+            false, Some(95), Some("18.10. (07:35)"), None, None,
+            Some((2026, 10, 11)), Some((18, 4)),
+        );
+        let elapsed = 629.0 / 1440.0; // 07:35 to 18:04 on cycle day one.
+        assert!((fc.remaining_days - (7.0 - elapsed)).abs() < 0.0001);
+        assert!((fc.pace_ratio.unwrap() - 0.35 / elapsed).abs() < 0.0001);
+        assert!((fc.runway_days.unwrap() - 19.0 * elapsed).abs() < 0.0001);
+        assert_eq!(fc.health, PacingHealth::Surplus);
+        assert!(!fc.week_is_deficit());
+        assert_eq!(fc.week_pace_text(Language::German), "Pace: 0.80x · +2d Reserve");
+        assert_eq!(fc.week_runway_text(Language::German), "Reicht noch 8.3 Tage (20.10)");
+    }
+
+    #[test]
+    fn weekly_pace_uses_actual_first_hour_instead_of_fixed_elapsed_floor() {
+        let fc = pacing_forecast_for(
+            false, Some(95), Some("18.10. (07:35)"), None, None,
+            Some((2026, 10, 11)), Some((8, 35)),
+        );
+        assert!((fc.pace_ratio.unwrap() - 8.4).abs() < 0.001);
+        assert!((fc.runway_days.unwrap() - 19.0 / 24.0).abs() < 0.0001);
+        assert!(fc.week_is_deficit());
+    }
+
+    #[test]
+    fn exact_weekly_reset_handles_year_boundary_and_same_day() {
+        assert!((remaining_days_at(Some("02.01. (06:00)"), (2026, 12, 31), (18, 0))
+            .unwrap() - 1.5).abs() < 0.0001);
+        assert!((remaining_days_at(Some("11.10. (19:00)"), (2026, 10, 11), (18, 0))
+            .unwrap() - 1.0 / 24.0).abs() < 0.0001);
     }
 
     #[test]
