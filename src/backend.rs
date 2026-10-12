@@ -48,6 +48,7 @@ pub enum WatchStatus {
         warning_seconds: u64,
     },
     ShutdownWarning {
+        warning_id: String,
         targets: usize,
         live_scope: bool,
         demo: bool,
@@ -129,6 +130,8 @@ struct Target {
 
 #[derive(Debug, Deserialize)]
 struct ShutdownWarning {
+    #[serde(default)]
+    warning_id: String,
     cancelable_until: String,
     #[serde(default)]
     seconds_remaining: u64,
@@ -268,6 +271,7 @@ pub fn status() -> Result<WatchStatus> {
     if let Some(warning) = payload.shutdown_warning {
         let _warning_until = warning.cancelable_until;
         return Ok(WatchStatus::ShutdownWarning {
+            warning_id: warning.warning_id,
             targets,
             live_scope,
             demo: state.demo,
@@ -336,13 +340,43 @@ pub fn stop(source: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn confirm_completion() -> Result<()> {
+pub fn confirm_completion(warning_id: &str) -> Result<()> {
     let mut command = wsl();
     command
         .arg("/usr/bin/python3")
         .arg(watcher_path())
-        .arg("--confirm");
+        .arg("--confirm")
+        .arg("--expected-warning-id")
+        .arg(warning_id);
     command_output(command, "Sofortiger Abschluss")?;
+    Ok(())
+}
+
+pub fn warning_is_current(expected: &str) -> Result<bool> {
+    let mut command = wsl();
+    command
+        .arg("/usr/bin/python3")
+        .arg(watcher_path())
+        .arg("--warning-status");
+    let output = command_output(command, "Warnungsprüfung")?;
+    #[derive(Deserialize)]
+    struct WarningIdentity {
+        warning_id: Option<String>,
+    }
+    let identity: WarningIdentity = serde_json::from_str(&output)?;
+    Ok(!expected.is_empty() && identity.warning_id.as_deref() == Some(expected))
+}
+
+pub fn cancel_warning(warning_id: &str) -> Result<()> {
+    let mut command = wsl();
+    command.arg("/usr/bin/python3").arg(watcher_path()).args([
+        "--cancel",
+        "--cancel-source",
+        "warning_dialog",
+        "--expected-warning-id",
+        warning_id,
+    ]);
+    command_output(command, "Abschaltwarnung abbrechen")?;
     Ok(())
 }
 
