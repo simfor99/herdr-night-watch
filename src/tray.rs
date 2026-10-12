@@ -234,12 +234,27 @@ impl App {
             self.checking = false;
             match result {
                 Ok(status) => {
-                    let show_notice =
-                        matches!(status, backend::WatchStatus::ShutdownWarning { .. })
-                            && !matches!(self.status, backend::WatchStatus::ShutdownWarning { .. });
+                    let show_notice = match (&status, &self.status) {
+                        (
+                            backend::WatchStatus::ShutdownWarning {
+                                warning_id: new, ..
+                            },
+                            backend::WatchStatus::ShutdownWarning {
+                                warning_id: old, ..
+                            },
+                        ) => new != old,
+                        (backend::WatchStatus::ShutdownWarning { .. }, _) => true,
+                        _ => false,
+                    };
                     self.status = status;
                     self.sync_expected_exit();
                     if show_notice {
+                        let warning_id = match &self.status {
+                            backend::WatchStatus::ShutdownWarning { warning_id, .. } => {
+                                warning_id.clone()
+                            }
+                            _ => unreachable!(),
+                        };
                         let (
                             demo,
                             observe_only,
@@ -270,9 +285,10 @@ impl App {
                                 warning_seconds,
                                 completion_action,
                                 network_triggered,
+                                Some(&warning_id),
                             ) {
                                 notify::NoticeAction::Confirm => {
-                                    match backend::confirm_completion() {
+                                    match backend::confirm_completion(&warning_id) {
                                         Ok(()) => Some("Abschluss sofort bestätigt".into()),
                                         Err(error) => {
                                             tray_history::set_expected_exit(false);
@@ -280,8 +296,12 @@ impl App {
                                         }
                                     }
                                 }
+                                notify::NoticeAction::Dismissed => {
+                                    tray_history::set_expected_exit(false);
+                                    Some("Abschaltwarnung nicht mehr aktiv".into())
+                                }
                                 notify::NoticeAction::Cancel => {
-                                    match backend::stop("warning_dialog") {
+                                    match backend::cancel_warning(&warning_id) {
                                         Ok(()) => {
                                             tray_history::set_expected_exit(false);
                                             Some("Nachtmodus abgebrochen".into())
@@ -302,6 +322,7 @@ impl App {
                                 warning_seconds,
                                 completion_action,
                                 network_triggered,
+                                None,
                             );
                         }
                     }
@@ -653,7 +674,10 @@ fn menu_for(
         language.text("Fenstereinstellungen", "Window settings"),
         true,
     );
-    let transparency_submenu = Submenu::new(language.text("Fenstertransparenz", "Window transparency"), true);
+    let transparency_submenu = Submenu::new(
+        language.text("Fenstertransparenz", "Window transparency"),
+        true,
+    );
     let current_transparency = window_settings::transparency();
     for value in window_settings::TRANSPARENCY_VALUES {
         let id = format!("{ID_WINDOW_TRANSPARENCY_PREFIX}{value}");
@@ -1025,6 +1049,7 @@ mod tests {
             warning_seconds: 300,
         };
         let warning = WatchStatus::ShutdownWarning {
+            warning_id: "test-warning".into(),
             targets: 1,
             live_scope: true,
             demo: false,

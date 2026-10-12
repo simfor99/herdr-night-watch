@@ -1,5 +1,13 @@
 # Changelog - Herdr-Nachtwächter
 
+## [2026-10-12] - Live-Anzeige und sichere Abschlussprüfung
+
+- CPU-, GPU-, RAM- und VRAM-Beschriftungen bleiben bei voller Schriftgröße sichtbar. Gleichmäßige Abstände und reservierte Ziffernbreiten verhindern springende Prozentanzeigen.
+- Nach einer Größenänderung wird die sichtbare Windows-Fensterfläche aktualisiert, damit beim Zurücksetzen auf 100 % keine Inhalte abgeschnitten bleiben.
+- Zusätzliche Abschlussprüfungen können noch laufende übergeordnete Arbeit erkennen; die Firstmate-Anbindung liest offene Aufgaben und ausstehende Fortsetzungen.
+- Zurückgezogene Abschaltwarnungen schließen automatisch. Bestätigen und Abbrechen gelten nur für die angezeigte Warnung; vor einer Bestätigung wird der Arbeitszustand erneut geprüft.
+- Die mitgelieferte EXE enthält diese Korrekturen. Die Firstmate-Anbindung benötigt zusätzlich die lokale Konfiguration gemäß `05-abschlusspruefung.md`.
+
 ## [2026-10-11] - Korrektes Wochen-Pacing v0.1.41
 
 - Das Wochen-Pacing berücksichtigt die Reset-Uhrzeit und die tatsächlich vergangene Zykluszeit. Ein künstliches 3-Tage-Defizit bei 95 % Restbudget entfällt.
