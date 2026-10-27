@@ -48,6 +48,7 @@ pub enum WatchStatus {
         warning_seconds: u64,
     },
     ShutdownWarning {
+        warning_id: String,
         targets: usize,
         live_scope: bool,
         demo: bool,
@@ -129,6 +130,8 @@ struct Target {
 
 #[derive(Debug, Deserialize)]
 struct ShutdownWarning {
+    #[serde(default)]
+    warning_id: String,
     cancelable_until: String,
     #[serde(default)]
     seconds_remaining: u64,
@@ -212,13 +215,17 @@ fn spawn_watcher() -> Result<()> {
 }
 
 pub fn status() -> Result<WatchStatus> {
+    if STATUS_CLOSING.load(std::sync::atomic::Ordering::Acquire) {
+        bail!("Statuskanal wird beendet");
+    }
+    let config = configuration::load();
+    let key = format!("{}\n{}", config.distro, config.watcher_path);
     let mut command = wsl();
-    command
-        .arg("/usr/bin/python3")
-        .arg(watcher_path())
-        .arg("--status");
-    let output = command_output(command, "Herdr-Statusabfrage")?;
-    let payload: StatusPayload = serde_json::from_str(&output)
+    command.arg("/usr/bin/env")
+        .arg(format!("HERDR_STATUS_WINDOWS_BOOT_TICKS={}", windows_boot_ticks()?))
+        .arg("/usr/bin/python3").arg(&config.watcher_path).arg("--status-channel");
+    let output = status_transport().lock().unwrap().request(key, command)?;
+    let payload: StatusPayload = serde_json::from_value(output)
         .map_err(|error| anyhow!("Herdr-Status konnte nicht gelesen werden: {error}"))?;
     let agents = AgentSummary {
         available: payload.live_agents.available,
@@ -268,6 +275,7 @@ pub fn status() -> Result<WatchStatus> {
     if let Some(warning) = payload.shutdown_warning {
         let _warning_until = warning.cancelable_until;
         return Ok(WatchStatus::ShutdownWarning {
+            warning_id: warning.warning_id,
             targets,
             live_scope,
             demo: state.demo,
@@ -336,13 +344,43 @@ pub fn stop(source: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn confirm_completion() -> Result<()> {
+pub fn confirm_completion(warning_id: &str) -> Result<()> {
     let mut command = wsl();
     command
         .arg("/usr/bin/python3")
         .arg(watcher_path())
-        .arg("--confirm");
+        .arg("--confirm")
+        .arg("--expected-warning-id")
+        .arg(warning_id);
     command_output(command, "Sofortiger Abschluss")?;
+    Ok(())
+}
+
+pub fn warning_is_current(expected: &str) -> Result<bool> {
+    let mut command = wsl();
+    command
+        .arg("/usr/bin/python3")
+        .arg(watcher_path())
+        .arg("--warning-status");
+    let output = command_output(command, "Warnungsprüfung")?;
+    #[derive(Deserialize)]
+    struct WarningIdentity {
+        warning_id: Option<String>,
+    }
+    let identity: WarningIdentity = serde_json::from_str(&output)?;
+    Ok(!expected.is_empty() && identity.warning_id.as_deref() == Some(expected))
+}
+
+pub fn cancel_warning(warning_id: &str) -> Result<()> {
+    let mut command = wsl();
+    command.arg("/usr/bin/python3").arg(watcher_path()).args([
+        "--cancel",
+        "--cancel-source",
+        "warning_dialog",
+        "--expected-warning-id",
+        warning_id,
+    ]);
+    command_output(command, "Abschaltwarnung abbrechen")?;
     Ok(())
 }
 
@@ -423,4 +461,48 @@ pub fn open_log() -> Result<()> {
         .spawn()
         .context("Protokoll konnte nicht geöffnet werden")?;
     Ok(())
+}
+
+static STATUS_INPUT: std::sync::OnceLock<crate::status_channel::Input> = std::sync::OnceLock::new();
+static STATUS_TRANSPORT: std::sync::OnceLock<std::sync::Mutex<crate::status_channel::Channel>> = std::sync::OnceLock::new();
+static STATUS_CLOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn status_transport() -> &'static std::sync::Mutex<crate::status_channel::Channel> {
+    STATUS_TRANSPORT.get_or_init(|| {
+        let input = STATUS_INPUT.get_or_init(Default::default).clone();
+        std::sync::Mutex::new(crate::status_channel::Channel::new(input))
+    })
+}
+
+pub fn shutdown_status_channel() {
+    STATUS_CLOSING.store(true, std::sync::atomic::Ordering::Release);
+    {
+        let mut input = STATUS_INPUT.get_or_init(Default::default).lock().unwrap();
+        input.closing = true;
+        input.writer.take();
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    if let Some(channel) = STATUS_TRANSPORT.get() {
+        while Instant::now() < deadline {
+            if let Ok(mut channel) = channel.try_lock() { channel.close_until(deadline); break; }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+// Native boot timestamp, the same FILETIME value exposed by Windows CIM.
+// No PowerShell/console process is needed for display-only status requests.
+fn windows_boot_ticks() -> Result<i64> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct TimeOfDay { boot: i64, current: i64, zone_bias: i64, zone_id: u32,
+        reserved: u32, boot_bias: u64, sleep_bias: u64 }
+    #[link(name = "ntdll")]
+    unsafe extern "system" { fn NtQuerySystemInformation(class: u32, data: *mut TimeOfDay,
+        length: u32, returned: *mut u32) -> i32; }
+    let mut data = TimeOfDay::default();
+    let status = unsafe { NtQuerySystemInformation(3, &mut data,
+        std::mem::size_of::<TimeOfDay>() as u32, std::ptr::null_mut()) };
+    if status < 0 || data.boot <= 0 { bail!("Windows-Startzeit nicht verfügbar ({status})"); }
+    Ok(data.boot)
 }
