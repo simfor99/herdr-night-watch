@@ -60,7 +60,7 @@ Wächter prüft aktuellen Herdr-Status, Ruhezeit und Warnfrist
 
 ## Agentenunabhängige Anbindung
 
-Der Nachtwächter hängt nicht an Codex oder Claude Code. Beide sind lediglich mögliche Programme in Herdr-Panes. Entscheidend ist allein die Herdr-CLI: Sie meldet dem Wächter, ob aktuell Arbeit läuft. Der Wächter liest weder Prompt-Inhalte noch Terminalausgaben und steuert keine Agenten. Damit kann eine Herdr-Sitzung auch Codex, Claude Code und weitere Agenten parallel enthalten.
+Der Nachtwächter hängt nicht an Codex oder Claude Code. Beide sind lediglich mögliche Programme in Herdr-Panes. Die Herdr-CLI meldet dem Wächter, ob aktuell Agentenarbeit läuft. Zusätzlich können allgemeine Abschlussprüfungen übergeordnete Arbeit absichern, die zwischen einzelnen Agentenantworten weiterläuft. Die [Abschlussprüfung für übergeordnete Arbeit](05-abschlusspruefung.md) beschreibt den aktuellen Vertrag und die Firstmate-Anbindung. Der Wächter liest weder Prompt-Inhalte noch Terminalausgaben und steuert keine Agenten. Damit kann eine Herdr-Sitzung auch Codex, Claude Code und weitere Agenten parallel enthalten.
 
 Die öffentliche Anwendung speichert zwei lokale Angaben unter dem Windows-Benutzerkonto: den Namen der WSL-Distro und den vollständigen WSL-Pfad zur Datei `herdr-night-watch.py`. Sie stehen im Rechtsklick-Menü unter „Einrichtung öffnen“ zur Verfügung. Das ist bewusst kein fest eingebauter Codex-Pfad mehr und gehört nicht in Git oder Logs.
 
@@ -97,7 +97,7 @@ Die Tray-App schreibt zusätzlich während ihrer Laufzeit einen temporären Sitz
 
 Abbrüche erhalten ebenfalls einen eigenen Verlauf. `cancellation-history.csv` nennt als Quelle zum Beispiel `live_window_moon`, `tray_menu`, `warning_dialog`, `manual_stop_script`, `start_failed` oder `power_guard_failed`. Damit ist am Folgetag nachvollziehbar, warum ein Nachtlauf nicht mehr aktiv war.
 
-`live_agent_summary()` liefert dieselbe aktuelle Herdr-Sicht für Tooltip und Live-Fenster. Die Shutdown-Entscheidung ruft Herdr unabhängig erneut ab und vertraut nie auf eine alte Anzeige. Ist Herdr nicht erreichbar oder ein Agentenstatus unvollständig, wird kein Shutdown vorbereitet.
+`live_agent_summary()` liefert dieselbe aktuelle Herdr-Sicht für Tooltip und Live-Fenster. Die Shutdown-Entscheidung ruft Herdr und die eingerichteten Abschlussprüfungen unabhängig erneut ab und vertraut nie auf eine alte Anzeige. Auch eine Sofortbestätigung prüft die aktuelle Arbeit und die Kennung der angezeigten Warnung erneut. Zurückgenommene Warnungen schließen ihr eigenes Warnfenster automatisch. Ist Herdr nicht erreichbar oder ein Agentenstatus unvollständig, wird kein Shutdown vorbereitet.
 
 ## Die zwei Wahrheiten: Quellcode und Auslieferung
 

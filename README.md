@@ -90,6 +90,8 @@ A dedicated magnetic satellite dock can be opened directly below the live status
 
 Claude's 5-hour and weekly quota values come from the `rate_limits` data in Claude Code's configured status-line input. This is available for Claude.ai Pro and Max accounts in Claude Code 2.1.251 or later, after the session's first API response. The capture helper stores only percentages and reset times locally; missing or stale data is shown as unavailable, never as unlimited.
 
+Weekly pacing uses the reset date and clock time when both are available. It divides the percentage consumed by the elapsed cycle time and projects the remaining budget at that average rate; it is an estimate, not a measured recent consumption trend. Date-only resets retain day-level estimates.
+
 ## Usage
 
 - **Start night mode**: continuously monitors all agents currently reported by Herdr and only shuts down Windows after the configured quiet period.

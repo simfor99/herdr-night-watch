@@ -1,5 +1,30 @@
 # Changelog - Herdr-Nachtwächter
 
+## [2026-10-26] - NVIDIA-Telemetrie erholt sich nach Einzelfehlern
+
+- Ein einziger fehlgeschlagener `nvidia-smi`-Aufruf (zum Beispiel ein Timeout unter Last) hat die NVIDIA-Telemetrie dauerhaft abgeschaltet: GPU-Temperatur, Verbrauch in Watt und VRAM zeigten bis zum App-Neustart einen Strich, obwohl `nvidia-smi` weiterhin antwortete. Nach einem Fehler pausiert die Abfrage jetzt 60 Sekunden und versucht es danach erneut, passend zum Retry-Muster der CPU-Temperatur; ein erfolgreicher Aufruf schaltet die Telemetrie sofort wieder frei.
+- Der neue Regressionstest prüft Fehler, Pause, Neuer Versuch und Wiederherstellung mit injizierbarem Reader und läuft damit deterministisch auf Maschinen mit und ohne NVIDIA-GPU.
+
+## [2026-10-24] - Statuskanal heilt nach WSL-Neustarts selbst
+
+- Der persistente Statuskanal der Windows-App stirbt, wenn WSL unter dem laufenden Tray neu startet; der bisherige Fail-Closed-Endstopp (fünf Fehler oder nicht bestätigte Kindprozess-Beendigung) hat die Verbindung danach dauerhaft blockiert, bis die App von Hand neu gestartet wurde. Statt des Endstopps pausiert der Kanal nach einer nicht bestätigten Beendigung 60 Sekunden und startet danach einen neuen Versuch; wiederholte Fehler verzögern über exponentielles Backoff (bis 64 Sekunden), stoppen aber nie dauerhaft.
+- Die Anzeige lügt nicht mehr über die Ursache: Bei gestörtem Statuskanal zeigt das Live-Fenster und das Tray-Menü „Herdr-Status veraltet – Kanal gestört“ statt „Herdr ist gerade nicht erreichbar“. Die Erreichbarkeitsmeldung steht nur noch nach einer frischen, erfolgreichen Abfrage, die `available: false` gemeldet hat.
+- Regressionstests decken die Selbstheilung nach der Pause und die Backoff-Kaskade ohne Endstopp ab.
+
+## [2026-10-12] - Live-Anzeige und sichere Abschlussprüfung
+
+- CPU-, GPU-, RAM- und VRAM-Beschriftungen bleiben bei voller Schriftgröße sichtbar. Gleichmäßige Abstände und reservierte Ziffernbreiten verhindern springende Prozentanzeigen.
+- Nach einer Größenänderung wird die sichtbare Windows-Fensterfläche aktualisiert, damit beim Zurücksetzen auf 100 % keine Inhalte abgeschnitten bleiben.
+- Zusätzliche Abschlussprüfungen können noch laufende übergeordnete Arbeit erkennen; die Firstmate-Anbindung liest offene Aufgaben und ausstehende Fortsetzungen.
+- Zurückgezogene Abschaltwarnungen schließen automatisch. Bestätigen und Abbrechen gelten nur für die angezeigte Warnung; vor einer Bestätigung wird der Arbeitszustand erneut geprüft.
+- Die mitgelieferte EXE enthält diese Korrekturen. Die Firstmate-Anbindung benötigt zusätzlich die lokale Konfiguration gemäß `05-abschlusspruefung.md`.
+
+## [2026-10-11] - Korrektes Wochen-Pacing v0.1.41
+
+- Das Wochen-Pacing berücksichtigt die Reset-Uhrzeit und die tatsächlich vergangene Zykluszeit. Ein künstliches 3-Tage-Defizit bei 95 % Restbudget entfällt.
+- Das Erschöpfungsdatum berücksichtigt die aktuelle Tageszeit. Die Reichweite bleibt eine Hochrechnung bei gleichbleibendem durchschnittlichem Verbrauch.
+- Regressionstests decken den gemeldeten Codex-Fall, die erste Zyklusstunde und den Jahreswechsel ab.
+
 ## [2026-09-18] - KI-Limits-Dock, Pacing-Radar & synchrone Vorschau v0.1.34
 
 - **Magnetisches Limits-Satellitendock** - Neues an- und abdockbares Satellitenfenster für KI-Budget-Telemetrie (GLM, AGY, Codex) mit 0-Pixel-Nahtstelle und magnetischem Einrasten.
