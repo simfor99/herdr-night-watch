@@ -27,6 +27,7 @@ const LIVE_STATUS_QUOTA_COLOR_CODEX_VALUE: &str = "LiveStatusQuotaColorCodex";
 const LIVE_STATUS_QUOTA_COLOR_CLAUDE_VALUE: &str = "LiveStatusQuotaColorClaude";
 const LIVE_STATUS_CORNER_RADIUS_VALUE: &str = "LiveStatusCornerRadius";
 const LIVE_STATUS_QUOTA_SETTINGS_OPEN_VALUE: &str = "LiveStatusQuotaSettingsOpen";
+const LIVE_STATUS_QUOTA_ORDER_VALUE: &str = "LiveStatusQuotaOrder";
 
 pub const DEFAULT_LIVE_STATUS_CORNER_RADIUS: u8 = 10;
 pub const MIN_LIVE_STATUS_CORNER_RADIUS: u8 = 0;
@@ -183,6 +184,65 @@ fn read_bool_setting(value_name: &str, default: bool) -> bool {
 fn write_bool_setting(value_name: &str, value: bool) -> anyhow::Result<()> {
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
     key.set_value(value_name, &u32::from(value))?;
+    Ok(())
+}
+
+fn provider_id_token(provider: crate::quota::ProviderId) -> &'static str {
+    match provider {
+        crate::quota::ProviderId::Glm => "Glm",
+        crate::quota::ProviderId::Agy => "Agi",
+        crate::quota::ProviderId::Codex => "Codex",
+        crate::quota::ProviderId::Claude => "Claude",
+    }
+}
+
+fn provider_id_from_token(token: &str) -> Option<crate::quota::ProviderId> {
+    match token.trim() {
+        "Glm" => Some(crate::quota::ProviderId::Glm),
+        "Agi" => Some(crate::quota::ProviderId::Agy),
+        "Codex" => Some(crate::quota::ProviderId::Codex),
+        "Claude" => Some(crate::quota::ProviderId::Claude),
+        _ => None,
+    }
+}
+
+pub fn default_quota_order() -> Vec<crate::quota::ProviderId> {
+    vec![
+        crate::quota::ProviderId::Glm,
+        crate::quota::ProviderId::Agy,
+        crate::quota::ProviderId::Codex,
+        crate::quota::ProviderId::Claude,
+    ]
+}
+
+/// Persisted display order of the quota cards; unknown or missing entries
+/// keep the default order, unknown tokens are ignored.
+pub fn live_status_quota_order() -> Vec<crate::quota::ProviderId> {
+    let stored: Option<String> = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .and_then(|key| key.get_value::<String, _>(LIVE_STATUS_QUOTA_ORDER_VALUE))
+        .ok();
+    let Some(stored) = stored else {
+        return default_quota_order();
+    };
+    let mut order: Vec<crate::quota::ProviderId> = stored
+        .split(',')
+        .filter_map(provider_id_from_token)
+        .collect();
+    let mut full = default_quota_order();
+    full.retain(|provider| !order.contains(provider));
+    order.extend(full);
+    order
+}
+
+pub fn set_live_status_quota_order(order: &[crate::quota::ProviderId]) -> anyhow::Result<()> {
+    let serialized = order
+        .iter()
+        .map(|provider| provider_id_token(*provider))
+        .collect::<Vec<_>>()
+        .join(",");
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
+    key.set_value(LIVE_STATUS_QUOTA_ORDER_VALUE, &serialized)?;
     Ok(())
 }
 
