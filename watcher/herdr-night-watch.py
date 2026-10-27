@@ -29,6 +29,9 @@ from urllib.request import Request, urlopen
 
 TERMINAL_STATUSES = {"idle", "done"}
 REFUSAL_STATUSES = {"blocked", "unknown"}
+UNCERTAIN_STATUSES = {"unknown"}
+UNCERTAIN_STATUS_RECHECK_ATTEMPTS = 2
+UNCERTAIN_STATUS_RECHECK_INTERVAL_SECONDS = 3
 DEFAULT_POLL_SECONDS = 1
 DEFAULT_QUIET_SECONDS = 5
 DEFAULT_WARNING_SECONDS = 300
@@ -37,6 +40,11 @@ MAX_WARNING_SECONDS = 3600
 NETWORK_GRACE_SECONDS = 300
 NETWORK_CHECK_INTERVAL_SECONDS = 15
 BOOT_MARKER_CACHE_TTL_SECONDS = 30
+# arm() records the CIM boot timestamp while the status channel derives a
+# native tick-based marker for the same boot. The two sources differ in
+# precision and reference moment, so equality needs a small tolerance instead
+# of a plain string comparison.
+BOOT_MARKER_COMPARE_TOLERANCE_SECONDS = 5
 BOOT_MARKER_RETRY_INTERVAL_SECONDS = 5
 BOOT_MARKER_RETRY_ATTEMPTS = 12
 BOOT_MARKER_WAIT_DEADLINE_SECONDS = 60
@@ -150,6 +158,37 @@ def windows_boot_time_from_marker(boot_id: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def boot_markers_match(previous: str | None, current: str | None) -> bool | None:
+    """Compare two composite boot markers across their marker sources.
+
+    Returns True when both describe the same boot session, False when they
+    describe different sessions, and None when the inputs cannot be compared.
+    Equal WSL markers plus Windows boot timestamps within the compare
+    tolerance describe the same session even when one marker came from CIM
+    and the other from the native tick calculation.
+    """
+    if not isinstance(previous, str) or not isinstance(current, str):
+        return None
+    if previous == current:
+        return True
+    previous_wsl = previous.split("|windows:", 1)[0]
+    current_wsl = current.split("|windows:", 1)[0]
+    if previous_wsl != current_wsl:
+        return False
+    previous_boot = windows_boot_time_from_marker(previous)
+    current_boot = windows_boot_time_from_marker(current)
+    if previous_boot is None or current_boot is None:
+        return False
+    return (
+        abs(previous_boot - current_boot).total_seconds()
+        <= BOOT_MARKER_COMPARE_TOLERANCE_SECONDS
+    )
+
+
+# Only the dedicated status channel sets this budget; power commands keep their contract.
+_STATUS_DEADLINE: float | None = None
+_STATUS_WINDOWS_BOOT_ID: str | None = None
+
 def state_dir() -> Path:
     root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     return root / "herdr-night-watch"
@@ -169,8 +208,35 @@ def wsl_boot_id() -> str | None:
     return value or None
 
 
+WINDOWS_POWERSHELL_FALLBACK_PATH = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+
+def powershell_executable() -> str | None:
+    """Resolve powershell.exe without depending on an interactive shell's PATH.
+
+    Some interactive shells on this machine deliberately trim Windows PATH
+    entries for faster command resolution, and a watcher started by Windows
+    Task Scheduler gets its own minimal PATH. Either way, a bare
+    "powershell.exe" plus shutil.which() can come back empty even though
+    /mnt/c is mounted and PowerShell is right there. Fall back to the fixed
+    WSL mount path before giving up.
+    """
+    configured = os.environ.get("HERDR_POWERSHELL_BIN")
+    candidates = [configured, shutil.which("powershell.exe"), WINDOWS_POWERSHELL_FALLBACK_PATH]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def windows_boot_id(deadline: float | None = None) -> str | None:
     """Return Windows' last boot time when this watcher runs inside WSL."""
+    if _STATUS_DEADLINE is not None and _STATUS_WINDOWS_BOOT_ID is not None:
+        return _STATUS_WINDOWS_BOOT_ID
+    powershell = powershell_executable()
+    if not powershell:
+        record_diagnostic("WINDOWS_BOOT_MARKER_UNAVAILABLE", method="powershell_not_found")
+        return None
     queries = (
         (
             "cim",
@@ -192,7 +258,7 @@ def windows_boot_id(deadline: float | None = None) -> str | None:
         try:
             result = subprocess.run(
                 [
-                    "powershell.exe",
+                    powershell,
                     "-NoProfile",
                     "-NonInteractive",
                     "-WindowStyle",
@@ -307,7 +373,7 @@ def reset_stale_run_after_restart(
                 and current_windows_boot
                 and completed_at < current_windows_boot
             )
-            if (previous_boot_id and previous_boot_id != current_boot_id) or (
+            if (previous_boot_id and boot_markers_match(previous_boot_id, current_boot_id) is not True) or (
                 not previous_boot_id and completed_before_current_boot
             ):
                 completed_run_id = str(state.get("run_id", "unknown"))
@@ -317,7 +383,7 @@ def reset_stale_run_after_restart(
                 return False
         if completed_run_id is None:
             reset_reason: str | None = None
-            if previous_boot_id and previous_boot_id != current_boot_id:
+            if previous_boot_id and boot_markers_match(previous_boot_id, current_boot_id) is not True:
                 reset_reason = "boot_id_changed"
             elif not previous_boot_id:
                 # Runs created by watcher schema 3 predate persisted boot markers.
@@ -403,7 +469,18 @@ def completion_lock() -> Any:
     path = completion_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if _STATUS_DEADLINE is None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        else:
+            deadline = min(_STATUS_DEADLINE, time.monotonic() + 2)
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Status reconciliation lock is busy")
+                    time.sleep(0.02)
         try:
             yield
         finally:
@@ -602,7 +679,11 @@ def load_json(path: Path) -> dict[str, Any] | None:
 
 
 def run_command(arguments: list[str]) -> str:
-    completed = subprocess.run(arguments, text=True, capture_output=True, check=False)
+    if _STATUS_DEADLINE is None:
+        completed = subprocess.run(arguments, text=True, capture_output=True, check=False)
+    else:
+        from status_channel import run_bounded
+        completed = run_bounded(arguments, _STATUS_DEADLINE)
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
         raise RuntimeError(f"{' '.join(arguments[:3])} failed: {detail}")
@@ -735,6 +816,58 @@ def snapshot_target(agent: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def load_work_guard_config() -> list[dict[str, Any]]:
+    path = state_dir() / "work-guards.json"
+    if not path.exists():
+        return []
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        guards = config["guards"]
+        if config.get("schema_version") != 1 or not isinstance(guards, list):
+            raise ValueError("unsupported work guard configuration")
+        ids: set[str] = set()
+        for guard in guards:
+            identifier = guard["id"]
+            command = guard["command"]
+            if not isinstance(identifier, str) or not identifier or identifier in ids:
+                raise ValueError("work guards need unique nonempty ids")
+            if not isinstance(command, list) or not command or not all(isinstance(arg, str) and arg for arg in command):
+                raise ValueError("work guard command must be an argument list")
+            ids.add(identifier)
+        return guards
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f"Work guard configuration could not be read: {error}") from error
+
+
+def evaluate_work_guards(state: dict[str, Any]) -> tuple[str, list[str]]:
+    statuses = []
+    active = False
+    for guard in state.get("work_guards", []):
+        try:
+            output = subprocess.run(guard["command"], capture_output=True, text=True,
+                                    check=False, timeout=5, stdin=subprocess.DEVNULL)
+            if output.returncode != 0 or len(output.stdout) > 65536:
+                raise ValueError("guard failed or returned too much output")
+            payload = json.loads(output.stdout)
+            status = payload.get("status")
+            if payload.get("schema_version") != 1 or status not in {"ready", "active", "unknown"}:
+                raise ValueError("invalid guard response")
+            statuses.append(f"work_guard:{guard['id']}={status} ({str(payload.get('detail', ''))[:300]})")
+            if status == "unknown":
+                return "refuse", statuses
+            active |= status == "active"
+        except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError(f"Work guard {guard['id']} unavailable: {error}") from error
+    return ("active" if active else "terminal"), statuses
+
+
+def work_guards_ready(state: dict[str, Any]) -> bool:
+    try:
+        return evaluate_work_guards(state)[0] == "terminal"
+    except RuntimeError:
+        return False
+
+
 def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: int) -> int:
     boot_id = wait_for_runtime_boot_id()
     reset_stale_run_after_restart(current_boot_id=boot_id)
@@ -770,6 +903,8 @@ def arm(dry_run: bool, poll_seconds: int, quiet_seconds: int, warning_seconds: i
             "completion_action": preferred_completion_action(),
             "network_unavailable_since": None,
             "targets": [],
+            # Freeze the configured safety sources for the entire run.
+            "work_guards": load_work_guard_config(),
         }
         write_json(state_path, state)
     log(
@@ -812,6 +947,38 @@ def demo() -> int:
     return 0
 
 
+def _resolve_uncertain_status(pane_id: str | None, status: Any) -> str | None:
+    """Give Herdr a brief, bounded chance to report a stable status again.
+
+    A pane can report "unknown" (or omit agent_status entirely) for a single
+    poll cycle during a short-lived terminal/session transition, such as
+    closing or reattaching a pane. That one uncertain reading must not
+    permanently discard an otherwise healthy night run. "blocked" is an
+    explicit signal rather than an uncertain one, so callers never route it
+    through this recheck; it keeps refusing immediately.
+
+    Returns the resolved status string, or None when the pane is still
+    uncertain after the recheck window, meaning the caller must refuse.
+    """
+    if isinstance(status, str) and status not in UNCERTAIN_STATUSES:
+        return status
+    if not pane_id:
+        return None
+    for _ in range(UNCERTAIN_STATUS_RECHECK_ATTEMPTS):
+        time.sleep(UNCERTAIN_STATUS_RECHECK_INTERVAL_SECONDS)
+        try:
+            agents = list_agents()
+        except RuntimeError:
+            continue
+        for agent in agents:
+            if agent.get("pane_id") == pane_id:
+                recheck_status = agent.get("agent_status")
+                if isinstance(recheck_status, str) and recheck_status not in UNCERTAIN_STATUSES:
+                    return recheck_status
+                break
+    return None
+
+
 def target_status(target: dict[str, Any], agents_by_pane: dict[str, dict[str, Any]]) -> tuple[str | None, str | None]:
     agent = agents_by_pane.get(target["pane_id"])
     if not agent:
@@ -823,9 +990,9 @@ def target_status(target: dict[str, Any], agents_by_pane: dict[str, dict[str, An
         return None, "selected pane now hosts a different agent session"
     if process_group_id(target["pane_id"]) != target["process_group_id"]:
         return None, "selected pane process changed"
-    status = agent.get("agent_status")
-    if not isinstance(status, str):
-        return None, "Herdr did not provide an agent status"
+    status = _resolve_uncertain_status(target["pane_id"], agent.get("agent_status"))
+    if status is None:
+        return None, "Herdr reported an uncertain agent status that did not resolve after a brief recheck"
     return status, None
 
 
@@ -835,9 +1002,11 @@ def evaluate_live_agents() -> tuple[str, list[str]]:
     for index, agent in enumerate(agents, start=1):
         pane_id = agent.get("pane_id")
         label = pane_id if isinstance(pane_id, str) and pane_id else f"agent-{index}"
-        status = agent.get("agent_status")
-        if not isinstance(status, str):
-            return "refuse", [f"{label}=missing-status"]
+        raw_status = agent.get("agent_status")
+        status = _resolve_uncertain_status(pane_id, raw_status)
+        if status is None:
+            reason = "missing-status" if not isinstance(raw_status, str) else "unknown"
+            return "refuse", [f"{label}={reason}-after-recheck"]
         statuses.append(f"{label}={status}")
         if status in REFUSAL_STATUSES:
             return "refuse", statuses
@@ -864,18 +1033,24 @@ def evaluate_snapshot(state: dict[str, Any]) -> tuple[str, list[str]]:
 def evaluate(state: dict[str, Any]) -> tuple[str, list[str]]:
     if state.get("demo"):
         return "terminal", ["demo=all_agents_finished"]
+    guard_result, guard_statuses = evaluate_work_guards(state)
+    if guard_result != "terminal":
+        return guard_result, guard_statuses
     verify_herdr()
     if state.get("monitoring_scope") == LIVE_MONITORING_SCOPE:
-        return evaluate_live_agents()
-    return evaluate_snapshot(state)
+        result, statuses = evaluate_live_agents()
+    else:
+        result, statuses = evaluate_snapshot(state)
+    return result, statuses + guard_statuses
 
 
-def schedule_shutdown(state: dict[str, Any], reason: str = "agents_finished") -> None:
+def schedule_shutdown(state: dict[str, Any], reason: str = "agents_finished") -> str:
     _, _, warning_path, _ = paths()
     warning_seconds = state["warning_seconds"]
     cancelable_until = utc_now() + timedelta(seconds=warning_seconds)
     warning = {
         "run_id": state["run_id"],
+        "warning_id": str(uuid.uuid4()),
         "scheduled_at": iso_now(),
         "cancelable_until": cancelable_until.isoformat(),
         "completion_action": completion_action(state.get("completion_action")),
@@ -887,11 +1062,11 @@ def schedule_shutdown(state: dict[str, Any], reason: str = "agents_finished") ->
             "DRY RUN: would schedule Windows "
             f"{warning['completion_action']} in {warning_seconds} seconds"
         )
-        return
+        return warning["warning_id"]
     if warning["completion_action"] == "sleep":
         log(f"Windows sleep will be requested in {warning_seconds} seconds reason={reason}")
-        return
-    if not shutil.which("powershell.exe"):
+        return warning["warning_id"]
+    if not powershell_executable():
         warning_path.unlink(missing_ok=True)
         raise RuntimeError("powershell.exe is unavailable; refusing shutdown.")
     # Keep the warning entirely inside the watcher. Starting an equally long
@@ -901,9 +1076,12 @@ def schedule_shutdown(state: dict[str, Any], reason: str = "agents_finished") ->
     # down immediately.
     log(f"Windows shutdown will be requested in {warning_seconds} seconds reason={reason}")
 
+    return warning["warning_id"]
+
 
 def request_windows_sleep() -> None:
-    if not shutil.which("powershell.exe"):
+    powershell = powershell_executable()
+    if not powershell:
         raise RuntimeError("powershell.exe is unavailable; refusing sleep mode.")
     command = (
         "$ErrorActionPreference = 'Stop'; "
@@ -914,7 +1092,7 @@ def request_windows_sleep() -> None:
         "throw 'Windows could not enter sleep mode.' }"
     )
     completed = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", command],
+        [powershell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", command],
         text=True,
         capture_output=True,
         check=False,
@@ -926,7 +1104,8 @@ def request_windows_sleep() -> None:
 
 
 def request_windows_shutdown_now() -> None:
-    if not shutil.which("powershell.exe"):
+    powershell = powershell_executable()
+    if not powershell:
         raise RuntimeError("powershell.exe is unavailable; refusing immediate shutdown.")
     command = (
         "$ErrorActionPreference = 'Stop'; "
@@ -935,7 +1114,7 @@ def request_windows_shutdown_now() -> None:
         "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
     )
     completed = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", command],
+        [powershell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", command],
         text=True,
         capture_output=True,
         check=False,
@@ -986,7 +1165,14 @@ def abort_shutdown_or_fail(
     return False
 
 
-def confirm_completion() -> int:
+def withdraw_rechecked_warning(state: dict[str, Any], warning: dict[str, Any]) -> None:
+    if abort_shutdown_or_fail(state, "Completion recheck withdrew the warning", require_warning=True):
+        state["all_terminal_since"] = None
+        state["withdrawn_warning_id"] = warning.get("warning_id")
+        write_json(paths()[1], state)
+
+
+def confirm_completion(expected_warning_id: str | None = None) -> int:
     boot_marker_deadline = confirmation_boot_marker_deadline_seconds()
     if boot_marker_deadline <= 0:
         raise RuntimeError("The Herdr completion warning is no longer active.")
@@ -1000,9 +1186,27 @@ def confirm_completion() -> int:
             raise RuntimeError("No active night watch is available for confirmation.")
         if not warning or warning.get("run_id") != state.get("run_id"):
             raise RuntimeError("No matching Herdr completion warning is active.")
+        if expected_warning_id is not None and warning.get("warning_id") != expected_warning_id:
+            raise RuntimeError("The displayed completion warning has been replaced.")
         cancelable_until = parse_time(warning.get("cancelable_until"))
         if not cancelable_until or utc_now() >= cancelable_until:
             raise RuntimeError("The Herdr completion warning is no longer active.")
+        if not state.get("demo"):
+            try:
+                if warning.get("reason") == "network_unavailable":
+                    ready = work_guards_ready(state) and not internet_available()
+                    statuses = ["network completion readiness rechecked"]
+                else:
+                    result, statuses = evaluate(state)
+                    ready = result == "terminal"
+            except RuntimeError:
+                withdraw_rechecked_warning(state, warning)
+                raise
+            if not ready:
+                withdraw_rechecked_warning(state, warning)
+                raise RuntimeError("Completion refused: work is active or uncertain. " + ", ".join(statuses))
+            if utc_now() >= cancelable_until:
+                raise RuntimeError("The Herdr completion warning expired during its safety check.")
         if state.get("dry_run"):
             warning_path.unlink(missing_ok=True)
             finish(state, "dry_run_confirmed", "observation confirmation - no Windows action")
@@ -1105,6 +1309,11 @@ def watch() -> int:
             if result == "refuse":
                 finish(state, "refused", report)
                 return 0
+            if network_outage_trigger and not work_guards_ready(state):
+                state["all_terminal_since"] = None
+                write_json(state_path, state)
+                time.sleep(state["poll_seconds"])
+                continue
             if result == "active" and not network_outage_trigger:
                 if state.get("all_terminal_since"):
                     state["all_terminal_since"] = None
@@ -1157,7 +1366,7 @@ def watch() -> int:
                     log("Run cancelled before completion warning could be scheduled")
                     return 0
                 try:
-                    schedule_shutdown(state, warning_reason)
+                    warning_identifier = schedule_shutdown(state, warning_reason)
                 except RuntimeError as error:
                     finish(state, "schedule_failed", str(error))
                     return 1
@@ -1165,6 +1374,12 @@ def watch() -> int:
             warning_interrupted = False
             while utc_now() < deadline:
                 time.sleep(min(5, max(1, state["poll_seconds"])))
+                current = active_run(state["run_id"])
+                if warning_identifier and current and current.get("withdrawn_warning_id") == warning_identifier:
+                    state = current
+                    log("Confirmation safety check withdrew the warning; monitoring continues")
+                    warning_interrupted = True
+                    break
                 if not active_run(state["run_id"]):
                     with completion_lock():
                         if active_run(state["run_id"]):
@@ -1173,7 +1388,7 @@ def watch() -> int:
                     log("Completion warning cancelled outside the watcher")
                     return 0
                 if warning_reason == "network_unavailable":
-                    if connectivity.refresh(state):
+                    if connectivity.refresh(state) or not work_guards_ready(state):
                         if not abort_shutdown_or_fail(
                             state,
                             "Internet connectivity returned but the Windows shutdown warning could not be cancelled",
@@ -1182,7 +1397,7 @@ def watch() -> int:
                             return 1
                         state["all_terminal_since"] = None
                         write_json(state_path, state)
-                        log("Completion warning cancelled because internet connectivity returned")
+                        log("Completion warning cancelled because connectivity returned or pending work prevents completion")
                         warning_interrupted = True
                         break
                     continue
@@ -1235,7 +1450,7 @@ def watch() -> int:
                     log("Completion action skipped because its warning is no longer active")
                     return 0
                 if warning_reason == "network_unavailable":
-                    if connectivity.refresh(state):
+                    if connectivity.refresh(state) or not work_guards_ready(state):
                         if not abort_shutdown_or_fail(
                             state,
                             "Internet connectivity returned but the Windows shutdown warning could not be cancelled",
@@ -1244,7 +1459,7 @@ def watch() -> int:
                             return 1
                         state["all_terminal_since"] = None
                         write_json(state_path, state)
-                        log("Completion warning cancelled because internet connectivity returned")
+                        log("Completion warning cancelled because connectivity returned or pending work prevents completion")
                         continue
                 else:
                     try:
@@ -1324,7 +1539,7 @@ def watch() -> int:
                 return 0
 
 
-def cancel(source: str) -> int:
+def cancel(source: str, expected_warning_id: str | None = None) -> int:
     reset_stale_run_after_restart(
         force=True,
         boot_marker_deadline=time.monotonic() + CANCEL_BOOT_MARKER_DEADLINE_SECONDS,
@@ -1332,6 +1547,8 @@ def cancel(source: str) -> int:
     _, state_path, _, _ = paths()
     with completion_lock():
         state = load_json(state_path)
+        if expected_warning_id is not None and current_warning_id() != expected_warning_id:
+            raise RuntimeError("The displayed completion warning is no longer active.")
         if state and not state.get("outcome"):
             run_id = str(state.get("run_id"))
             finish(state, "cancelled", f"cancelled by {source}")
@@ -1349,7 +1566,18 @@ def cancel(source: str) -> int:
     return 0
 
 
-def status() -> int:
+def current_warning_id() -> str | None:
+    state = load_json(paths()[1])
+    warning = load_json(paths()[2])
+    if not state or state.get("outcome") or not warning or warning.get("run_id") != state.get("run_id"):
+        return None
+    until = parse_time(warning.get("cancelable_until"))
+    if not until or utc_now() >= until:
+        return None
+    return warning.get("warning_id")
+
+
+def status_payload() -> dict[str, Any]:
     reset_stale_run_after_restart(
         boot_marker_deadline=time.monotonic() + STATUS_BOOT_MARKER_DEADLINE_SECONDS
     )
@@ -1362,19 +1590,17 @@ def status() -> int:
             warning["seconds_remaining"] = max(
                 0, int((cancelable_until - utc_now()).total_seconds())
             )
-    print(
-        json.dumps(
-            {
-                "state": state,
-                "shutdown_warning": warning,
-                "preferred_completion_action": preferred_completion_action(),
-                "preferred_warning_seconds": preferred_warning_seconds(),
-                "live_agents": live_agent_summary(),
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    return {
+        "state": state,
+        "shutdown_warning": warning,
+        "preferred_completion_action": preferred_completion_action(),
+        "preferred_warning_seconds": preferred_warning_seconds(),
+        "live_agents": live_agent_summary(),
+    }
+
+
+def status() -> int:
+    print(json.dumps(status_payload(), indent=2, sort_keys=True))
     return 0
 
 
@@ -1386,9 +1612,12 @@ def main() -> int:
     mode.add_argument("--watch", action="store_true", help="Watch an already armed run")
     mode.add_argument("--cancel", action="store_true", help="Cancel the armed run and its own pending shutdown")
     mode.add_argument("--confirm", action="store_true", help="Immediately perform the active completion action after user confirmation")
+    mode.add_argument("--warning-status", action="store_true", help="Read only the current warning identity")
+    mode.add_argument("--status-channel", action="store_true", help="Serve bounded status requests over stdin/stdout")
     mode.add_argument("--status", action="store_true", help="Show the current run state")
     mode.add_argument("--set-completion-action", choices=sorted(COMPLETION_ACTIONS))
     mode.add_argument("--set-warning-seconds", type=int)
+    parser.add_argument("--expected-warning-id")
     parser.add_argument("--cancel-source", default="external_or_legacy")
     parser.add_argument("--dry-run", action="store_true", help="Do everything except invoke Windows shutdown")
     parser.add_argument("--poll-seconds", type=int, default=DEFAULT_POLL_SECONDS)
@@ -1405,6 +1634,9 @@ def main() -> int:
     if min(arguments.poll_seconds, arguments.quiet_seconds, selected_warning_seconds) < 1:
         parser.error("poll, quiet, and warning seconds must be positive")
     try:
+        if arguments.status_channel:
+            from status_channel import serve
+            return serve(sys.modules[__name__])
         if arguments.arm:
             return arm(arguments.dry_run, arguments.poll_seconds, arguments.quiet_seconds, selected_warning_seconds)
         if arguments.demo:
@@ -1416,9 +1648,12 @@ def main() -> int:
         if arguments.set_warning_seconds is not None:
             return set_warning_seconds(arguments.set_warning_seconds)
         if arguments.confirm:
-            return confirm_completion()
+            return confirm_completion(arguments.expected_warning_id)
+        if arguments.warning_status:
+            print(json.dumps({"warning_id": current_warning_id()}))
+            return 0
         if arguments.cancel:
-            return cancel(arguments.cancel_source)
+            return cancel(arguments.cancel_source, arguments.expected_warning_id)
         return status()
     except RuntimeError as error:
         log(f"ERROR {error}")

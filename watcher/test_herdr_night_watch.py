@@ -30,10 +30,18 @@ LIVE_STATE = {"demo": False, "monitoring_scope": "live_agents", "targets": []}
 
 
 class LiveScopeEvaluationTests(unittest.TestCase):
-    def evaluate(self, agents: list[dict[str, object]]) -> tuple[str, list[str]]:
+    def evaluate(
+        self, agents: list[dict[str, object]] | None = None, *, list_agents_side_effect=None
+    ) -> tuple[str, list[str]]:
+        list_agents_kwargs = (
+            {"side_effect": list_agents_side_effect}
+            if list_agents_side_effect is not None
+            else {"return_value": agents}
+        )
         with (
             patch.object(WATCHER, "verify_herdr"),
-            patch.object(WATCHER, "list_agents", return_value=agents),
+            patch.object(WATCHER, "list_agents", **list_agents_kwargs),
+            patch.object(WATCHER.time, "sleep"),
         ):
             return WATCHER.evaluate(LIVE_STATE)
 
@@ -47,18 +55,42 @@ class LiveScopeEvaluationTests(unittest.TestCase):
         self.assertEqual(result, "active")
         self.assertEqual(statuses, ["p1=idle", "p-new=working"])
 
-    def test_unknown_or_missing_status_refuses_shutdown(self) -> None:
-        result, _ = self.evaluate([agent("p1", "unknown")])
+    def test_unknown_or_missing_status_refuses_shutdown_after_recheck(self) -> None:
+        # The recheck window itself calls list_agents() again; keep returning
+        # the same uncertain reading so the final refusal is still asserted.
+        result, _ = self.evaluate(list_agents_side_effect=lambda: [agent("p1", "unknown")])
         self.assertEqual(result, "refuse")
 
-        result, _ = self.evaluate([agent("p1", None)])
+        result, _ = self.evaluate(list_agents_side_effect=lambda: [agent("p1", None)])
         self.assertEqual(result, "refuse")
+
+    def test_blocked_status_refuses_immediately_without_recheck(self) -> None:
+        calls = {"count": 0}
+
+        def list_agents_once():
+            calls["count"] += 1
+            return [agent("p1", "blocked")]
+
+        result, _ = self.evaluate(list_agents_side_effect=list_agents_once)
+        self.assertEqual(result, "refuse")
+        # "blocked" is an explicit signal; it must not trigger the uncertain-
+        # status recheck loop, which would call list_agents() again.
+        self.assertEqual(calls["count"], 1)
+
+    def test_unknown_status_recovers_after_a_brief_recheck(self) -> None:
+        # First poll reports "unknown" for a momentarily transitioning pane;
+        # the recheck poll finds it settled into "idle". The run must not be
+        # refused for a reading that resolved within the grace window.
+        responses = iter([[agent("p1", "unknown")], [agent("p1", "idle")]])
+        result, statuses = self.evaluate(list_agents_side_effect=lambda: next(responses))
+        self.assertEqual(result, "terminal")
+        self.assertEqual(statuses, ["p1=idle"])
 
 
 class CompletionActionTests(unittest.TestCase):
     def test_shutdown_forces_open_apps_closed_and_checks_windows_exit_code(self) -> None:
         with (
-            patch.object(WATCHER.shutil, "which", return_value="powershell.exe"),
+            patch.object(WATCHER, "powershell_executable", return_value="/usr/bin/powershell.exe"),
             patch.object(
                 WATCHER.subprocess,
                 "run",
@@ -76,7 +108,7 @@ class CompletionActionTests(unittest.TestCase):
 
     def test_shutdown_reports_windows_command_failure(self) -> None:
         with (
-            patch.object(WATCHER.shutil, "which", return_value="powershell.exe"),
+            patch.object(WATCHER, "powershell_executable", return_value="/usr/bin/powershell.exe"),
             patch.object(
                 WATCHER.subprocess,
                 "run",
@@ -84,6 +116,11 @@ class CompletionActionTests(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(RuntimeError, "access denied"):
+                WATCHER.request_windows_shutdown_now()
+
+    def test_shutdown_refuses_when_powershell_cannot_be_resolved(self) -> None:
+        with patch.object(WATCHER, "powershell_executable", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "powershell.exe is unavailable"):
                 WATCHER.request_windows_shutdown_now()
 
     def test_unknown_settings_fail_closed_to_shutdown(self) -> None:
@@ -227,6 +264,12 @@ class ArmingTests(unittest.TestCase):
 
 
 class ConfirmationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Existing history/boot tests assume a successful fresh safety decision.
+        self.fresh_decision = patch.object(WATCHER, "evaluate", return_value=("terminal", []))
+        self.fresh_decision.start()
+        self.addCleanup(self.fresh_decision.stop)
+
     def test_windows_boot_time_marker_parses_round_trip_timestamp(self) -> None:
         for suffix in ("Z", "+02:00", "-05:00", ""):
             parsed = WATCHER.windows_boot_time_from_marker(
@@ -245,6 +288,90 @@ class ConfirmationTests(unittest.TestCase):
         self.assertIsNone(
             WATCHER.windows_boot_time_from_marker("wsl:test|windows:not-a-time")
         )
+
+    def test_cim_and_native_markers_describe_the_same_boot(self) -> None:
+        cim_marker = "wsl:same-wsl|windows:2026-10-17T08:17:22.5000000Z"
+        native_marker = "wsl:same-wsl|windows:2026-10-17T08:17:23.6294080Z"
+        self.assertTrue(WATCHER.boot_markers_match(cim_marker, native_marker))
+        self.assertTrue(WATCHER.boot_markers_match(native_marker, cim_marker))
+
+    def test_identical_markers_match(self) -> None:
+        marker = "wsl:same-wsl|windows:2026-10-17T08:17:22.5000000Z"
+        self.assertTrue(WATCHER.boot_markers_match(marker, marker))
+
+    def test_different_wsl_boot_means_different_session(self) -> None:
+        previous = "wsl:first-wsl|windows:2026-10-17T08:17:22.5000000Z"
+        current = "wsl:second-wsl|windows:2026-10-17T08:17:23.6294080Z"
+        self.assertFalse(WATCHER.boot_markers_match(previous, current))
+
+    def test_later_windows_boot_means_different_session(self) -> None:
+        previous = "wsl:same-wsl|windows:2026-10-17T08:17:22.5000000Z"
+        current = "wsl:same-wsl|windows:2026-10-17T10:17:22.5000000Z"
+        self.assertFalse(WATCHER.boot_markers_match(previous, current))
+
+    def test_unparsable_markers_cannot_be_compared(self) -> None:
+        self.assertIsNone(WATCHER.boot_markers_match(None, "wsl:x|windows:2026-10-17T08:17:22.5000000Z"))
+        self.assertIsNone(WATCHER.boot_markers_match("wsl:x|windows:2026-10-17T08:17:22.5000000Z", None))
+
+    def test_status_channel_marker_does_not_reset_armed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-1",
+                        "boot_id": "wsl:same-wsl|windows:2026-10-17T08:17:22.5000000Z",
+                        "armed_at": "2026-10-26T20:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "record_cancellation"),
+                patch.object(WATCHER, "log"),
+            ):
+                reset = WATCHER.reset_stale_run_after_restart(
+                    current_boot_id="wsl:same-wsl|windows:2026-10-17T08:17:23.6294080Z"
+                )
+            self.assertFalse(reset)
+            state = WATCHER.load_json(state_path)
+            self.assertNotIn("outcome", state)
+
+    def test_real_windows_reboot_still_resets_armed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-1",
+                        "boot_id": "wsl:same-wsl|windows:2026-10-17T08:17:22.5000000Z",
+                        "armed_at": "2026-10-26T20:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "record_cancellation"),
+                patch.object(WATCHER, "log"),
+            ):
+                reset = WATCHER.reset_stale_run_after_restart(
+                    current_boot_id="wsl:same-wsl|windows:2026-10-18T09:00:00.0000000Z"
+                )
+            self.assertTrue(reset)
+            state = WATCHER.load_json(state_path)
+            self.assertEqual(state.get("outcome"), "reset_after_restart")
 
     def test_boot_marker_wait_refuses_when_deadline_is_already_expired(self) -> None:
         with patch.object(WATCHER, "runtime_boot_id") as runtime_boot_id:
@@ -455,6 +582,10 @@ class ConnectivityTests(unittest.TestCase):
 
 class CompletionHistoryTests(unittest.TestCase):
     def setUp(self) -> None:
+        # Existing history/boot tests assume a successful fresh safety decision.
+        self.fresh_decision = patch.object(WATCHER, "evaluate", return_value=("terminal", []))
+        self.fresh_decision.start()
+        self.addCleanup(self.fresh_decision.stop)
         original_log_dir = WATCHER.WINDOWS_INSTALL_LOG_DIR
         WATCHER.WINDOWS_INSTALL_LOG_DIR = None
         self.addCleanup(setattr, WATCHER, "WINDOWS_INSTALL_LOG_DIR", original_log_dir)
@@ -516,7 +647,7 @@ class CompletionHistoryTests(unittest.TestCase):
                 patch.object(WATCHER, "wait_for_runtime_boot_id", return_value="boot-current"),
                 patch.object(WATCHER, "reset_stale_run_after_restart"),
                 patch.object(WATCHER, "record_completion", side_effect=RuntimeError("history unavailable")),
-                patch.object(WATCHER.shutil, "which", return_value="/usr/bin/powershell.exe"),
+                patch.object(WATCHER, "powershell_executable", return_value="/usr/bin/powershell.exe"),
                 patch.object(
                     WATCHER.subprocess,
                     "run",
@@ -656,7 +787,7 @@ class ShutdownSchedulingTests(unittest.TestCase):
                     return_value=(root, state_path, warning_path, root / "watch.lock"),
                 ),
                 patch.object(WATCHER, "WINDOWS_INSTALL_LOG_DIR", root),
-                patch.object(WATCHER.shutil, "which", return_value="/usr/bin/powershell.exe"),
+                patch.object(WATCHER, "powershell_executable", return_value="/usr/bin/powershell.exe"),
                 patch.object(WATCHER.subprocess, "run") as run,
                 patch.object(WATCHER, "log"),
             ):
@@ -676,7 +807,7 @@ class ShutdownSchedulingTests(unittest.TestCase):
                     "paths",
                     return_value=(root, state_path, warning_path, root / "watch.lock"),
                 ),
-                patch.object(WATCHER.shutil, "which", return_value="/usr/bin/powershell.exe"),
+                patch.object(WATCHER, "powershell_executable", return_value="/usr/bin/powershell.exe"),
                 patch.object(WATCHER, "record_completion") as record_completion,
                 patch.object(WATCHER.subprocess, "run") as run,
                 patch.object(WATCHER, "log"),
@@ -697,7 +828,7 @@ class ShutdownSchedulingTests(unittest.TestCase):
                     "paths",
                     return_value=(root, root / "active-run.json", warning_path, root / "watch.lock"),
                 ),
-                patch.object(WATCHER.shutil, "which", return_value=None),
+                patch.object(WATCHER, "powershell_executable", return_value=None),
                 patch.object(WATCHER, "log"),
             ):
                 with self.assertRaisesRegex(RuntimeError, "powershell.exe is unavailable"):

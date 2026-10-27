@@ -62,6 +62,7 @@ struct App {
     language: Language,
     tray: Option<TrayIcon>,
     status: backend::WatchStatus,
+    status_available: bool,
     message: Option<String>,
     last_view: String,
     refresh_at: Instant,
@@ -83,13 +84,13 @@ pub fn run() -> Result<()> {
     // the startup marker aligned with the current executable before the tray
     // decides how to handle the live window.
     let _ = autostart::normalize_if_enabled();
-    let initial = backend::status();
-    let stop_on_guard_failure = initial.as_ref().map_or(true, night_watch_is_active);
-    let initial = initial.unwrap_or(backend::WatchStatus::Off {
+    let stop_on_guard_failure = true; // Status initially unknown; refresh only on the worker.
+    let initial = backend::WatchStatus::Off {
         agents: backend::AgentSummary::default(),
         completion_action: backend::CompletionAction::Shutdown,
         warning_seconds: 300,
-    });
+    };
+    let initial_message = Some("Status unbekannt – erste Abfrage läuft".to_string());
     let _power_guard = match power_guard::TrayPowerGuard::acquire() {
         Ok(guard) => guard,
         Err(error) if stop_on_guard_failure => {
@@ -117,11 +118,12 @@ pub fn run() -> Result<()> {
     let language = Language::current();
     let icon = icon_for(&initial)?;
     let tray = TrayIconBuilder::new()
-        .with_tooltip(tooltip(&initial, None, language))
+        .with_tooltip(tooltip(&initial, false, initial_message.as_deref(), language))
         .with_icon(icon)
         .with_menu(Box::new(menu_for(
             &initial,
-            None,
+            false,
+            initial_message.as_deref(),
             autostart::enabled(),
             language,
         )))
@@ -149,7 +151,8 @@ pub fn run() -> Result<()> {
         language,
         tray: Some(tray),
         status: initial,
-        message: None,
+        status_available: false,
+        message: initial_message,
         last_view: String::new(),
         refresh_at: Instant::now()
             .checked_sub(Duration::from_secs(10))
@@ -234,12 +237,28 @@ impl App {
             self.checking = false;
             match result {
                 Ok(status) => {
-                    let show_notice =
-                        matches!(status, backend::WatchStatus::ShutdownWarning { .. })
-                            && !matches!(self.status, backend::WatchStatus::ShutdownWarning { .. });
+                    self.status_available = true;
+                    let show_notice = match (&status, &self.status) {
+                        (
+                            backend::WatchStatus::ShutdownWarning {
+                                warning_id: new, ..
+                            },
+                            backend::WatchStatus::ShutdownWarning {
+                                warning_id: old, ..
+                            },
+                        ) => new != old,
+                        (backend::WatchStatus::ShutdownWarning { .. }, _) => true,
+                        _ => false,
+                    };
                     self.status = status;
                     self.sync_expected_exit();
                     if show_notice {
+                        let warning_id = match &self.status {
+                            backend::WatchStatus::ShutdownWarning { warning_id, .. } => {
+                                warning_id.clone()
+                            }
+                            _ => unreachable!(),
+                        };
                         let (
                             demo,
                             observe_only,
@@ -270,9 +289,10 @@ impl App {
                                 warning_seconds,
                                 completion_action,
                                 network_triggered,
+                                Some(&warning_id),
                             ) {
                                 notify::NoticeAction::Confirm => {
-                                    match backend::confirm_completion() {
+                                    match backend::confirm_completion(&warning_id) {
                                         Ok(()) => Some("Abschluss sofort bestätigt".into()),
                                         Err(error) => {
                                             tray_history::set_expected_exit(false);
@@ -280,8 +300,12 @@ impl App {
                                         }
                                     }
                                 }
+                                notify::NoticeAction::Dismissed => {
+                                    tray_history::set_expected_exit(false);
+                                    Some("Abschaltwarnung nicht mehr aktiv".into())
+                                }
                                 notify::NoticeAction::Cancel => {
-                                    match backend::stop("warning_dialog") {
+                                    match backend::cancel_warning(&warning_id) {
                                         Ok(()) => {
                                             tray_history::set_expected_exit(false);
                                             Some("Nachtmodus abgebrochen".into())
@@ -302,18 +326,19 @@ impl App {
                                 warning_seconds,
                                 completion_action,
                                 network_triggered,
+                                None,
                             );
                         }
                     }
                     if self
                         .message
                         .as_deref()
-                        .is_some_and(|message| message.starts_with("Fehler:"))
+                        .is_some_and(|message| message.starts_with("Fehler:") || message.starts_with("Status unbekannt"))
                     {
                         self.message = None;
                     }
                 }
-                Err(error) => self.message = Some(format!("Fehler: {error}")),
+                Err(error) => { self.status_available = false; self.message = Some(format!("Status unbekannt / letzte Daten veraltet: {error}")); },
             }
         }
     }
@@ -336,6 +361,7 @@ impl App {
         if let Some(tray) = &self.tray {
             let _ = tray.set_tooltip(Some(tooltip(
                 &self.status,
+                self.status_available,
                 self.message.as_deref(),
                 self.language,
             )));
@@ -344,6 +370,7 @@ impl App {
             }
             tray.set_menu(Some(Box::new(menu_for(
                 &self.status,
+                self.status_available,
                 self.message.as_deref(),
                 autostart::enabled(),
                 self.language,
@@ -369,6 +396,7 @@ impl App {
     }
 
     fn perform(&mut self, action: &str, event_loop: &ActiveEventLoop) {
+        if !self.status_available && matches!(action, ID_START | ID_OBSERVE) { return; }
         let result = match action {
             ID_START => backend::start(false),
             ID_OBSERVE => backend::start(true),
@@ -424,7 +452,7 @@ impl App {
                 .map_err(|error| anyhow::anyhow!("invalid corner radius value: {error}"))
                 .and_then(window_settings::set_live_status_corner_radius),
             ID_QUIT => {
-                if night_watch_is_active(&self.status) {
+                if !self.status_available || night_watch_is_active(&self.status) {
                     // The tray owns the guaranteed foreground warning. Do not leave a
                     // running night watch behind when its only warning surface exits.
                     let _ = backend::stop("tray_app_quit");
@@ -580,6 +608,7 @@ impl ApplicationHandler<Wake> for App {
 
 fn menu_for(
     status: &backend::WatchStatus,
+    status_available: bool,
     message: Option<&str>,
     autostart: bool,
     language: Language,
@@ -587,7 +616,7 @@ fn menu_for(
     let menu = Menu::new();
     let _ = menu.append(&MenuItem::with_id(
         "status",
-        status_line(status, language),
+        if message.is_some_and(|m| m.starts_with("Status unbekannt")) { "Status unbekannt / letzte Daten veraltet".into() } else { status_line(status, status_available, language) },
         false,
         None,
     ));
@@ -595,23 +624,24 @@ fn menu_for(
         let _ = menu.append(&MenuItem::with_id("message", message, false, None));
     }
     let _ = menu.append(&PredefinedMenuItem::separator());
+    let unknown = message.is_some_and(|m| m.starts_with("Status unbekannt"));
     let active = night_watch_is_active(status);
     let _ = menu.append(&MenuItem::with_id(
         ID_START,
         language.text("Nachtmodus starten", "Start night mode"),
-        !active,
+        !active && !unknown,
         None,
     ));
     let _ = menu.append(&MenuItem::with_id(
         ID_OBSERVE,
         language.text("Nur beobachten", "Observe only"),
-        !active,
+        !active && !unknown,
         None,
     ));
     let _ = menu.append(&MenuItem::with_id(
         ID_STOP,
         language.text("Stopp und Shutdown abbrechen", "Stop and cancel shutdown"),
-        active,
+        active || unknown,
         None,
     ));
     let _ = menu.append(&MenuItem::with_id(
@@ -653,7 +683,10 @@ fn menu_for(
         language.text("Fenstereinstellungen", "Window settings"),
         true,
     );
-    let transparency_submenu = Submenu::new(language.text("Fenstertransparenz", "Window transparency"), true);
+    let transparency_submenu = Submenu::new(
+        language.text("Fenstertransparenz", "Window transparency"),
+        true,
+    );
     let current_transparency = window_settings::transparency();
     for value in window_settings::TRANSPARENCY_VALUES {
         let id = format!("{ID_WINDOW_TRANSPARENCY_PREFIX}{value}");
@@ -804,13 +837,13 @@ fn menu_for(
     menu
 }
 
-fn status_line(status: &backend::WatchStatus, language: Language) -> String {
+fn status_line(status: &backend::WatchStatus, status_available: bool, language: Language) -> String {
     match status {
         backend::WatchStatus::Off { agents, .. } => {
             format!(
                 "● {} - {}",
                 language.text("Aus - kein Nachtlauf aktiv", "Off - no night run active"),
-                agent_summary(agents, language)
+                agent_summary(agents, status_available, language)
             )
         }
         backend::WatchStatus::Watching {
@@ -825,7 +858,7 @@ fn status_line(status: &backend::WatchStatus, language: Language) -> String {
             if *demo {
                 return format!(
                     "● Demo: Ruhezeit und Warnung werden simuliert - {}",
-                    agent_summary(agents, language)
+                    agent_summary(agents, status_available, language)
                 );
             }
             let mode = if *observe_only {
@@ -845,7 +878,7 @@ fn status_line(status: &backend::WatchStatus, language: Language) -> String {
             };
             format!(
                 "● {mode}: {scope} - {phase} - {}",
-                agent_summary(agents, language)
+                agent_summary(agents, status_available, language)
             )
         }
         backend::WatchStatus::ShutdownWarning {
@@ -858,7 +891,7 @@ fn status_line(status: &backend::WatchStatus, language: Language) -> String {
             if *demo {
                 format!(
                     "● Demo-Warnung: kein Windows-Shutdown - {}",
-                    agent_summary(agents, language)
+                    agent_summary(agents, status_available, language)
                 )
             } else {
                 let scope = if *live_scope {
@@ -868,7 +901,7 @@ fn status_line(status: &backend::WatchStatus, language: Language) -> String {
                 };
                 format!(
                     "● Shutdown-Warnfrist: {scope} - Stopp bricht ab - {}",
-                    agent_summary(agents, language)
+                    agent_summary(agents, status_available, language)
                 )
             }
         }
@@ -877,13 +910,27 @@ fn status_line(status: &backend::WatchStatus, language: Language) -> String {
         } => {
             format!(
                 "● Letzter Lauf: {outcome} - {}",
-                agent_summary(agents, language)
+                agent_summary(agents, status_available, language)
             )
         }
     }
 }
 
-fn agent_summary(agents: &backend::AgentSummary, language: Language) -> String {
+fn agent_summary(
+    agents: &backend::AgentSummary,
+    status_available: bool,
+    language: Language,
+) -> String {
+    if !status_available {
+        // Distinguish a disrupted status channel from an unreachable Herdr;
+        // only a fresh successful response may claim the latter.
+        return language
+            .text(
+                "Herdr-Status veraltet – Kanal gestört",
+                "Herdr status stale – channel disrupted",
+            )
+            .into();
+    }
     if !agents.available {
         return language
             .text("Herdr nicht erreichbar", "Herdr unavailable")
@@ -902,15 +949,21 @@ fn agent_summary(agents: &backend::AgentSummary, language: Language) -> String {
     }
 }
 
-fn tooltip(status: &backend::WatchStatus, _message: Option<&str>, language: Language) -> String {
+fn tooltip(
+    status: &backend::WatchStatus,
+    status_available: bool,
+    message: Option<&str>,
+    language: Language,
+) -> String {
+    if message.is_some_and(|m| m.starts_with("Status unbekannt")) { return "Herdr-Nachtwächter\nStatus unbekannt / letzte Daten veraltet".into(); }
     format!(
         "{}\n{}",
         language.text("Herdr-Nachtwächter", "Herdr Night Watch"),
-        compact_status_line(status, language)
+        compact_status_line(status, status_available, language)
     )
 }
 
-fn compact_status_line(status: &backend::WatchStatus, _language: Language) -> String {
+fn compact_status_line(status: &backend::WatchStatus, status_available: bool, _language: Language) -> String {
     let agents = match status {
         backend::WatchStatus::Off { agents, .. }
         | backend::WatchStatus::Watching { agents, .. }
@@ -919,8 +972,10 @@ fn compact_status_line(status: &backend::WatchStatus, _language: Language) -> St
     };
     let herdr = if agents.available {
         format!("Herdr {}/{} aktiv", agents.working, agents.total)
-    } else {
+    } else if status_available {
         "Herdr nicht erreichbar".into()
+    } else {
+        "Herdr-Status veraltet".into()
     };
     match status {
         backend::WatchStatus::Off { .. } => format!("Aus · {herdr}"),
@@ -1025,6 +1080,7 @@ mod tests {
             warning_seconds: 300,
         };
         let warning = WatchStatus::ShutdownWarning {
+            warning_id: "test-warning".into(),
             targets: 1,
             live_scope: true,
             demo: false,

@@ -1564,6 +1564,7 @@ fn live_title(language: Language) -> &'static str {
 struct LiveStatusApp {
     language: Language,
     status: WatchStatus,
+    status_available: bool,
     status_rx: Receiver<Result<WatchStatus, String>>,
     status_tx: Sender<Result<WatchStatus, String>>,
     action_rx: Receiver<Result<NightAction, String>>,
@@ -1637,6 +1638,7 @@ struct LiveStatusApp {
     last_settings_poll: Option<Instant>,
     last_docked_state: Option<bool>,
     last_synced_radius: Option<u8>,
+    last_synced_main_size: Option<egui::Vec2>,
     first_frame_painted: bool,
     satellite_frames_painted: usize,
     satellite_opacity_applied: Option<(HWND, u8)>,
@@ -1684,6 +1686,7 @@ impl LiveStatusApp {
                 completion_action: CompletionAction::Shutdown,
                 warning_seconds: 300,
             },
+            status_available: false,
             status_rx,
             status_tx,
             action_rx,
@@ -1757,6 +1760,7 @@ impl LiveStatusApp {
             last_settings_poll: None,
             last_docked_state: None,
             last_synced_radius: None,
+            last_synced_main_size: None,
             first_frame_painted: false,
             satellite_frames_painted: 0,
             satellite_opacity_applied: None,
@@ -2006,6 +2010,7 @@ impl LiveStatusApp {
                 Ok(status) => {
                     let warning_seconds = backend::warning_seconds(&status);
                     self.status = status;
+                    self.status_available = true;
                     self.error = None;
                     if !self.editing_warning_seconds
                         && !matches!(self.pending_action, Some(NightAction::SetWarningSeconds(_)))
@@ -2013,13 +2018,13 @@ impl LiveStatusApp {
                         self.warning_seconds_input = warning_seconds.to_string();
                     }
                 }
-                Err(error) => self.error = Some(error),
+                Err(error) => { self.status_available = false; self.error = Some(format!("Status unbekannt / letzte Daten veraltet: {error}")); },
             }
         }
     }
 
     fn run_action(&mut self, action: NightAction) {
-        if self.action_in_progress {
+        if self.action_in_progress || (!self.status_available && !matches!(action, NightAction::Stop)) {
             return;
         }
         self.action_in_progress = true;
@@ -2330,9 +2335,20 @@ impl eframe::App for LiveStatusApp {
             ui.ctx().request_repaint();
         }
         let is_docked = self.quota_open && self.quota_docked;
-        if self.last_docked_state != Some(is_docked) || self.last_synced_radius != Some(self.corner_radius) {
+        // SetWindowRgn clips to physical pixels. A scale request is applied
+        // asynchronously, so syncing only when it is requested uses the old
+        // window size. Refresh after the native resize has actually arrived.
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let main_size = ui.ctx().input(|i| {
+            i.viewport().inner_rect.map(|rect| rect.size() * pixels_per_point)
+        });
+        if self.last_docked_state != Some(is_docked)
+            || self.last_synced_radius != Some(self.corner_radius)
+            || self.last_synced_main_size != main_size
+        {
             self.last_docked_state = Some(is_docked);
             self.last_synced_radius = Some(self.corner_radius);
+            self.last_synced_main_size = main_size;
             self.sync_corner_regions();
         }
         window_chrome::default_gradient(ui.painter(), ui.max_rect());
@@ -2393,10 +2409,15 @@ impl eframe::App for LiveStatusApp {
                     self.language,
                     self.weather_reading.as_ref(),
                 );
-                let action = action_for(&self.status);
-                let night_mode_active = night_mode_active(&self.status);
+                if !self.status_available {
+                    ui.colored_label(YELLOW, self.language.text(
+                        "Status unbekannt – letzte Daten sind veraltet. Stopp bleibt verfügbar.",
+                        "Status unknown – previous data is stale. Stop remains available."));
+                }
+                let action = if self.status_available { action_for(&self.status) } else { NightAction::Stop };
+                let night_mode_active = !self.status_available || night_mode_active(&self.status);
                 let display_completion_action = completion_action_for_display(&self.status, self.pending_action);
-                let countdown_seconds = countdown_seconds(&self.status);
+                let countdown_seconds = if self.status_available { countdown_seconds(&self.status) } else { None };
                 let gradient_rect = ui.max_rect();
                 let row_size = egui::vec2(ui.available_width(), 88.0);
                 ui.allocate_ui_with_layout(
@@ -2496,7 +2517,7 @@ impl eframe::App for LiveStatusApp {
                                 // the German-sized card instead of widening it.
                                 ui.set_width(KPI_PANEL_WIDTH - 24.0);
                                 let agents = agents_for(&self.status);
-                                if agents.available {
+                                if self.status_available && agents.available {
                                     let old_spacing = ui.spacing().item_spacing.x;
                                     ui.spacing_mut().item_spacing.x = 4.0;
                                     ui.horizontal(|ui| {
@@ -2516,12 +2537,31 @@ impl eframe::App for LiveStatusApp {
                                         );
                                     });
                                     ui.spacing_mut().item_spacing.x = old_spacing;
-                                } else {
+                                } else if self.status_available {
                                     ui.colored_label(
                                         YELLOW,
                                         self.language.text(
                                             "Herdr ist gerade nicht erreichbar",
                                             "Herdr is currently unreachable",
+                                        ),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(self.language.text(
+                                            "Es wird keine Zahl geschätzt.",
+                                            "No number will be guessed.",
+                                        ))
+                                            .color(GRAY),
+                                    );
+                                } else {
+                                    // The status channel itself is disrupted
+                                    // (e.g. WSL restarted under the running
+                                    // app); do not claim Herdr is down when
+                                    // only our own pipe is.
+                                    ui.colored_label(
+                                        YELLOW,
+                                        self.language.text(
+                                            "Herdr-Status veraltet – Kanal gestört",
+                                            "Herdr status stale – channel disrupted",
                                         ),
                                     );
                                     ui.label(
@@ -5596,15 +5636,62 @@ fn glowing_metric_text(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Co
     painter.text(rect.min, egui::Align2::LEFT_TOP, text, font, color);
 }
 
+fn system_metric_text_galley(
+    painter: &egui::Painter,
+    text: String,
+    font: egui::FontId,
+    color: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let digit_width = ('0'..='9').map(|digit| {
+        painter.layout_no_wrap(digit.to_string(), font.clone(), color).size().x
+    }).fold(0.0_f32, f32::max);
+    let mut job = egui::text::LayoutJob::default();
+    for character in text.chars() {
+        let padding = character == '\u{2007}';
+        let glyph = if padding { " ".to_owned() } else { character.to_string() };
+        let width = painter.layout_no_wrap(glyph.clone(), font.clone(), color).size().x;
+        job.append(&glyph, (if padding || character.is_ascii_digit() { digit_width - width } else { 0.0 }).max(0.0), egui::TextFormat {
+            font_id: font.clone(), color, ..Default::default()
+        });
+    }
+    painter.layout_job(job)
+}
+
+fn system_metric_percent_value(value: Option<u8>) -> Option<String> {
+    // A figure space has the width of a digit without showing a leading zero.
+    value.map(|value| format!("{value:>2}%").replace(' ', "\u{2007}"))
+}
+
 fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Language) -> f32 {
-    let available = ui.available_width();
-    let spacing = 10.0;
-    let cpu_value = metrics.cpu_percent.map(|value| format!("{value}%"));
-    let ram_value = metrics.ram_percent.map(|value| format!("{value}%"));
-    let gpu_value = metrics.gpu_percent.map(|value| format!("{value}%"));
-    let vram_value = metrics.vram_percent.map(|value| format!("{value}%"));
+    // Match the visible right text edge to the CPU icon's left inset.
+    let window = ui.ctx().content_rect();
+    let left_inset = ui.max_rect().left() - window.left() + 3.5;
+    let right_inset = window.right() - ui.max_rect().right();
+    let right_padding = (left_inset - right_inset - 1.0).max(0.0);
+    let available = (ui.available_width() - right_padding).max(0.0);
+    let spacing = 4.0;
+    let cpu_value = system_metric_percent_value(metrics.cpu_percent);
+    let ram_value = system_metric_percent_value(metrics.ram_percent);
+    let gpu_value = system_metric_percent_value(metrics.gpu_percent);
+    let vram_value = system_metric_percent_value(metrics.vram_percent);
     let power_value = metrics.gpu_watts.map(|value| format!("{value}W"));
-    let desired_widths = system_metric_badge_widths(ui, metrics);
+    let mut desired_widths = system_metric_badge_widths(ui, metrics);
+    if desired_widths.iter().sum::<f32>() + spacing * 4.0 > available {
+        desired_widths = [
+            ("CPU", cpu_value.as_deref(), metrics.cpu_temperature_c),
+            ("RAM", ram_value.as_deref(), None),
+            ("GPU", gpu_value.as_deref(), metrics.gpu_temperature_c),
+            ("VRAM", vram_value.as_deref(), None),
+            ("", power_value.as_deref(), None),
+        ].map(|(label, value, temperature)| {
+            system_metric_text_galley(ui.painter(),
+                system_metric_compact_display_text(label, value, temperature),
+                egui::FontId::proportional(11.0),
+                GRAY,
+            ).size().x + 18.0
+        });
+    }
+    let spacing = ((available - desired_widths.iter().sum::<f32>()) / 4.0).max(0.0);
     let item_widths = system_metric_item_widths(available, desired_widths, spacing);
     let old_spacing = ui.spacing().item_spacing.x;
     ui.spacing_mut().item_spacing.x = spacing;
@@ -5663,7 +5750,7 @@ fn system_metrics_row(ui: &mut egui::Ui, metrics: SystemMetrics, language: Langu
                 None,
                 metric_color(metrics.gpu_power_percent),
                 language,
-                true,
+                false,
             )
         })
         .inner;
@@ -5676,7 +5763,6 @@ fn system_metric_item_widths(
     desired_widths: [f32; 5],
     spacing: f32,
 ) -> [f32; 5] {
-    let item_count = desired_widths.len() as f32;
     let spacing_count = (desired_widths.len() - 1) as f32;
     let content_width = (available_width - spacing * spacing_count).max(0.0);
     let desired_total = desired_widths.iter().sum::<f32>();
@@ -5685,57 +5771,24 @@ fn system_metric_item_widths(
         let scale = content_width / desired_total;
         desired_widths.map(|width| width * scale)
     } else {
-        let spare_width = (content_width - desired_total) / item_count;
-        desired_widths.map(|width| width + spare_width)
+        desired_widths
     }
 }
 
 fn system_metric_badge_widths(ui: &egui::Ui, metrics: SystemMetrics) -> [f32; 5] {
-    // Reserve the sampler's bounded value ranges so sensor updates cannot move later badges.
-    const MAX_PERCENT_VALUE: &str = "100%";
-    const MAX_TEMPERATURE_C: u8 = u8::MAX;
-    const MAX_POWER_VALUE: &str = "65535W";
+    // Size columns for the values on screen, rather than reserving space for
+    // 255-degree temperatures and 65535 watts at the expense of readable labels.
+    let cpu = system_metric_percent_value(metrics.cpu_percent);
+    let ram = system_metric_percent_value(metrics.ram_percent);
+    let gpu = system_metric_percent_value(metrics.gpu_percent);
+    let vram = system_metric_percent_value(metrics.vram_percent);
+    let power = metrics.gpu_watts.map(|value| format!("{value}W"));
     [
-        system_metric_badge_width(
-            ui,
-            "CPU",
-            Some(MAX_PERCENT_VALUE),
-            Some(MAX_TEMPERATURE_C),
-            metric_color(metrics.cpu_percent),
-            false,
-        ),
-        system_metric_badge_width(
-            ui,
-            "RAM",
-            Some(MAX_PERCENT_VALUE),
-            None,
-            metric_color(metrics.ram_percent),
-            false,
-        ),
-        system_metric_badge_width(
-            ui,
-            "GPU",
-            Some(MAX_PERCENT_VALUE),
-            Some(MAX_TEMPERATURE_C),
-            metric_color(metrics.gpu_percent),
-            false,
-        ),
-        system_metric_badge_width(
-            ui,
-            "VRAM",
-            Some(MAX_PERCENT_VALUE),
-            None,
-            metric_color(metrics.vram_percent),
-            false,
-        ),
-        system_metric_badge_width(
-            ui,
-            "",
-            Some(MAX_POWER_VALUE),
-            None,
-            metric_color(metrics.gpu_power_percent),
-            true,
-        ),
+        system_metric_badge_width(ui, "CPU", cpu.as_deref(), metrics.cpu_temperature_c, metric_color(metrics.cpu_percent), false),
+        system_metric_badge_width(ui, "RAM", ram.as_deref(), None, metric_color(metrics.ram_percent), false),
+        system_metric_badge_width(ui, "GPU", gpu.as_deref(), metrics.gpu_temperature_c, metric_color(metrics.gpu_percent), false),
+        system_metric_badge_width(ui, "VRAM", vram.as_deref(), None, metric_color(metrics.vram_percent), false),
+        system_metric_badge_width(ui, "", power.as_deref(), None, metric_color(metrics.gpu_power_percent), false),
     ]
 }
 
@@ -5748,9 +5801,7 @@ fn system_metric_badge_width(
     center_content: bool,
 ) -> f32 {
     let text = system_metric_display_text(label, value, temperature_c);
-    let text_width = ui
-        .painter()
-        .layout_no_wrap(text, egui::FontId::proportional(11.0), color)
+    let text_width = system_metric_text_galley(ui.painter(), text, egui::FontId::proportional(11.0), color)
         .size()
         .x;
 
@@ -5781,12 +5832,22 @@ fn system_metric_display_text(
     }
 }
 
-fn system_metric_compact_display_text(value: Option<&str>, temperature_c: Option<u8>) -> String {
-    match (value, temperature_c) {
+fn system_metric_compact_display_text(
+    label: &str,
+    value: Option<&str>,
+    temperature_c: Option<u8>,
+) -> String {
+    let value = match (value, temperature_c) {
         (Some(value), Some(temperature)) => format!("{value}·{temperature}°"),
         (Some(value), None) => value.to_owned(),
         (None, Some(temperature)) => format!("—·{temperature}°"),
         (None, None) => "—".into(),
+    };
+    // Compact spacing may save room, but the metric must remain identifiable.
+    if label.is_empty() {
+        value
+    } else {
+        format!("{label} {value}")
     }
 }
 
@@ -5798,12 +5859,10 @@ fn system_metric_badge_text_layout(
     available_width: f32,
 ) -> (String, egui::FontId) {
     const FONT_SIZE: f32 = 11.0;
-    const MIN_FONT_SIZE: f32 = 8.0;
 
     let available_width = available_width.max(0.0);
     let text_width = |text: &str, font_size: f32| {
-        painter
-            .layout_no_wrap(
+        system_metric_text_galley(painter,
                 text.to_owned(),
                 egui::FontId::proportional(font_size),
                 color,
@@ -5817,14 +5876,6 @@ fn system_metric_badge_text_layout(
     }
     if text_width(&compact_text, FONT_SIZE) <= available_width {
         return (compact_text, egui::FontId::proportional(FONT_SIZE));
-    }
-
-    let compact_width = text_width(&compact_text, FONT_SIZE);
-    if compact_width > f32::EPSILON {
-        let scaled_font_size = (FONT_SIZE * available_width / compact_width).min(FONT_SIZE);
-        if scaled_font_size >= MIN_FONT_SIZE {
-            return (compact_text, egui::FontId::proportional(scaled_font_size));
-        }
     }
 
     let ellipsis = "…";
@@ -8248,9 +8299,7 @@ fn system_metric_badge(
     let value = value.as_deref();
     let text_color = if has_value { color } else { GRAY };
     let full_text = system_metric_display_text(label, value, temperature_c);
-    let full_text_width = ui
-        .painter()
-        .layout_no_wrap(
+    let full_text_width = system_metric_text_galley(ui.painter(),
             full_text.clone(),
             egui::FontId::proportional(11.0),
             text_color,
@@ -8266,13 +8315,11 @@ fn system_metric_badge(
     let (text, font) = system_metric_badge_text_layout(
         ui.painter(),
         full_text,
-        system_metric_compact_display_text(value, temperature_c),
+        system_metric_compact_display_text(label, value, temperature_c),
         text_color,
         available_text_width,
     );
-    let text_width = ui
-        .painter()
-        .layout_no_wrap(text.clone(), font.clone(), text_color)
+    let text_width = system_metric_text_galley(ui.painter(), text.clone(), font.clone(), text_color)
         .size()
         .x;
     let text_left = if center_content {
@@ -8291,7 +8338,7 @@ fn system_metric_badge(
         egui::pos2(icon_x, rect.center().y),
         color,
     );
-    let text_galley = ui.painter().layout_no_wrap(text, font, text_color);
+    let text_galley = system_metric_text_galley(ui.painter(), text, font, text_color);
     let text_shape = egui::epaint::TextShape::new(
         egui::pos2(text_left, rect.center().y - text_galley.size().y / 2.0),
         text_galley,
@@ -8508,7 +8555,133 @@ mod tests {
     }
 
     #[test]
-    fn system_metric_column_widths_stay_fixed_across_sensor_updates() {
+    fn system_metrics_row_keeps_labels_at_normal_window_width() {
+        let context = egui::Context::default();
+        let metrics = SystemMetrics {
+            cpu_percent: Some(38),
+            ram_percent: Some(90),
+            gpu_percent: Some(18),
+            vram_percent: Some(10),
+            gpu_temperature_c: Some(35),
+            gpu_watts: Some(29),
+            ..Default::default()
+        };
+        for temperature in [None, Some(65)] {
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(360.0, 40.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    system_metrics_row(
+                        ui,
+                        SystemMetrics {
+                            cpu_temperature_c: temperature,
+                            ..metrics
+                        },
+                        Language::German,
+                    );
+                },
+            );
+            let texts = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => {
+                        if text.galley.text() != "GPU" {
+                            assert!(text.galley.job.sections.iter().all(|section| section.format.font_id.size == 11.0));
+                        }
+                        Some(text.galley.text())
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for label in ["CPU ", "RAM ", "GPU ", "VRAM "] {
+                assert!(
+                    texts.iter().any(|text| text.starts_with(label)),
+                    "metric label {label:?} disappeared: {texts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn system_metrics_row_does_not_shift_when_gpu_percent_changes_digit_count() {
+        let context = egui::Context::default();
+        let mut expected: Option<Vec<(f32, f32)>> = None;
+        for gpu_percent in [18, 9, 1, 0, 10, 99] {
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 40.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    system_metrics_row(ui, SystemMetrics {
+                        cpu_percent: Some(38), ram_percent: Some(90),
+                        gpu_percent: Some(gpu_percent), gpu_temperature_c: Some(35),
+                        vram_percent: Some(10), gpu_watts: Some(29),
+                        ..Default::default()
+                    }, Language::German);
+                },
+            );
+            let positions = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() != "GPU" => Some((text.pos.x, text.visual_bounding_rect().right())),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(positions.len(), 5);
+            if let Some(expected) = &expected {
+                for ((left, right), (expected_left, expected_right)) in positions.iter().zip(expected) {
+                    assert!((left - expected_left).abs() < 0.1 && (right - expected_right).abs() < 0.1,
+                        "GPU {gpu_percent}% shifted the row: {positions:?} vs {expected:?}");
+                }
+            } else {
+                expected = Some(positions);
+            }
+        }
+    }
+
+    #[test]
+    fn system_metrics_row_balances_window_edge_margins() {
+        let context = egui::Context::default();
+        let mut edges = None;
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 60.0))),
+                ..Default::default()
+            },
+            |ui| {
+                egui::Frame::new().inner_margin(egui::Margin { left: 20, right: 1, top: 0, bottom: 0 }).show(ui, |ui| {
+                    let cpu_left = ui.max_rect().left() + 3.5;
+                    let right = system_metrics_row(ui, SystemMetrics {
+                        cpu_percent: Some(38), ram_percent: Some(90),
+                        gpu_percent: Some(18), gpu_temperature_c: Some(35),
+                        vram_percent: Some(10), gpu_watts: Some(29),
+                        ..Default::default()
+                    }, Language::German);
+                    edges = Some((cpu_left, right));
+                });
+            },
+        );
+        let (left, right) = edges.unwrap();
+        assert!((left - (400.0 - right)).abs() < 1.0, "unequal outer margins: {left} vs {}", 400.0 - right);
+        let texts = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() != "GPU" => Some(text),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(texts.len(), 5);
+        let gaps = texts.windows(2).map(|pair| {
+            pair[1].pos.x - 17.0 - pair[0].visual_bounding_rect().right()
+        }).collect::<Vec<_>>();
+        let smallest = gaps.iter().copied().fold(f32::INFINITY, f32::min);
+        let largest = gaps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(largest - smallest < 1.0, "unequal gaps: {gaps:?}");
+    }
+
+    #[test]
+    fn system_metric_column_widths_fit_current_sensor_values() {
         let context = egui::Context::default();
         let maximum = SystemMetrics {
             cpu_percent: Some(100),
@@ -8540,10 +8713,10 @@ mod tests {
                 text_width("RAM", Some("100%"), None) + 18.0,
                 text_width("GPU", Some("100%"), Some(u8::MAX)) + 18.0,
                 text_width("VRAM", Some("100%"), None) + 18.0,
-                text_width("", Some(&format!("{}W", u16::MAX)), None) + 38.0,
+                text_width("", Some(&format!("{}W", u16::MAX)), None) + 18.0,
             ];
             assert!(
-                unavailable_widths
+                maximum_widths
                     .iter()
                     .zip(maximum_text_widths)
                     .all(|(reserved, actual)| reserved >= &actual),
@@ -8553,11 +8726,11 @@ mod tests {
         });
 
         let (unavailable, maximum) = measured_widths.expect("metric widths were measured");
-        assert_eq!(unavailable, maximum);
+        assert!(unavailable.iter().zip(maximum).all(|(empty, full)| *empty < full));
     }
 
     #[test]
-    fn system_metric_item_widths_fit_narrow_rows_and_distribute_spare_width() {
+    fn system_metric_item_widths_fit_narrow_rows_without_internal_gaps() {
         let desired = [90.0, 60.0, 90.0, 60.0, 80.0];
         let spacing = 10.0;
         let narrow_available = 330.0;
@@ -8572,15 +8745,8 @@ mod tests {
 
         let wide_available = 500.0;
         let wide = system_metric_item_widths(wide_available, desired, spacing);
-        let spare_per_item =
-            (wide_available - spacing * 4.0 - desired.iter().sum::<f32>()) / desired.len() as f32;
-
-        assert!(
-            wide.iter()
-                .zip(desired)
-                .all(|(actual, desired)| (actual - desired - spare_per_item).abs() < 0.0001)
-        );
-        assert!((wide.iter().sum::<f32>() + spacing * 4.0 - wide_available).abs() < 0.0001);
+        assert_eq!(wide, desired);
+        assert!(wide.iter().sum::<f32>() + spacing * 4.0 < wide_available);
     }
 
     #[test]

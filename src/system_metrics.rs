@@ -22,6 +22,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const NVIDIA_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const NVIDIA_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const NVIDIA_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+// A single failed read (spawn failure or timeout under load) must not disable
+// NVIDIA telemetry until app restart; retry on a slow cadence like the CPU
+// temperature sampler so transient failures heal themselves.
+const NVIDIA_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const CPU_TEMPERATURE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const CPU_TEMPERATURE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const CPU_TEMPERATURE_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -219,13 +223,17 @@ struct CpuSample {
     user: u64,
 }
 
+type NvidiaReader = fn(&AtomicBool) -> Option<NvidiaTelemetry>;
+
 pub struct Sampler {
     cancellation: Arc<CancellationToken>,
     cpu_previous: Option<CpuSample>,
     query: Option<PdhQuery>,
     nvidia_available: bool,
+    nvidia_retry_at: Instant,
     nvidia_last_read: Option<Instant>,
     nvidia_cached: Option<NvidiaTelemetry>,
+    nvidia_reader: NvidiaReader,
     cpu_temperature: CpuTemperatureSampler,
 }
 
@@ -343,8 +351,10 @@ impl Sampler {
             cpu_previous: None,
             query: PdhQuery::new(),
             nvidia_available: true,
+            nvidia_retry_at: Instant::now(),
             nvidia_last_read: None,
             nvidia_cached: None,
+            nvidia_reader: read_nvidia_gpu_telemetry,
             cpu_temperature: CpuTemperatureSampler::new(cancellation),
         }
     }
@@ -354,7 +364,12 @@ impl Sampler {
             return None;
         }
         if !self.nvidia_available {
-            return self.nvidia_cached;
+            // The retry interval has elapsed: give nvidia-smi another chance
+            // instead of staying disabled until app restart.
+            if Instant::now() < self.nvidia_retry_at {
+                return self.nvidia_cached;
+            }
+            self.nvidia_available = true;
         }
         if self
             .nvidia_last_read
@@ -363,12 +378,13 @@ impl Sampler {
             return self.nvidia_cached;
         }
         self.nvidia_last_read = Some(Instant::now());
-        match read_nvidia_gpu_telemetry(&self.cancellation.cancelled) {
+        match (self.nvidia_reader)(&self.cancellation.cancelled) {
             Some(telemetry) => {
                 self.nvidia_cached = Some(telemetry);
             }
             None => {
                 self.nvidia_available = false;
+                self.nvidia_retry_at = Instant::now() + NVIDIA_RETRY_INTERVAL;
                 self.nvidia_cached = None;
             }
         }
@@ -1123,6 +1139,49 @@ mod tests {
         assert_eq!(telemetry.vram_percent, Some(50));
     }
 
+    fn failing_nvidia_reader(_cancelled: &AtomicBool) -> Option<NvidiaTelemetry> {
+        None
+    }
+
+    fn healthy_nvidia_reader(_cancelled: &AtomicBool) -> Option<NvidiaTelemetry> {
+        Some(NvidiaTelemetry {
+            temperature_c: Some(40),
+            power_watts: Some(30),
+            power_percent: Some(12),
+            vram_percent: Some(31),
+        })
+    }
+
+    #[test]
+    fn nvidia_failure_pauses_then_retries_instead_of_stopping() {
+        let cancellation = Arc::new(CancellationToken::new());
+        let mut sampler = Sampler::new_with_cancellation(Arc::clone(&cancellation));
+        sampler.nvidia_reader = failing_nvidia_reader;
+        // A failed read arms the retry pause instead of disabling telemetry
+        // until app restart.
+        assert!(sampler.sample_nvidia().is_none());
+        assert!(!sampler.nvidia_available);
+        assert!(sampler.nvidia_retry_at > Instant::now());
+        // During the pause no new attempt is made (read marker unchanged).
+        let paused_marker = sampler.nvidia_last_read;
+        assert!(sampler.sample_nvidia().is_none());
+        assert_eq!(sampler.nvidia_last_read, paused_marker);
+        // After the pause elapses a fresh attempt is made (marker moves), and
+        // a healthy reader re-enables telemetry with fresh values. Age the
+        // last-read marker past NVIDIA_REFRESH_INTERVAL so the attempt runs.
+        sampler.nvidia_retry_at = Instant::now() - Duration::from_secs(1);
+        sampler.nvidia_last_read = paused_marker.map(|at| {
+            at - (NVIDIA_REFRESH_INTERVAL + Duration::from_secs(1))
+        });
+        sampler.nvidia_reader = healthy_nvidia_reader;
+        let recovered = sampler
+            .sample_nvidia()
+            .expect("healthy reader should recover telemetry after the pause");
+        assert!(sampler.nvidia_available);
+        assert_eq!(recovered.vram_percent, Some(31));
+        assert!(sampler.nvidia_last_read.unwrap() > paused_marker.unwrap());
+    }
+
     #[test]
     fn blocked_temperature_worker_does_not_block_metric_sampling() {
         let (temperature_tx, temperature_rx) = mpsc::channel();
@@ -1144,8 +1203,10 @@ mod tests {
             cpu_previous: None,
             query: None,
             nvidia_available: false,
+            nvidia_retry_at: Instant::now(),
             nvidia_last_read: None,
             nvidia_cached: None,
+            nvidia_reader: failing_nvidia_reader,
             cpu_temperature: CpuTemperatureSampler::from_receiver(temperature_rx),
         };
 

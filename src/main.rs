@@ -5,6 +5,8 @@
 
 #[cfg(any(windows, test))]
 mod quota;
+#[cfg(any(windows, test))]
+mod status_channel;
 
 #[cfg(windows)]
 mod autostart;
@@ -45,7 +47,7 @@ mod window_settings;
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    if std::env::args().any(|argument| argument == "--settings") {
+    let result = if std::env::args().any(|argument| argument == "--settings") {
         settings::run()
     } else if std::env::args().any(|argument| argument == "--live-status") {
         live_status::run()
@@ -55,7 +57,9 @@ fn main() -> anyhow::Result<()> {
         weather_location::run()
     } else {
         tray::run()
-    }
+    };
+    backend::shutdown_status_channel();
+    result
 }
 
 #[cfg(not(windows))]

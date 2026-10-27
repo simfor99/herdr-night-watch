@@ -88,6 +88,7 @@ Es verbindet sich außerdem direkt mit WSL. Windows besitzt die Herunterfahr-Fun
 | 02 | [Bedienung und Zustände](02-bedienung-und-zustaende.md) | 83 | Tray-Menü, Farben, Popup und Zustandsautomat |
 | 03 | [Betrieb und Fehlerdiagnose](03-betrieb-und-fehlerdiagnose.md) | 80 | Installation, Status, Protokoll und sichere Fehlerbehebung |
 | 04 | [Entwicklung und Test](04-entwicklung-und-test.md) | 79 | Änderungsregeln, Build, Auslieferung und Testmatrix |
+| 05 | [Abschlussprüfung für übergeordnete Arbeit](05-abschlusspruefung.md) | — | Firstmate, allgemeine Abschlussprüfungen und gültige Warnfenster |
 
 ## Leseempfehlung
 
