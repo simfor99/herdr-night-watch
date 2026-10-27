@@ -6824,6 +6824,11 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                     );
                                 }
                             }
+                            if app.quota_drag.is_some()
+                                && !ui.input(|i| i.pointer.primary_down())
+                            {
+                                app.quota_drag = None;
+                            }
                             if let (Some(drag), Some(pointer)) = (app.quota_drag, config_pointer) {
                                 let others: Vec<(ProviderId, f32, f32)> = config_row_bounds
                                     .iter()
@@ -6903,13 +6908,21 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                     .map(|(pid, _, _, _)| *pid)
                                     .filter(|provider| *provider != dragged_provider)
                                     .collect();
+                                let mut next_order = app.quota_order.clone();
                                 reorder_quota_order(
-                                    &mut app.quota_order,
+                                    &mut next_order,
                                     dragged_provider,
                                     &visible_without,
                                     insert_index,
                                 );
-                                let _ = window_settings::set_live_status_quota_order(&app.quota_order);
+                                match window_settings::set_live_status_quota_order(&next_order) {
+                                    Ok(()) => app.quota_order = next_order,
+                                    Err(error) => {
+                                        app.error = Some(format!(
+                                            "Reihenfolge konnte nicht gespeichert werden: {error}"
+                                        ));
+                                    }
+                                }
                             }
                         }
                         ConfigTab::Window => {
@@ -7293,6 +7306,14 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                         }
                         current_y += card_h + 6.0;
                     }
+                    if app.quota_drag.is_some()
+                        && !ui.input(|i| i.pointer.primary_down())
+                    {
+                        // The origin widget vanished with a view or tab
+                        // switch; drop the stale drag instead of drawing a
+                        // ghost without a pressed pointer.
+                        app.quota_drag = None;
+                    }
                     if let (Some(drag), Some(pointer)) = (app.quota_drag, pointer) {
                         let others: Vec<(ProviderId, f32, f32)> = card_bounds
                             .iter()
@@ -7353,13 +7374,21 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             .map(|quota| quota.id)
                             .filter(|provider| *provider != dragged_provider)
                             .collect();
+                        let mut next_order = app.quota_order.clone();
                         reorder_quota_order(
-                            &mut app.quota_order,
+                            &mut next_order,
                             dragged_provider,
                             &visible_without,
                             insert_index,
                         );
-                        let _ = window_settings::set_live_status_quota_order(&app.quota_order);
+                        match window_settings::set_live_status_quota_order(&next_order) {
+                            Ok(()) => app.quota_order = next_order,
+                            Err(error) => {
+                                app.error = Some(format!(
+                                    "Reihenfolge konnte nicht gespeichert werden: {error}"
+                                ));
+                            }
+                        }
                     }
                 }
 
