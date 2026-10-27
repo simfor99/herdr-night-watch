@@ -1561,6 +1561,14 @@ fn live_title(language: Language) -> &'static str {
     )
 }
 
+#[derive(Clone, Copy)]
+struct QuotaCardDrag {
+    provider: ProviderId,
+    grab_offset_y: f32,
+}
+
+use crate::quota_layout::{apply_quota_order, provider_slot, reorder_quota_order};
+
 struct LiveStatusApp {
     language: Language,
     status: WatchStatus,
@@ -1619,6 +1627,8 @@ struct LiveStatusApp {
     quota_show_agi: bool,
     quota_show_codex: bool,
     quota_show_claude: bool,
+    quota_order: Vec<ProviderId>,
+    quota_drag: Option<QuotaCardDrag>,
     quota_color_glm: u8,
     quota_color_agi: u8,
     quota_color_codex: u8,
@@ -1741,6 +1751,8 @@ impl LiveStatusApp {
             quota_show_agi: window_settings::live_status_quota_show_agi(),
             quota_show_codex: window_settings::live_status_quota_show_codex(),
             quota_show_claude: window_settings::live_status_quota_show_claude(),
+            quota_order: window_settings::live_status_quota_order(),
+            quota_drag: None,
             quota_color_glm: window_settings::live_status_quota_color_glm(),
             quota_color_agi: window_settings::live_status_quota_color_agi(),
             quota_color_codex: window_settings::live_status_quota_color_codex(),
@@ -2255,6 +2267,7 @@ impl eframe::App for LiveStatusApp {
             self.quota_show_agi = window_settings::live_status_quota_show_agi();
             self.quota_show_codex = window_settings::live_status_quota_show_codex();
             self.quota_show_claude = window_settings::live_status_quota_show_claude();
+            self.quota_order = window_settings::live_status_quota_order();
             self.quota_color_glm = window_settings::live_status_quota_color_glm();
             self.quota_color_agi = window_settings::live_status_quota_color_agi();
             self.quota_color_codex = window_settings::live_status_quota_color_codex();
@@ -6177,7 +6190,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
     let show_codex = app.quota_show_codex;
     let show_claude = app.quota_show_claude;
 
-    let visible_providers: Vec<ProviderQuota> = app
+    let mut visible_providers: Vec<ProviderQuota> = app
         .quota_snapshot
         .providers
         .iter()
@@ -6189,6 +6202,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
         })
         .cloned()
         .collect();
+    apply_quota_order(&mut visible_providers, &app.quota_order);
 
     let sat_design_height = quota_satellite_design_height(&visible_providers, app.quota_settings_open);
     if app.last_synced_sat_height != Some(sat_design_height) {
@@ -6628,12 +6642,22 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     let content_top = tab_bar_y + tab_h + 6.0;
                     match app.config_tab {
                         ConfigTab::Providers => {
-                            let providers_to_config = [
+                            let mut providers_to_config = vec![
                                 (ProviderId::Glm, "GLM", "Z.ai (GLM-4)", app.quota_show_glm),
                                 (ProviderId::Agy, "AGY", "Google (Antigravity)", app.quota_show_agi),
                                 (ProviderId::Codex, "CODEX", "OpenAI (Codex)", app.quota_show_codex),
                                 (ProviderId::Claude, "CLAUDE", "Anthropic (Claude)", app.quota_show_claude),
                             ];
+                            // Follow the same persisted card order as the quota cards.
+                            providers_to_config.sort_by_key(|(pid, _, _, _)| {
+                                app.quota_order
+                                    .iter()
+                                    .position(|entry| *entry == *pid)
+                                    .unwrap_or(app.quota_order.len())
+                            });
+                            let mut config_row_bounds: Vec<(ProviderId, f32, f32)> = Vec::new();
+                            let mut config_drop_requested: Option<(ProviderId, egui::Pos2)> = None;
+                            let config_pointer = ui.input(|i| i.pointer.latest_pos());
 
                             for (idx, (pid, short_name, full_name, is_shown)) in providers_to_config.iter().enumerate() {
                                 let y = content_top + idx as f32 * (row_height + row_gap);
@@ -6650,9 +6674,22 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 );
                                 let top_resp = ui.interact(
                                     top_area,
-                                    ui.make_persistent_id(format!("sat_cfg_top_{idx}")),
-                                    egui::Sense::click(),
+                                    ui.make_persistent_id(format!("sat_cfg_top_{}", provider_slot(*pid))),
+                                    egui::Sense::click_and_drag(),
                                 );
+                                if top_resp.drag_started() {
+                                    if let Some(pointer) = config_pointer {
+                                        app.quota_drag = Some(QuotaCardDrag {
+                                            provider: *pid,
+                                            grab_offset_y: pointer.y - row_rect.top(),
+                                        });
+                                    }
+                                } else if top_resp.drag_stopped() {
+                                    config_drop_requested =
+                                        config_pointer.map(|position| (*pid, position));
+                                    app.quota_drag = None;
+                                }
+                                config_row_bounds.push((*pid, y, row_height));
                                 let top_hovered = top_resp.hovered();
                                 if top_hovered {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -6775,6 +6812,104 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 ) {
                                     app.set_provider_color(*pid, new_color);
                                 }
+                                if app
+                                    .quota_drag
+                                    .is_some_and(|drag| drag.provider == *pid)
+                                {
+                                    // Dim the vacated settings row while it follows the pointer.
+                                    painter.rect_filled(
+                                        row_rect,
+                                        egui::CornerRadius::same(6),
+                                        egui::Color32::from_black_alpha(130),
+                                    );
+                                }
+                            }
+                            if let (Some(drag), Some(pointer)) = (app.quota_drag, config_pointer) {
+                                let others: Vec<(ProviderId, f32, f32)> = config_row_bounds
+                                    .iter()
+                                    .filter(|(provider, _, _)| *provider != drag.provider)
+                                    .copied()
+                                    .collect();
+                                let mut insert_y = content_top;
+                                for (_, top, height) in &others {
+                                    if pointer.y < top + height / 2.0 {
+                                        insert_y = *top - 3.0;
+                                        break;
+                                    }
+                                    insert_y = top + height + 3.0;
+                                }
+                                let marker_color = app.provider_color(drag.provider);
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(rect.left() + 10.0, insert_y),
+                                        egui::pos2(rect.right() - 10.0, insert_y),
+                                    ],
+                                    egui::Stroke::new(2.0, marker_color),
+                                );
+                                if let Some((pid, short_name, _, _)) = providers_to_config
+                                    .iter()
+                                    .find(|(entry, _, _, _)| *entry == drag.provider)
+                                {
+                                    let ghost_rect = egui::Rect::from_min_size(
+                                        egui::pos2(pointer.x - 24.0, pointer.y - 12.0),
+                                        egui::vec2(96.0, 22.0),
+                                    );
+                                    painter.rect_filled(
+                                        ghost_rect.expand(2.0),
+                                        egui::CornerRadius::same(6),
+                                        egui::Color32::from_black_alpha(70),
+                                    );
+                                    let ghost_color = app.provider_color(*pid);
+                                    painter.rect_filled(
+                                        ghost_rect,
+                                        egui::CornerRadius::same(4),
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            ghost_color.r(),
+                                            ghost_color.g(),
+                                            ghost_color.b(),
+                                            220,
+                                        ),
+                                    );
+                                    let ghost_text = painter.layout_no_wrap(
+                                        (*short_name).into(),
+                                        egui::FontId::proportional(11.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                    painter.galley(
+                                        egui::pos2(
+                                            ghost_rect.center().x - ghost_text.size().x / 2.0,
+                                            ghost_rect.center().y - ghost_text.size().y / 2.0,
+                                        ),
+                                        ghost_text,
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            }
+                            if let Some((dragged_provider, drop_at)) = config_drop_requested {
+                                let others: Vec<(ProviderId, f32, f32)> = config_row_bounds
+                                    .iter()
+                                    .filter(|(provider, _, _)| *provider != dragged_provider)
+                                    .copied()
+                                    .collect();
+                                let mut insert_index = others.len();
+                                for (index, (_, top, height)) in others.iter().enumerate() {
+                                    if drop_at.y < top + height / 2.0 {
+                                        insert_index = index;
+                                        break;
+                                    }
+                                }
+                                let visible_without: Vec<ProviderId> = providers_to_config
+                                    .iter()
+                                    .map(|(pid, _, _, _)| *pid)
+                                    .filter(|provider| *provider != dragged_provider)
+                                    .collect();
+                                reorder_quota_order(
+                                    &mut app.quota_order,
+                                    dragged_provider,
+                                    &visible_without,
+                                    insert_index,
+                                );
+                                let _ = window_settings::set_live_status_quota_order(&app.quota_order);
                             }
                         }
                         ConfigTab::Window => {
@@ -7116,15 +7251,115 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     );
                 } else {
                     let mut current_y = rows_top;
+                    let mut card_bounds: Vec<(ProviderId, f32, f32)> = Vec::new();
+                    let mut drop_requested: Option<(ProviderId, egui::Pos2)> = None;
+                    let pointer = ui.input(|i| i.pointer.latest_pos());
                     for quota in &visible_providers {
                         let card_h = provider_card_height(quota);
                         let row_rect = egui::Rect::from_min_size(
                             egui::pos2(rect.left() + 8.0, current_y),
                             egui::vec2(rect.width() - 16.0, card_h),
                         );
+                        card_bounds.push((quota.id, current_y, card_h));
                         let forecast = quota.pacing_forecast();
-                        draw_provider_card(painter, row_rect, quota, &forecast, language, app.provider_color(quota.id));
+                        let card_color = app.provider_color(quota.id);
+                        draw_provider_card(painter, row_rect, quota, &forecast, language, card_color);
+                        if app
+                            .quota_drag
+                            .is_some_and(|drag| drag.provider == quota.id)
+                        {
+                            // Dim the vacated slot while the card follows the pointer.
+                            painter.rect_filled(
+                                row_rect,
+                                egui::CornerRadius::same(6),
+                                egui::Color32::from_black_alpha(130),
+                            );
+                        }
+                        let card_response = ui.interact(
+                            row_rect,
+                            egui::Id::new("quota_card").with(provider_slot(quota.id)),
+                            egui::Sense::drag(),
+                        );
+                        if card_response.drag_started() {
+                            if let Some(pointer) = pointer {
+                                app.quota_drag = Some(QuotaCardDrag {
+                                    provider: quota.id,
+                                    grab_offset_y: pointer.y - row_rect.top(),
+                                });
+                            }
+                        } else if card_response.drag_stopped() {
+                            drop_requested = pointer.map(|position| (quota.id, position));
+                            app.quota_drag = None;
+                        }
                         current_y += card_h + 6.0;
+                    }
+                    if let (Some(drag), Some(pointer)) = (app.quota_drag, pointer) {
+                        let others: Vec<(ProviderId, f32, f32)> = card_bounds
+                            .iter()
+                            .filter(|(provider, _, _)| *provider != drag.provider)
+                            .copied()
+                            .collect();
+                        // Insert marker at the gap the pointer currently targets.
+                        let mut insert_y = rows_top;
+                        for (_, top, height) in &others {
+                            if pointer.y < top + height / 2.0 {
+                                insert_y = *top - 3.0;
+                                break;
+                            }
+                            insert_y = top + height + 3.0;
+                        }
+                        let marker_color = app.provider_color(drag.provider);
+                        painter.line_segment(
+                            [
+                                egui::pos2(rect.left() + 10.0, insert_y),
+                                egui::pos2(rect.right() - 10.0, insert_y),
+                            ],
+                            egui::Stroke::new(2.0, marker_color),
+                        );
+                        if let Some(quota) = app.quota_snapshot.get(drag.provider) {
+                            let card_h = provider_card_height(quota);
+                            let ghost_top = (pointer.y - drag.grab_offset_y).max(rows_top);
+                            let ghost_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 8.0, ghost_top),
+                                egui::vec2(rect.width() - 16.0, card_h),
+                            );
+                            painter.rect_filled(
+                                ghost_rect.expand(2.0),
+                                egui::CornerRadius::same(8),
+                                egui::Color32::from_black_alpha(70),
+                            );
+                            let forecast = quota.pacing_forecast();
+                            let card_color = app.provider_color(drag.provider);
+                            draw_provider_card(
+                                painter, ghost_rect, quota, &forecast, language, card_color,
+                            );
+                        }
+                    }
+                    if let Some((dragged_provider, drop_at)) = drop_requested {
+                        let others: Vec<(ProviderId, f32, f32)> = card_bounds
+                            .iter()
+                            .filter(|(provider, _, _)| *provider != dragged_provider)
+                            .copied()
+                            .collect();
+                        let mut insert_index = others.len();
+                        for (index, (_, top, height)) in others.iter().enumerate() {
+                            if drop_at.y < top + height / 2.0 {
+                                insert_index = index;
+                                break;
+                            }
+                        }
+                        let visible_without: Vec<ProviderId> = visible_providers
+                            .iter()
+                            .map(|quota| quota.id)
+                            .filter(|provider| *provider != dragged_provider)
+                            .collect();
+                        reorder_quota_order(
+                            &mut app.quota_order,
+                            dragged_provider,
+                            &visible_without,
+                            insert_index,
+                        );
+                        let _ = window_settings::set_live_status_quota_order(&app.quota_order);
                     }
                 }
 

@@ -26,6 +26,8 @@ mod media;
 mod notify;
 #[cfg(windows)]
 mod power_guard;
+#[cfg(any(windows, test))]
+mod quota_layout;
 #[cfg(windows)]
 mod settings;
 #[cfg(windows)]
