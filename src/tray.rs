@@ -344,9 +344,6 @@ impl App {
     }
 
     fn render(&mut self) {
-        if !self.status_available && !self.message.as_deref().is_some_and(|m| m.starts_with("Status unbekannt")) {
-            self.message = Some("Status unbekannt – letzte Daten sind veraltet".into());
-        }
         let view = format!(
             "{:?}|{:?}|{}|{}|{:?}|{}|{}",
             self.status,

@@ -49,7 +49,9 @@ raise SystemExit(channel.serve(watcher))
 
     def response(self, child, timeout=4):
         self.assertTrue(select.select([child.stdout],[],[],timeout)[0], 'response deadline')
-        return json.loads(child.stdout.readline())
+        line = child.stdout.readline()
+        self.assertTrue(line, 'channel closed without a final frame')
+        return json.loads(line)
 
     def test_reuse_and_log_isolation_and_boot_marker(self):
         child=self.start("    print('maintenance log')\n    return {'pid':os.getpid(),'boot':watcher._STATUS_WINDOWS_BOOT_ID}")

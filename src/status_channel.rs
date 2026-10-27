@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const MAX_FRAME: usize = 256 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(26); // 3.2 seconds remain for cleanup.
@@ -159,11 +159,14 @@ impl Channel {
             let sequence = response["sequence"]
                 .as_u64()
                 .ok_or_else(|| anyhow!("Statussequenz fehlt"))?;
-            let generated = response["generated_unix_ms"]
-                .as_u64()
-                .ok_or_else(|| anyhow!("Statuszeit fehlt"))?;
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
-            if sequence <= session.sequence || now.abs_diff(generated) > 5000 {
+            // Freshness is enforced by the request id and the strictly growing
+            // sequence; comparing the Windows clock against the helper's WSL
+            // wall clock would misfire for the whole session whenever WSL time
+            // drifts after a host sleep.
+            if response["generated_unix_ms"].as_u64().is_none() {
+                bail!("Statuszeit fehlt");
+            }
+            if sequence <= session.sequence {
                 bail!("Veraltete Statusantwort");
             }
             session.sequence = sequence;
@@ -206,7 +209,13 @@ impl Channel {
             }
             while Instant::now() < deadline {
                 if matches!(session.child.try_wait(), Ok(Some(_))) {
+                    // The helper ended without the closing frame (typical after
+                    // a WSL restart); arm the recovery pause here as well so
+                    // the next request waits instead of spawning immediately.
                     self.cleanup_failed |= !acknowledged;
+                    if self.cleanup_failed {
+                        self.cleanup_retry_at = Instant::now() + RECOVERY_PAUSE;
+                    }
                     return;
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -300,7 +309,7 @@ print(json.dumps({{'version':1,'closed':True}}),flush=True)
         for body in [
             "print('garbage',flush=True)",
             "print(json.dumps({'version':1,'id':999}),flush=True)",
-            "print(json.dumps({'version':1,'id':r['id'],'sequence':r['id'],'generated_unix_ms':0,'status':{}}),flush=True)",
+            "print(json.dumps({'version':1,'id':r['id'],'sequence':0,'generated_unix_ms':int(time.time()*1000),'status':{}}),flush=True)",
             "print('x'*300000,flush=True)",
         ] {
             let mut c = channel();
@@ -346,6 +355,26 @@ print(json.dumps({{'version':1,'closed':True}}),flush=True)
         assert!(c.request("a".into(), helper(VALID)).is_ok());
         assert!(!c.cleanup_failed);
         assert_eq!(c.failures, 0);
+    }
+
+    #[test]
+    fn helper_exit_without_close_frame_arms_the_recovery_pause() {
+        // The typical WSL-restart shape: wsl.exe ends without the closing
+        // frame, so the request times out and cleanup is never acknowledged.
+        let mut c = channel();
+        assert!(
+            c.request_with_timeout(
+                "a".into(),
+                helper("import sys; sys.stdout.close()"),
+                Duration::from_millis(50)
+            )
+            .is_err()
+        );
+        assert!(c.cleanup_failed);
+        // The pause must be armed in this branch as well, not only after a kill.
+        assert!(c.cleanup_retry_at > Instant::now());
+        assert!(c.request("a".into(), helper(VALID)).is_err());
+        assert!(c.session.is_none());
     }
     #[test]
     fn repeated_errors_back_off_but_never_stop_permanently() {

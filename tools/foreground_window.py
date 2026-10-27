@@ -10,7 +10,7 @@ user32 = ctypes.windll.user32
 user32.SetProcessDPIAware()
 
 TARGET = sys.argv[1] if len(sys.argv) > 1 else "Live-Status"
-OUT = sys.argv[2] if len(sys.argv) > 2 else r"C:\Users\Simon\Desktop\temp\nw-window.png"
+OUT = sys.argv[2] if len(sys.argv) > 2 else "nw-window.png"
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 found = []
@@ -37,6 +37,8 @@ if not found:
     print("window-not-found")
     sys.exit(1)
 hwnd = found[0]
+if user32.IsIconic(hwnd):
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
 user32.SetForegroundWindow(hwnd)
 user32.BringWindowToTop(hwnd)
 time.sleep(2.5)

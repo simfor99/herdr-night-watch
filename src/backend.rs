@@ -1,6 +1,7 @@
 use crate::configuration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -362,12 +363,48 @@ pub fn warning_is_current(expected: &str) -> Result<bool> {
         .arg("/usr/bin/python3")
         .arg(watcher_path())
         .arg("--warning-status");
-    let output = command_output(command, "Warnungsprüfung")?;
+    // The dialog monitor joins on this call from the tray thread, so an
+    // unbounded wsl.exe hang would freeze the tray. Keep the check bounded:
+    // poll the child up to five seconds, then kill it and report an error.
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .with_context(|| "Warnungsprüfung konnte nicht gestartet werden")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("Warnungsprüfung fehlgeschlagen");
+            }
+        }
+    };
+    let Some(status) = status else {
+        bail!("Warnungsprüfung hat das Zeitlimit überschritten");
+    };
+    if !status.success() {
+        bail!("Warnungsprüfung fehlgeschlagen");
+    }
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout)
+            .context("Warnungsausgabe konnte nicht gelesen werden")?;
+    }
     #[derive(Deserialize)]
     struct WarningIdentity {
         warning_id: Option<String>,
     }
-    let identity: WarningIdentity = serde_json::from_str(&output)?;
+    let identity: WarningIdentity = serde_json::from_str(&stdout)?;
     Ok(!expected.is_empty() && identity.warning_id.as_deref() == Some(expected))
 }
 
