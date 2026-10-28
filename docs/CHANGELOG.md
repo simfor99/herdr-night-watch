@@ -1,5 +1,13 @@
 # Changelog - Herdr-Nachtwächter
 
+## [2026-10-27] - Zurückgezogene Warnungen beenden den Nachtwächter nicht mehr
+
+- Hat eine zusätzliche Abschlussprüfung die Abschaltwarnung zurückgezogen, während der Wächter seine eigene Sicherheitsprüfung lief, scheiterte diese fälschlich am Fehlen der Warnung und beendete den Lauf mit `shutdown_abort_failed`. Der Wächter erkennt jetzt an der in den Laufzustand geschriebenen `withdrawn_warning_id`, dass die Warnung absichtlich zurückgezogen wurde, synchronisiert seinen Zustand und überwacht weiter; keine Energieaktion, kein `refused`-Abschluss.
+- Der Netzwächter hat beim Verfügbarkeitswechsel den Laufzustand mit seinem veralteten Abbild überschrieben und konnte dabei die Rücknahmemarke wieder aus der Datei löschen. Er lädt den Zustand jetzt unter dem completion lock frisch, ändert nur das Netzfeld und schreibt das Ergebnis verlustfrei zurück.
+- Der completion lock ist im selben Prozess wiedereintrittsfähig, damit der Netzwächter innerhalb der finalen Abschlussprüfung keinen Deadlock auf der eigenen Sperrdatei erzeugt.
+- Herdr-CLI-Aufrufe ohne Statuskanal-Frist laufen mit einem 60-Sekunden-Limit; ein hängender Aufruf wird als wiederholbarer Fehler gemeldet, statt die Wächterschleife dauerhaft zu blockieren. Energiekommandos laufen bewusst weiter ohne Zeitlimit: Ein Schlafaufruf überdauert die Schlafdauer selbst, ein Timeout würde einen erfolgreichen Schlaf als Fehlschlag melden; ihr Endzustand steht vorher dauerhaft auf der Platte.
+- Zwölf neue Tests decken beide Rücknahme-Integrationen (refuse und finale Aktion), die verlustfreie Netzfeldaktualisierung inklusive Fremdlauf- und Gegenprobenfälle, den Lock-Wiedereintritt, das CLI-Timeout und die Fail-Closed-Gegenprobe ab; der bestehende Konnektivitätstest prüft jetzt zusätzlich, dass die Rücknahmemarke beim Verfügbarkeitswechsel erhalten bleibt.
+
 ## [2026-10-26] - NVIDIA-Telemetrie erholt sich nach Einzelfehlern
 
 - Ein einziger fehlgeschlagener `nvidia-smi`-Aufruf (zum Beispiel ein Timeout unter Last) hat die NVIDIA-Telemetrie dauerhaft abgeschaltet: GPU-Temperatur, Verbrauch in Watt und VRAM zeigten bis zum App-Neustart einen Strich, obwohl `nvidia-smi` weiterhin antwortete. Nach einem Fehler pausiert die Abfrage jetzt 60 Sekunden und versucht es danach erneut, passend zum Retry-Muster der CPU-Temperatur; ein erfolgreicher Aufruf schaltet die Telemetrie sofort wieder frei.

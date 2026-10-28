@@ -570,7 +570,12 @@ class ConnectivityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             state_path = root / "active-run.json"
-            state = {"network_unavailable_since": WATCHER.iso_now()}
+            state = {
+                "run_id": "watch-run",
+                "network_unavailable_since": WATCHER.iso_now(),
+                "withdrawn_warning_id": "warning-1",
+            }
+            WATCHER.write_json(state_path, state)
             with (
                 patch.object(WATCHER, "paths", return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock")),
                 patch.object(WATCHER, "internet_available", return_value=True),
@@ -578,6 +583,10 @@ class ConnectivityTests(unittest.TestCase):
                 monitor = WATCHER.ConnectivityMonitor()
                 self.assertTrue(monitor.refresh(state))
             self.assertIsNone(state["network_unavailable_since"])
+            self.assertEqual(state["withdrawn_warning_id"], "warning-1")
+            persisted = WATCHER.load_json(state_path)
+            self.assertIsNone(persisted["network_unavailable_since"])
+            self.assertEqual(persisted["withdrawn_warning_id"], "warning-1")
 
 
 class CompletionHistoryTests(unittest.TestCase):
@@ -1285,6 +1294,374 @@ class DiagnosticLogTests(unittest.TestCase):
             self.assertEqual(entries[0]["sequence"], 1)
             self.assertEqual(entries[-1]["sequence"], WATCHER.DIAGNOSTIC_HISTORY_LIMIT)
             self.assertEqual(entries[-1]["event"], "STATUS")
+
+
+class WithdrawnWarningRecoveryTests(unittest.TestCase):
+    """The race where a confirmation recheck withdraws a live warning."""
+
+    def state(self) -> dict[str, object]:
+        return {
+            "run_id": "watch-run",
+            "poll_seconds": 1,
+            "warning_seconds": 1,
+            "quiet_seconds": 0,
+            "all_terminal_since": "2020-01-01T00:00:00+00:00",
+            "completion_action": "shutdown",
+            "dry_run": False,
+        }
+
+    def base_patches(self, root: Path, state_path: Path):
+        connectivity = SimpleNamespace(refresh=lambda state: False)
+        return (
+            patch.object(WATCHER, "wait_for_runtime_boot_id", return_value="boot-current"),
+            patch.object(WATCHER, "reset_stale_run_after_restart"),
+            patch.object(
+                WATCHER,
+                "paths",
+                return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+            ),
+            patch.object(WATCHER, "ConnectivityMonitor", return_value=connectivity),
+            patch.object(WATCHER, "network_grace_elapsed", return_value=False),
+            patch.object(WATCHER.time, "sleep"),
+            patch.object(WATCHER, "log"),
+        )
+
+    def test_refused_warning_withdrawn_by_a_recheck_resumes_monitoring(self) -> None:
+        state = self.state()
+        state["warning_seconds"] = 30
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            WATCHER.write_json(state_path, state)
+            base = datetime(2026, 8, 23, tzinfo=timezone.utc)
+            evaluations = 0
+
+            def evaluate(_state: dict[str, object]) -> tuple[str, list[str]]:
+                nonlocal evaluations
+                evaluations += 1
+                if evaluations == 3:
+                    warning_path.unlink(missing_ok=True)
+                    current = WATCHER.load_json(state_path)
+                    assert current is not None
+                    current["withdrawn_warning_id"] = "w-1"
+                    current["all_terminal_since"] = None
+                    WATCHER.write_json(state_path, current)
+                    return "refuse", ["p=blocked"]
+                if evaluations == 4:
+                    current = WATCHER.load_json(state_path)
+                    assert current is not None
+                    current["outcome"] = "cancelled"
+                    WATCHER.write_json(state_path, current)
+                    return "active", []
+                return "terminal", []
+
+            def schedule_warning(current: dict[str, object], _reason: str) -> str:
+                WATCHER.write_json(
+                    warning_path,
+                    {
+                        "run_id": current["run_id"],
+                        "warning_id": "w-1",
+                        "completion_action": "shutdown",
+                        "cancelable_until": (base + timedelta(seconds=60)).isoformat(),
+                    },
+                )
+                return "w-1"
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(WATCHER, "evaluate", side_effect=evaluate))
+                stack.enter_context(patch.object(WATCHER, "utc_now", return_value=base))
+                stack.enter_context(patch.object(WATCHER, "schedule_shutdown", side_effect=schedule_warning))
+                record = stack.enter_context(patch.object(WATCHER, "record_completion"))
+                shutdown = stack.enter_context(patch.object(WATCHER, "request_windows_shutdown_now"))
+                sleep_action = stack.enter_context(patch.object(WATCHER, "request_windows_sleep"))
+                for context in self.base_patches(root, state_path):
+                    stack.enter_context(context)
+                self.assertEqual(WATCHER.watch(), 0)
+            record.assert_not_called()
+            shutdown.assert_not_called()
+            sleep_action.assert_not_called()
+            self.assertFalse(warning_path.exists())
+            self.assertEqual(WATCHER.load_json(state_path)["outcome"], "cancelled")
+
+    def test_final_action_is_skipped_when_the_warning_was_withdrawn(self) -> None:
+        state = self.state()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            WATCHER.write_json(state_path, state)
+            base = datetime(2026, 8, 23, tzinfo=timezone.utc)
+            clock: list[int] = []
+            evaluations = 0
+
+            def now() -> datetime:
+                clock.append(len(clock))
+                if len(clock) == 4:
+                    # The second warning-window check races with the
+                    # confirmation recheck: withdraw the warning right here.
+                    warning_path.unlink(missing_ok=True)
+                    current = WATCHER.load_json(state_path)
+                    assert current is not None
+                    current["withdrawn_warning_id"] = "w-1"
+                    current["all_terminal_since"] = None
+                    WATCHER.write_json(state_path, current)
+                    return base + timedelta(seconds=2)
+                return base
+
+            def evaluate(_state: dict[str, object]) -> tuple[str, list[str]]:
+                nonlocal evaluations
+                evaluations += 1
+                if evaluations == 4:
+                    current = WATCHER.load_json(state_path)
+                    assert current is not None
+                    current["outcome"] = "cancelled"
+                    WATCHER.write_json(state_path, current)
+                    return "active", []
+                return "terminal", []
+
+            def schedule_warning(current: dict[str, object], _reason: str) -> str:
+                WATCHER.write_json(
+                    warning_path,
+                    {
+                        "run_id": current["run_id"],
+                        "warning_id": "w-1",
+                        "completion_action": "shutdown",
+                        "cancelable_until": (base + timedelta(seconds=60)).isoformat(),
+                    },
+                )
+                return "w-1"
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(WATCHER, "evaluate", side_effect=evaluate))
+                stack.enter_context(patch.object(WATCHER, "utc_now", side_effect=now))
+                stack.enter_context(patch.object(WATCHER, "schedule_shutdown", side_effect=schedule_warning))
+                record = stack.enter_context(patch.object(WATCHER, "record_completion"))
+                shutdown = stack.enter_context(patch.object(WATCHER, "request_windows_shutdown_now"))
+                sleep_action = stack.enter_context(patch.object(WATCHER, "request_windows_sleep"))
+                for context in self.base_patches(root, state_path):
+                    stack.enter_context(context)
+                self.assertEqual(WATCHER.watch(), 0)
+            record.assert_not_called()
+            shutdown.assert_not_called()
+            sleep_action.assert_not_called()
+            self.assertFalse(warning_path.exists())
+            self.assertEqual(WATCHER.load_json(state_path)["outcome"], "cancelled")
+
+    def test_abort_or_fail_resumes_when_the_warning_was_withdrawn(self) -> None:
+        state = {"run_id": "watch-run", "all_terminal_since": "2020-01-01T00:00:00+00:00"}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(WATCHER, "abort_shutdown_if_ours", return_value=None))
+            stack.enter_context(
+                patch.object(
+                    WATCHER,
+                    "active_run",
+                    return_value={"run_id": "watch-run", "withdrawn_warning_id": "w-1", "all_terminal_since": None},
+                )
+            )
+            finish = stack.enter_context(patch.object(WATCHER, "finish"))
+            self.assertTrue(
+                WATCHER.abort_shutdown_or_fail(
+                    state,
+                    "Herdr refused completion and the Windows shutdown warning could not be cancelled",
+                    require_warning=True,
+                    warning_identifier="w-1",
+                )
+            )
+        finish.assert_not_called()
+        self.assertEqual(state["withdrawn_warning_id"], "w-1")
+        self.assertIsNone(state["all_terminal_since"])
+
+    def test_abort_or_fail_without_the_marker_fails_closed(self) -> None:
+        state = {"run_id": "watch-run"}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(WATCHER, "abort_shutdown_if_ours", return_value=None))
+            stack.enter_context(
+                patch.object(WATCHER, "active_run", return_value={"run_id": "watch-run"})
+            )
+            finish = stack.enter_context(patch.object(WATCHER, "finish"))
+            self.assertFalse(
+                WATCHER.abort_shutdown_or_fail(
+                    state,
+                    "The active completion warning could not be removed",
+                    require_warning=True,
+                    warning_identifier="w-1",
+                )
+            )
+        finish.assert_called_once()
+
+    def test_completion_lock_is_reentrant_and_released(self) -> None:
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            lock_path = root / "completion.lock"
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, root / "active-run.json", root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                WATCHER.completion_lock(),
+            ):
+                self.assertEqual(WATCHER._COMPLETION_LOCK_DEPTH, 1)
+                with lock_path.open("r") as probe:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with WATCHER.completion_lock():
+                    self.assertEqual(WATCHER._COMPLETION_LOCK_DEPTH, 2)
+                self.assertEqual(WATCHER._COMPLETION_LOCK_DEPTH, 1)
+            self.assertEqual(WATCHER._COMPLETION_LOCK_DEPTH, 0)
+            with lock_path.open("r") as probe:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(probe, fcntl.LOCK_UN)
+
+    def test_run_command_times_out_in_the_default_path(self) -> None:
+        self.assertIsNone(WATCHER._STATUS_DEADLINE)
+        with patch.object(WATCHER, "WATCHER_COMMAND_TIMEOUT_SECONDS", 0.3):
+            with self.assertRaisesRegex(RuntimeError, r"timed out after 0\.3s"):
+                WATCHER.run_command(["sleep", "5"])
+        self.assertEqual(WATCHER.run_command(["printf", "ok"]), "ok")
+
+    def test_completed_detail_extracts_partial_output(self) -> None:
+        import subprocess
+
+        with_bytes = subprocess.TimeoutExpired(cmd=["herdr", "status"], timeout=60, output=b"partial")
+        self.assertEqual(WATCHER.completed_detail(with_bytes, ["herdr", "status"]), "partial")
+        with_text = subprocess.TimeoutExpired(cmd=["herdr", "status"], timeout=60, stderr="late failure")
+        self.assertEqual(WATCHER.completed_detail(with_text, ["herdr", "status"]), "late failure")
+        empty = subprocess.TimeoutExpired(cmd=["herdr", "status"], timeout=60)
+        self.assertEqual(WATCHER.completed_detail(empty, ["herdr", "status"]), "no output from herdr status")
+
+    def test_refresh_offline_transition_persists_the_new_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            state = {"run_id": "watch-run", "network_unavailable_since": None}
+            WATCHER.write_json(state_path, state)
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "internet_available", return_value=False),
+            ):
+                monitor = WATCHER.ConnectivityMonitor()
+                self.assertFalse(monitor.refresh(state))
+            self.assertIsNotNone(state["network_unavailable_since"])
+            persisted = WATCHER.load_json(state_path)
+            assert persisted is not None
+            self.assertIsNotNone(persisted["network_unavailable_since"])
+
+    def test_refresh_syncs_a_reconciled_state_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            state = {"run_id": "watch-run", "network_unavailable_since": WATCHER.iso_now()}
+            WATCHER.write_json(state_path, {"run_id": "watch-run", "network_unavailable_since": None})
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "internet_available", return_value=True),
+                patch.object(WATCHER, "write_json") as write,
+            ):
+                monitor = WATCHER.ConnectivityMonitor()
+                self.assertTrue(monitor.refresh(state))
+            write.assert_not_called()
+            self.assertIsNone(state["network_unavailable_since"])
+
+    def test_refresh_without_a_transition_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            state = {"run_id": "watch-run", "network_unavailable_since": None}
+            WATCHER.write_json(state_path, state)
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "internet_available", return_value=True),
+                patch.object(WATCHER, "write_json") as write,
+            ):
+                monitor = WATCHER.ConnectivityMonitor()
+                self.assertTrue(monitor.refresh(state))
+            write.assert_not_called()
+            self.assertIsNone(state["network_unavailable_since"])
+
+    def test_refresh_never_touches_a_state_from_a_different_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            state = {"run_id": "watch-run", "network_unavailable_since": WATCHER.iso_now()}
+            WATCHER.write_json(state_path, {"run_id": "replaced-run", "network_unavailable_since": None})
+            with (
+                patch.object(
+                    WATCHER,
+                    "paths",
+                    return_value=(root, state_path, root / "shutdown-warning.json", root / "watch.lock"),
+                ),
+                patch.object(WATCHER, "internet_available", return_value=True),
+                patch.object(WATCHER, "write_json") as write,
+            ):
+                monitor = WATCHER.ConnectivityMonitor()
+                self.assertTrue(monitor.refresh(state))
+            write.assert_not_called()
+            persisted = WATCHER.load_json(state_path)
+            assert persisted is not None
+            self.assertEqual(persisted["run_id"], "replaced-run")
+            self.assertIsNone(persisted["network_unavailable_since"])
+
+    def test_refuse_without_withdrawal_finishes_the_run(self) -> None:
+        state = self.state()
+        state["warning_seconds"] = 30
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "active-run.json"
+            warning_path = root / "shutdown-warning.json"
+            WATCHER.write_json(state_path, state)
+            base = datetime(2026, 8, 23, tzinfo=timezone.utc)
+            evaluations = 0
+
+            def evaluate(_state: dict[str, object]) -> tuple[str, list[str]]:
+                nonlocal evaluations
+                evaluations += 1
+                if evaluations == 3:
+                    return "refuse", ["p=blocked"]
+                return "terminal", []
+
+            def schedule_warning(current: dict[str, object], _reason: str) -> str:
+                WATCHER.write_json(
+                    warning_path,
+                    {
+                        "run_id": current["run_id"],
+                        "warning_id": "w-1",
+                        "completion_action": "shutdown",
+                        "cancelable_until": (base + timedelta(seconds=60)).isoformat(),
+                    },
+                )
+                return "w-1"
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(WATCHER, "evaluate", side_effect=evaluate))
+                stack.enter_context(patch.object(WATCHER, "utc_now", return_value=base))
+                stack.enter_context(patch.object(WATCHER, "schedule_shutdown", side_effect=schedule_warning))
+                record = stack.enter_context(patch.object(WATCHER, "record_completion"))
+                shutdown = stack.enter_context(patch.object(WATCHER, "request_windows_shutdown_now"))
+                sleep_action = stack.enter_context(patch.object(WATCHER, "request_windows_sleep"))
+                for context in self.base_patches(root, state_path):
+                    stack.enter_context(context)
+                self.assertEqual(WATCHER.watch(), 0)
+            record.assert_not_called()
+            shutdown.assert_not_called()
+            sleep_action.assert_not_called()
+            self.assertFalse(warning_path.exists())
+            self.assertEqual(WATCHER.load_json(state_path)["outcome"], "refused")
 
 
 if __name__ == "__main__":
