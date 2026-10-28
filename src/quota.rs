@@ -1278,7 +1278,7 @@ impl QuotaSnapshot {
             ),
             ProviderQuota::new(
                 ProviderId::Agy,
-                "AGI",
+                "AGY",
                 "Antigravity",
                 Some(98),
                 Some("17:53".into()),
@@ -1851,7 +1851,7 @@ mod tests {
         // Session at zero alone also disables the provider.
         let agy = ProviderQuota::new(
             ProviderId::Agy,
-            "AGI",
+            "AGY",
             "Antigravity",
             Some(0),
             Some("19:45".into()),
