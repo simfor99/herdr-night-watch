@@ -6,7 +6,7 @@
 - Der Netzwächter hat beim Verfügbarkeitswechsel den Laufzustand mit seinem veralteten Abbild überschrieben und konnte dabei die Rücknahmemarke wieder aus der Datei löschen. Er lädt den Zustand jetzt unter dem completion lock frisch, ändert nur das Netzfeld und schreibt das Ergebnis verlustfrei zurück.
 - Der completion lock ist im selben Prozess wiedereintrittsfähig, damit der Netzwächter innerhalb der finalen Abschlussprüfung keinen Deadlock auf der eigenen Sperrdatei erzeugt.
 - Herdr-CLI-Aufrufe ohne Statuskanal-Frist laufen mit einem 60-Sekunden-Limit; ein hängender Aufruf wird als wiederholbarer Fehler gemeldet, statt die Wächterschleife dauerhaft zu blockieren. Energiekommandos laufen bewusst weiter ohne Zeitlimit: Ein Schlafaufruf überdauert die Schlafdauer selbst, ein Timeout würde einen erfolgreichen Schlaf als Fehlschlag melden; ihr Endzustand steht vorher dauerhaft auf der Platte.
-- Zwölf neue Tests decken beide Rücknahme-Integrationen (refuse und finale Aktion), die verlustfreie Netzfeldaktualisierung inklusive Fremdlauf- und Gegenprobenfälle, die Lock-Wiedereintritt, das CLI-Timeout und die Fail-Closed-Gegenprobe ab; der bestehende Konnektivitätstest prüft jetzt zusätzlich, dass die Rücknahmemarke beim Verfügbarkeitswechsel erhalten bleibt.
+- Zwölf neue Tests decken beide Rücknahme-Integrationen (refuse und finale Aktion), die verlustfreie Netzfeldaktualisierung inklusive Fremdlauf- und Gegenprobenfälle, den Lock-Wiedereintritt, das CLI-Timeout und die Fail-Closed-Gegenprobe ab; der bestehende Konnektivitätstest prüft jetzt zusätzlich, dass die Rücknahmemarke beim Verfügbarkeitswechsel erhalten bleibt.
 
 ## [2026-10-26] - NVIDIA-Telemetrie erholt sich nach Einzelfehlern
 
