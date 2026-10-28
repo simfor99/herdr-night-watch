@@ -18,6 +18,7 @@ const LIVE_STATUS_QUOTA_DOCKED_VALUE: &str = "LiveStatusQuotaDocked";
 const LIVE_STATUS_QUOTA_POS_X_VALUE: &str = "LiveStatusQuotaPositionX";
 const LIVE_STATUS_QUOTA_POS_Y_VALUE: &str = "LiveStatusQuotaPositionY";
 const LIVE_STATUS_QUOTA_SHOW_GLM_VALUE: &str = "LiveStatusQuotaShowGlm";
+const LIVE_STATUS_MINIMIZE_DEPLETED_VALUE: &str = "LiveStatusMinimizeDepleted";
 const LIVE_STATUS_QUOTA_SHOW_AGI_VALUE: &str = "LiveStatusQuotaShowAgi";
 const LIVE_STATUS_QUOTA_SHOW_CODEX_VALUE: &str = "LiveStatusQuotaShowCodex";
 const LIVE_STATUS_QUOTA_SHOW_CLAUDE_VALUE: &str = "LiveStatusQuotaShowClaude";
@@ -367,6 +368,14 @@ pub fn set_live_status_quota_position(position: [f32; 2]) -> anyhow::Result<()> 
 
 pub fn live_status_quota_show_glm() -> bool {
     read_bool_setting(LIVE_STATUS_QUOTA_SHOW_GLM_VALUE, true)
+}
+
+pub fn live_status_minimize_depleted() -> bool {
+    read_bool_setting(LIVE_STATUS_MINIMIZE_DEPLETED_VALUE, true)
+}
+
+pub fn set_live_status_minimize_depleted(minimize: bool) -> anyhow::Result<()> {
+    write_bool_setting(LIVE_STATUS_MINIMIZE_DEPLETED_VALUE, minimize)
 }
 
 pub fn set_live_status_quota_show_glm(show: bool) -> anyhow::Result<()> {

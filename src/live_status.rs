@@ -1624,6 +1624,7 @@ struct LiveStatusApp {
     quota_resize_drag: Option<(egui::Pos2, f32, egui::Vec2)>,
     satellite_configured_hwnd: Option<HWND>,
     quota_show_glm: bool,
+    quota_minimize_depleted: bool,
     quota_show_agi: bool,
     quota_show_codex: bool,
     quota_show_claude: bool,
@@ -1748,6 +1749,7 @@ impl LiveStatusApp {
             quota_resize_drag: None,
             satellite_configured_hwnd: None,
             quota_show_glm: window_settings::live_status_quota_show_glm(),
+            quota_minimize_depleted: window_settings::live_status_minimize_depleted(),
             quota_show_agi: window_settings::live_status_quota_show_agi(),
             quota_show_codex: window_settings::live_status_quota_show_codex(),
             quota_show_claude: window_settings::live_status_quota_show_claude(),
@@ -1794,7 +1796,7 @@ impl LiveStatusApp {
             }
         }
         if let Some(sat_hwnd) = self.satellite_hwnd {
-            let sat_h = self.last_synced_sat_height.unwrap_or(314.0);
+            let sat_h = self.last_synced_sat_height.unwrap_or(SETTINGS_OPEN_DESIGN_HEIGHT);
             window_chrome::sync_satellite_size(sat_hwnd, sat_h, self.main_hwnd, r, is_docked);
             window_chrome::ensure_window_chrome_synced(sat_hwnd, op, self.window_level);
             if !taskbar::is_satellite_exempt_synced(sat_hwnd) {
@@ -2264,6 +2266,7 @@ impl eframe::App for LiveStatusApp {
                 }
             }
             self.quota_show_glm = window_settings::live_status_quota_show_glm();
+            self.quota_minimize_depleted = window_settings::live_status_minimize_depleted();
             self.quota_show_agi = window_settings::live_status_quota_show_agi();
             self.quota_show_codex = window_settings::live_status_quota_show_codex();
             self.quota_show_claude = window_settings::live_status_quota_show_claude();
@@ -2778,7 +2781,11 @@ fn persist_window_position(app: &mut LiveStatusApp, ctx: &egui::Context) {
     }
 }
 
-fn provider_card_height(quota: &ProviderQuota) -> f32 {
+fn provider_card_height(quota: &ProviderQuota, minimize_depleted: bool) -> f32 {
+    if minimize_depleted && quota.is_throttled {
+        // Header row only: badge, subtitle, LED and the reset hint.
+        return 30.0;
+    }
     let has_5h = quota.five_hour_percent.is_some() || quota.five_hour_reset.is_some();
     let has_wk = quota.week_percent.is_some() || quota.week_reset.is_some();
     let count = match (has_5h, has_wk) {
@@ -2793,14 +2800,24 @@ fn provider_card_height(quota: &ProviderQuota) -> f32 {
     }
 }
 
-fn quota_satellite_design_height(visible_providers: &[ProviderQuota], settings_open: bool) -> f32 {
+/// Shared so the startup fallback cannot drift from the real layout.
+const SETTINGS_OPEN_DESIGN_HEIGHT: f32 = 350.0;
+
+fn quota_satellite_design_height(
+    visible_providers: &[ProviderQuota],
+    settings_open: bool,
+    minimize_depleted: bool,
+) -> f32 {
     if settings_open {
-        return 314.0;
+        return SETTINGS_OPEN_DESIGN_HEIGHT;
     }
     if visible_providers.is_empty() {
         return 38.0 + 42.0 + 8.0;
     }
-    let total_cards: f32 = visible_providers.iter().map(provider_card_height).sum();
+    let total_cards: f32 = visible_providers
+        .iter()
+        .map(|quota| provider_card_height(quota, minimize_depleted))
+        .sum::<f32>();
     let gaps = (visible_providers.len() - 1) as f32 * 6.0;
     38.0 + total_cards + gaps + 8.0
 }
@@ -2836,7 +2853,11 @@ fn apply_live_status_scale(
             })
             .cloned()
             .collect();
-        let sat_height = quota_satellite_design_height(&visible_providers, app.quota_settings_open);
+        let sat_height = quota_satellite_design_height(
+            &visible_providers,
+            app.quota_settings_open,
+            app.quota_minimize_depleted,
+        );
         app.last_synced_sat_height = Some(sat_height);
         ctx.send_viewport_cmd_to(
             quota_viewport_id,
@@ -6204,7 +6225,11 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
         .collect();
     apply_quota_order(&mut visible_providers, &app.quota_order);
 
-    let sat_design_height = quota_satellite_design_height(&visible_providers, app.quota_settings_open);
+    let sat_design_height = quota_satellite_design_height(
+            &visible_providers,
+            app.quota_settings_open,
+            app.quota_minimize_depleted,
+        );
     if app.last_synced_sat_height != Some(sat_design_height) {
         app.last_synced_sat_height = Some(sat_design_height);
         app.sync_corner_regions();
@@ -6642,11 +6667,100 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     let content_top = tab_bar_y + tab_h + 6.0;
                     match app.config_tab {
                         ConfigTab::Providers => {
-                            let mut providers_to_config = vec![
-                                (ProviderId::Glm, "GLM", "Z.ai (GLM-4)", app.quota_show_glm),
-                                (ProviderId::Agy, "AGY", "Google (Antigravity)", app.quota_show_agi),
-                                (ProviderId::Codex, "CODEX", "OpenAI (Codex)", app.quota_show_codex),
-                                (ProviderId::Claude, "CLAUDE", "Anthropic (Claude)", app.quota_show_claude),
+                                // First row: minimize depleted services toggle,
+                                // styled like the per-provider toggle pills.
+                                let min_row_rect = egui::Rect::from_min_size(
+                                    egui::pos2(rect.left() + 8.0, content_top),
+                                    egui::vec2(rect.width() - 16.0, 28.0),
+                                );
+                                let min_resp = ui.interact(
+                                    min_row_rect,
+                                    ui.make_persistent_id("sat_cfg_minimize_depleted"),
+                                    egui::Sense::click(),
+                                );
+                                let min_hovered = min_resp.hovered();
+                                if min_hovered {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                painter.rect_filled(
+                                    min_row_rect,
+                                    egui::CornerRadius::same(6),
+                                    if min_hovered {
+                                        egui::Color32::from_rgba_unmultiplied(30, 41, 65, 180)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140)
+                                    },
+                                );
+                                painter.rect_stroke(
+                                    min_row_rect,
+                                    egui::CornerRadius::same(6),
+                                    egui::Stroke::new(
+                                        1.0,
+                                        if app.quota_minimize_depleted {
+                                            egui::Color32::from_rgb(59, 130, 246)
+                                        } else {
+                                            egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)
+                                        },
+                                    ),
+                                    egui::StrokeKind::Inside,
+                                );
+                                let min_label = painter.layout_no_wrap(
+                                    language
+                                        .text("Erschöpfte Dienste minimieren", "Minimize depleted services")
+                                        .into(),
+                                    egui::FontId::proportional(12.0),
+                                    if app.quota_minimize_depleted { TEXT } else { GRAY },
+                                );
+                                painter.galley(
+                                    egui::pos2(
+                                        min_row_rect.left() + 10.0,
+                                        min_row_rect.center().y - min_label.size().y / 2.0,
+                                    ),
+                                    min_label,
+                                    if app.quota_minimize_depleted { TEXT } else { GRAY },
+                                );
+                                let min_toggle_w = 34.0;
+                                let min_toggle_h = 18.0;
+                                let min_toggle_rect = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        min_row_rect.right() - min_toggle_w - 10.0,
+                                        min_row_rect.center().y - min_toggle_h / 2.0,
+                                    ),
+                                    egui::vec2(min_toggle_w, min_toggle_h),
+                                );
+                                painter.rect_filled(
+                                    min_toggle_rect,
+                                    egui::CornerRadius::same(9),
+                                    if app.quota_minimize_depleted {
+                                        egui::Color32::from_rgb(22, 163, 74)
+                                    } else {
+                                        egui::Color32::from_rgb(51, 65, 85)
+                                    },
+                                );
+                                let min_knob_r = min_toggle_h / 2.0 - 2.0;
+                                let min_knob_x = if app.quota_minimize_depleted {
+                                    min_toggle_rect.right() - min_knob_r - 2.0
+                                } else {
+                                    min_toggle_rect.left() + min_knob_r + 2.0
+                                };
+                                painter.circle_filled(
+                                    egui::pos2(min_knob_x, min_toggle_rect.center().y),
+                                    min_knob_r,
+                                    egui::Color32::WHITE,
+                                );
+                                if min_resp.clicked() {
+                                    app.quota_minimize_depleted = !app.quota_minimize_depleted;
+                                    let _ = window_settings::set_live_status_minimize_depleted(
+                                        app.quota_minimize_depleted,
+                                    );
+                                }
+
+                                let providers_top = content_top + 36.0;
+                                let mut providers_to_config = vec![
+                                (ProviderId::Glm, "GLM", "Z.ai", app.quota_show_glm),
+                                (ProviderId::Agy, "AGI", "Google", app.quota_show_agi),
+                                (ProviderId::Codex, "CODEX", "OpenAI", app.quota_show_codex),
+                                (ProviderId::Claude, "CLAUDE", "Anthropic", app.quota_show_claude),
                             ];
                             // Follow the same persisted card order as the quota cards.
                             providers_to_config.sort_by_key(|(pid, _, _, _)| {
@@ -6660,7 +6774,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             let config_pointer = ui.input(|i| i.pointer.latest_pos());
 
                             for (idx, (pid, short_name, full_name, is_shown)) in providers_to_config.iter().enumerate() {
-                                let y = content_top + idx as f32 * (row_height + row_gap);
+                                let y = providers_top + idx as f32 * (row_height + row_gap);
                                 let row_rect = egui::Rect::from_min_size(
                                     egui::pos2(rect.left() + 8.0, y),
                                     egui::vec2(rect.width() - 16.0, row_height),
@@ -7268,7 +7382,9 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     let mut drop_requested: Option<(ProviderId, egui::Pos2)> = None;
                     let pointer = ui.input(|i| i.pointer.latest_pos());
                     for quota in &visible_providers {
-                        let card_h = provider_card_height(quota);
+                        let card_minimized =
+                            app.quota_minimize_depleted && quota.is_throttled;
+                        let card_h = provider_card_height(quota, app.quota_minimize_depleted);
                         let row_rect = egui::Rect::from_min_size(
                             egui::pos2(rect.left() + 8.0, current_y),
                             egui::vec2(rect.width() - 16.0, card_h),
@@ -7276,7 +7392,10 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                         card_bounds.push((quota.id, current_y, card_h));
                         let forecast = quota.pacing_forecast();
                         let card_color = app.provider_color(quota.id);
-                        draw_provider_card(painter, row_rect, quota, &forecast, language, card_color);
+                        draw_provider_card(
+                            painter, row_rect, quota, &forecast, language, card_color,
+                            card_minimized,
+                        );
                         if app
                             .quota_drag
                             .is_some_and(|drag| drag.provider == quota.id)
@@ -7338,7 +7457,8 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             egui::Stroke::new(2.0, marker_color),
                         );
                         if let Some(quota) = app.quota_snapshot.get(drag.provider) {
-                            let card_h = provider_card_height(quota);
+                            let card_h =
+                                provider_card_height(quota, app.quota_minimize_depleted);
                             let ghost_top = (pointer.y - drag.grab_offset_y).max(rows_top);
                             let ghost_rect = egui::Rect::from_min_size(
                                 egui::pos2(rect.left() + 8.0, ghost_top),
@@ -7351,8 +7471,11 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             );
                             let forecast = quota.pacing_forecast();
                             let card_color = app.provider_color(drag.provider);
+                            let ghost_minimized =
+                                app.quota_minimize_depleted && quota.is_throttled;
                             draw_provider_card(
                                 painter, ghost_rect, quota, &forecast, language, card_color,
+                                ghost_minimized,
                             );
                         }
                     }
@@ -7610,7 +7733,11 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
     if user_toggled_settings {
         app.quota_settings_open = !app.quota_settings_open;
         let _ = window_settings::set_live_status_quota_settings_open(app.quota_settings_open);
-        let new_sat_h = quota_satellite_design_height(&visible_providers, app.quota_settings_open);
+        let new_sat_h = quota_satellite_design_height(
+            &visible_providers,
+            app.quota_settings_open,
+            app.quota_minimize_depleted,
+        );
         app.last_synced_sat_height = Some(new_sat_h);
         if let Some(sat_hwnd) = app.satellite_hwnd {
             window_chrome::sync_satellite_size(
@@ -7700,13 +7827,20 @@ fn draw_smooth_limit_block(
     language: Language,
 ) {
     // Line 1: Header (Left: Title + pct, Right: Runway tag)
+    // A throttled provider has no spendable budget at all, so its whole card
+    // renders in the disabled gray instead of the traffic-light colors.
+    let title_color = if is_throttled {
+        GRAY
+    } else {
+        egui::Color32::from_rgb(226, 232, 240)
+    };
     let title_text = format!("{title}: {pct}%");
     let title_galley = painter.layout_no_wrap(
         title_text.into(),
         egui::FontId::monospace(10.5),
-        egui::Color32::from_rgb(226, 232, 240),
+        title_color,
     );
-    painter.galley(top_left, title_galley, egui::Color32::from_rgb(226, 232, 240));
+    painter.galley(top_left, title_galley, title_color);
 
     let runway_text = if is_five_hour {
         forecast.five_hour_runway_text(language)
@@ -7718,7 +7852,10 @@ fn draw_smooth_limit_block(
     // Green (#78b886): Ample buffer (>30d, 5.7d, buffer stable). Alles OK!
     // Yellow (#fde047): Tight (<3.0d, high pace, moderate deficit). Vorwarn-Zone!
     // Red (#fca5a5): Critical (<1.0d, severe deficit >45m before reset, throttled, 0%). Problem!
-    let (runway_color, is_red_alert, is_yellow_alert) = if pct == 0 || is_throttled {
+    // Throttled overrides the light: no budget means unusable, not critical.
+    let (runway_color, is_red_alert, is_yellow_alert) = if is_throttled {
+        (GRAY, false, false)
+    } else if pct == 0 {
         (egui::Color32::from_rgb(252, 165, 165), true, false)
     } else if is_five_hour {
         if let Some(fh) = &forecast.five_hour_forecast {
@@ -7783,7 +7920,9 @@ fn draw_smooth_limit_block(
     let dot_count = ((width - 2.0) / dot_step).floor() as usize;
     let active_count = ((dot_count as f32) * (pct as f32 / 100.0)).round() as usize;
 
-    let dot_active_color = if is_red_alert {
+    let dot_active_color = if is_throttled {
+        GRAY // Unusable: disabled gray instead of the traffic light
+    } else if is_red_alert {
         egui::Color32::from_rgb(248, 113, 113) // Pastel coral red
     } else if is_yellow_alert {
         egui::Color32::from_rgb(251, 191, 36) // Warm amber
@@ -7841,8 +7980,10 @@ fn draw_smooth_limit_block(
         )
     };
     if !pace_text.is_empty() {
-        let pace_color = if pct == 0 || is_throttled || is_red_alert {
-            egui::Color32::from_rgb(252, 165, 165) // Red: throttled / depleted / red alert
+        let pace_color = if is_throttled {
+            GRAY // Unusable: disabled gray instead of red
+        } else if pct == 0 || is_red_alert {
+            egui::Color32::from_rgb(252, 165, 165) // Red: depleted / red alert
         } else if is_yellow_alert {
             egui::Color32::from_rgb(253, 224, 71) // Yellow: yellow warning / tight buffer
         } else if let Some(ratio) = pace_ratio_opt {
@@ -7882,6 +8023,7 @@ fn draw_provider_card(
     forecast: &PacingForecast,
     language: Language,
     provider_color: egui::Color32,
+    minimized: bool,
 ) {
     // Card background
     painter.rect_filled(
@@ -7924,17 +8066,19 @@ fn draw_provider_card(
     );
 
     // Full Name
+    // The badge already carries the model, so the subtitle is just the company.
     let full_name = match quota.id {
-        ProviderId::Glm => "Z.ai · GLM-4",
-        ProviderId::Agy => "Google · Antigravity",
-        ProviderId::Codex => "OpenAI · Codex",
-        ProviderId::Claude => "Anthropic · Claude",
+        ProviderId::Glm => "Z.ai",
+        ProviderId::Agy => "Google",
+        ProviderId::Codex => "OpenAI",
+        ProviderId::Claude => "Anthropic",
     };
     let name_galley = painter.layout_no_wrap(
         full_name.into(),
         egui::FontId::proportional(11.5),
         egui::Color32::from_rgb(226, 232, 240),
     );
+    let name_width = name_galley.size().x;
     painter.galley(
         egui::pos2(badge_rect.right() + 8.0, header_y + 1.0),
         name_galley,
@@ -7965,6 +8109,34 @@ fn draw_provider_card(
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
     );
 
+    if minimized {
+        // Header-only row: name plus the reset that ends the depletion,
+        // formatted like the reset footer of the full cards.
+        if let Some(raw) = crate::quota_layout::minimized_reset_raw(quota) {
+            let five_hour_reset = quota.week_percent != Some(0);
+            let reset_text = format!(
+                "Reset {}",
+                format_reset_phrase(Some(&raw), five_hour_reset, language)
+            );
+            let reset_galley = painter.layout_no_wrap(
+                reset_text,
+                egui::FontId::monospace(9.0),
+                GRAY,
+            );
+            painter.galley(
+                egui::pos2(
+                    (led_pos.x - 10.0 - reset_galley.size().x).max(
+                        badge_rect.right() + 8.0 + name_width + 8.0,
+                    ),
+                    header_y + 3.0,
+                ),
+                reset_galley,
+                GRAY,
+            );
+        }
+        return;
+    }
+
     // Subtle divider
     let div_y = header_y + 22.0;
     painter.line_segment(
@@ -7988,7 +8160,10 @@ fn draw_provider_card(
         } else {
             language.text("5h-Limit", "5-Hour Limit")
         };
-        let five_h_throttled = quota.five_hour_percent.map(|p| p == 0).unwrap_or(false);
+        // A provider without any spendable budget (week or session at zero)
+        // renders both blocks disabled: a full session window is worthless
+        // when the weekly budget is exhausted.
+        let five_h_throttled = quota.is_throttled;
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 5.0),
@@ -8007,7 +8182,7 @@ fn draw_provider_card(
         } else {
             language.text("Wochen-Limit", "Weekly Limit")
         };
-        let week_throttled = quota.week_percent.map(|p| p == 0).unwrap_or(false);
+        let week_throttled = quota.is_throttled;
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 41.0),
@@ -8026,7 +8201,7 @@ fn draw_provider_card(
         } else {
             language.text("5h-Limit", "5-Hour Limit")
         };
-        let five_h_throttled = quota.five_hour_percent.map(|p| p == 0).unwrap_or(false) || quota.is_throttled;
+        let five_h_throttled = quota.is_throttled;
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 5.0),
@@ -8045,7 +8220,7 @@ fn draw_provider_card(
         } else {
             language.text("Wochen-Limit", "Weekly Limit")
         };
-        let week_throttled = quota.week_percent.map(|p| p == 0).unwrap_or(false) || quota.is_throttled;
+        let week_throttled = quota.is_throttled;
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 5.0),
@@ -10002,16 +10177,42 @@ mod tests {
 
     #[test]
     fn test_quota_satellite_design_height() {
-        assert_eq!(quota_satellite_design_height(&[], true), 314.0);
-        assert_eq!(quota_satellite_design_height(&[], false), 88.0);
+        assert_eq!(quota_satellite_design_height(&[], true, false), 350.0);
+        assert_eq!(quota_satellite_design_height(&[], false, false), 88.0);
+        assert_eq!(quota_satellite_design_height(&[], true, true), 350.0);
 
         let glm = ProviderQuota::new(ProviderId::Glm, "GLM", "Z.ai", None, None, Some(90), Some("01.10.".into()));
-        assert_eq!(provider_card_height(&glm), 68.0);
-        assert_eq!(quota_satellite_design_height(&[glm.clone()], false), 38.0 + 68.0 + 8.0);
+        assert_eq!(provider_card_height(&glm, false), 68.0);
+        // A healthy card keeps its full height even with minimizing on.
+        assert_eq!(provider_card_height(&glm, true), 68.0);
+        assert_eq!(
+            quota_satellite_design_height(&[glm.clone()], false, false),
+            38.0 + 68.0 + 8.0
+        );
 
         let agy = ProviderQuota::new(ProviderId::Agy, "AGY", "Google", Some(73), Some("19:45".into()), Some(85), Some("137h".into()));
-        assert_eq!(provider_card_height(&agy), 104.0);
-        assert_eq!(quota_satellite_design_height(&[glm, agy], false), 38.0 + 68.0 + 104.0 + 6.0 + 8.0);
+        assert_eq!(provider_card_height(&agy, false), 104.0);
+        assert_eq!(
+            quota_satellite_design_height(&[glm.clone(), agy], false, false),
+            38.0 + 68.0 + 104.0 + 6.0 + 8.0
+        );
+
+        // Simon's case: a depleted provider collapses to its header row.
+        let claude = ProviderQuota::new(
+            ProviderId::Claude,
+            "Claude",
+            "Anthropic",
+            Some(100),
+            Some("21:00".into()),
+            Some(0),
+            Some("31.10. (02:08)".into()),
+        );
+        assert_eq!(provider_card_height(&claude, false), 104.0);
+        assert_eq!(provider_card_height(&claude, true), 30.0);
+        assert_eq!(
+            quota_satellite_design_height(&[glm, claude], false, true),
+            38.0 + 68.0 + 30.0 + 6.0 + 8.0
+        );
     }
 
     #[test]

@@ -1,5 +1,14 @@
 # Changelog - Herdr-Nachtwächter
 
+## [2026-10-28] - Erschöpfte Anbieter ausgegraut, GLM umbenannt, GL-Capture repariert
+
+- Ein Anbieter ohne spendierbares Budget (Wochen- oder Session-Limit bei 0 %) wird jetzt als komplette Karte im deaktivierten Grau gezeichnet: Titelzeile, Runway- und Pace-Text sowie die Punkte-Reihen beider Limit-Blöcke. Eine volle „Session-Limit: 100 %"-Anzeige bei erschöpftem Wochenbudget suggeriert damit keinen nutzbaren Vorrat mehr; Claude und Antigravity zeigen diesen Zustand aktuell lebendig vor.
+- Neue Einstellung „Erschöpfte Dienste minimieren" (Standard aktiv, erste Zeile im ⚡-Limits-Tab des Zahnrad-Overlays): Erschöpfte Anbieter kollabieren im Limits-Fenster auf eine einzige Kopfzeile mit Namen, Status-LED und dem Reset im Format der vollen Karten („Reset in ~7h (heute 21:00)"); die Fensterhöhe schrumpft passend mit. Gesunde Karten bleiben unverändert, die Reihenfolge per Drag-and-Drop gilt weiterhin auch für die minimierten Zeilen.
+- Die GLM-Karte heißt jetzt „Z.ai · GLM" statt „Z.ai · GLM-4" (Options-Tab ebenso „Z.ai").
+- Die Karten-Untertitel nennen nur noch die Firma („Google", „OpenAI", „Anthropic", „Z.ai"), da das Modell schon im farbigen Kürzel steht; die doppelte Nennung wie „Google · Antigravity" entfällt auf den Karten und im Options-Tab. Die minimierte Zeile zeigt damit Kürzel, Firma und den kleineren Reset-Hinweis in einer Zeile.
+- Neues Werkzeug `tools/capture_gl_window.py` für eine verlässliche Screenshot-Verifikation der OpenGL-Fenster: PrintWindow mit `PW_RENDERFULLCONTENT` lässt den DWM den Fensterinhalt inklusive GL-Fläche neu rendern, während der bisherige GDI-Bildschirmausschnitt bei den Tray-Fenstern nur eine flache Ersatzfarbe lieferte. Das Werkzeug erkennt fast-einfarbige Aufnahmen selbst, fällt auf den GDI-Griff zurück und meldet die verwendete Methode.
+- Der Antigravity-Reset-Test erwartet die lokale Uhrzeit jetzt über dieselbe Offset-Regel wie der Produktionscode statt einer fest eincodierten Sommerzeit-Uhrzeit; er lief damit nach der Zeitumstellung im Windows-Target-Lauf rot.
+
 ## [2026-10-27] - Zurückgezogene Warnungen beenden den Nachtwächter nicht mehr
 
 - Hat eine zusätzliche Abschlussprüfung die Abschaltwarnung zurückgezogen, während der Wächter seine eigene Sicherheitsprüfung lief, scheiterte diese fälschlich am Fehlen der Warnung und beendete den Lauf mit `shutdown_abort_failed`. Der Wächter erkennt jetzt an der in den Laufzustand geschriebenen `withdrawn_warning_id`, dass die Warnung absichtlich zurückgezogen wurde, synchronisiert seinen Zustand und überwacht weiter; keine Energieaktion, kein `refused`-Abschluss.
