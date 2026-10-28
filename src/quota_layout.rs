@@ -150,7 +150,7 @@ mod tests {
 
         let session_depleted = ProviderQuota::new(
             ProviderId::Agy,
-            "AGI",
+            "AGY",
             "Antigravity",
             Some(0),
             Some("16:34".into()),
