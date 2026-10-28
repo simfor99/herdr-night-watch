@@ -1,6 +1,6 @@
 # Changelog - Herdr-Nachtwächter
 
-## [2026-10-28] - Erschöpfte Anbieter ausgegraut, GLM umbenannt, GL-Capture repariert
+## [2026-10-28] - Erschöpfte Anbieter ausgegraut, GLM umbenannt, GL-Capture repariert v0.1.43
 
 - Ein Anbieter ohne spendierbares Budget (Wochen- oder Session-Limit bei 0 %) wird jetzt als komplette Karte im deaktivierten Grau gezeichnet: Titelzeile, Runway- und Pace-Text sowie die Punkte-Reihen beider Limit-Blöcke. Eine volle „Session-Limit: 100 %"-Anzeige bei erschöpftem Wochenbudget suggeriert damit keinen nutzbaren Vorrat mehr; Claude und Antigravity zeigen diesen Zustand aktuell lebendig vor.
 - Neue Einstellung „Erschöpfte Dienste minimieren" (Standard aktiv, erste Zeile im ⚡-Limits-Tab des Zahnrad-Overlays): Erschöpfte Anbieter kollabieren im Limits-Fenster auf eine einzige Kopfzeile mit Namen, Status-LED und dem Reset im Format der vollen Karten („Reset in ~7h (heute 21:00)"); die Fensterhöhe schrumpft passend mit. Gesunde Karten bleiben unverändert, die Reihenfolge per Drag-and-Drop gilt weiterhin auch für die minimierten Zeilen.
