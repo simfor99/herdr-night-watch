@@ -51,6 +51,13 @@ BOOT_MARKER_WAIT_DEADLINE_SECONDS = 60
 CONFIRM_BOOT_MARKER_DEADLINE_SECONDS = min(DEFAULT_WARNING_SECONDS, 30)
 STATUS_BOOT_MARKER_DEADLINE_SECONDS = 15
 WINDOWS_COMMAND_TIMEOUT_SECONDS = 30
+# Bound for Herdr CLI calls outside the status channel deadline: a hung
+# invocation must surface as RuntimeError (retryable) instead of blocking
+# the watch loop forever. Power commands deliberately run unbounded: a sleep
+# call outlives the suspend duration, so a timeout would misreport a
+# successful sleep as a failure. Their terminal state is already durable
+# before the call.
+WATCHER_COMMAND_TIMEOUT_SECONDS = 60
 MIN_ABORT_TIMEOUT_SECONDS = 5
 WINDOWS_PATH_SEPARATORS = ("\\", "/")
 CANCEL_BOOT_MARKER_DEADLINE_SECONDS = MIN_ABORT_TIMEOUT_SECONDS
@@ -463,9 +470,25 @@ def completion_lock_path() -> Path:
     return root / "completion.lock"
 
 
+_COMPLETION_LOCK_DEPTH = 0
+
+
 @contextmanager
 def completion_lock() -> Any:
-    """Serialize cancel, confirmation, and the irreversible completion step."""
+    """Serialize cancel, confirmation, and the irreversible completion step.
+
+    Reentrant within the same process: a nested acquisition (for example a
+    connectivity refresh inside the final completion step) only increases the
+    depth instead of deadlocking on a second flock for the same file.
+    """
+    global _COMPLETION_LOCK_DEPTH
+    if _COMPLETION_LOCK_DEPTH > 0:
+        _COMPLETION_LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _COMPLETION_LOCK_DEPTH -= 1
+        return
     path = completion_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as lock:
@@ -482,8 +505,10 @@ def completion_lock() -> Any:
                         raise TimeoutError("Status reconciliation lock is busy")
                     time.sleep(0.02)
         try:
+            _COMPLETION_LOCK_DEPTH = 1
             yield
         finally:
+            _COMPLETION_LOCK_DEPTH = 0
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
@@ -678,9 +703,29 @@ def load_json(path: Path) -> dict[str, Any] | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def completed_detail(error: subprocess.TimeoutExpired, arguments: list[str]) -> str:
+    """Extract readable partial output from a timed-out command."""
+    for value in (error.stderr, error.stdout):
+        if isinstance(value, bytes):
+            value = value.decode(errors="replace")
+        if value and value.strip():
+            return value.strip()[:200]
+    return f"no output from {' '.join(arguments[:3])}"
+
+
 def run_command(arguments: list[str]) -> str:
     if _STATUS_DEADLINE is None:
-        completed = subprocess.run(arguments, text=True, capture_output=True, check=False)
+        try:
+            completed = subprocess.run(
+                arguments,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=float(WATCHER_COMMAND_TIMEOUT_SECONDS),
+            )
+        except subprocess.TimeoutExpired as error:
+            detail = completed_detail(error, arguments)
+            raise RuntimeError(f"{' '.join(arguments[:3])} timed out after {WATCHER_COMMAND_TIMEOUT_SECONDS}s: {detail}") from error
     else:
         from status_channel import run_bounded
         completed = run_bounded(arguments, _STATUS_DEADLINE)
@@ -772,13 +817,30 @@ class ConnectivityMonitor:
         self.last_checked_at = time.monotonic()
         self.available = internet_available()
         offline_since = parse_time(state.get("network_unavailable_since"))
-        if self.available and offline_since:
-            state["network_unavailable_since"] = None
-            write_json(paths()[1], state)
+        if self.available != (offline_since is not None):
+            # Field already matches availability; nothing to persist.
+            return self.available
+        # A concurrent confirmation recheck may have written the run state
+        # (for example the withdrawn_warning_id marker). Reload the current
+        # file, change only the network field, and sync the caller's dict so
+        # a stale snapshot can never overwrite the marker again.
+        with completion_lock():
+            current = load_json(paths()[1])
+            if not current or current.get("run_id") != state.get("run_id"):
+                return self.available
+            current_offline_since = parse_time(current.get("network_unavailable_since"))
+            if self.available != (current_offline_since is not None):
+                # Another writer already reconciled the transition.
+                state.clear()
+                state.update(current)
+                return self.available
+            current["network_unavailable_since"] = None if self.available else iso_now()
+            state.clear()
+            state.update(current)
+            write_json(paths()[1], current)
+        if self.available:
             log("Internet connection restored")
-        elif not self.available and not offline_since:
-            state["network_unavailable_since"] = iso_now()
-            write_json(paths()[1], state)
+        else:
             log("Internet connection unavailable; five-minute grace period started")
         return self.available
 
@@ -1151,16 +1213,43 @@ def abort_shutdown_if_ours(expected_run_id: str | None = None) -> bool | None:
     return True
 
 
+def warning_was_withdrawn(
+    state: dict[str, Any],
+    warning_identifier: str | None,
+) -> bool:
+    """Whether the given warning was withdrawn by a confirmation recheck."""
+    return bool(
+        warning_identifier
+        and isinstance(state, dict)
+        and state.get("withdrawn_warning_id") == warning_identifier
+    )
+
+
 def abort_shutdown_or_fail(
     state: dict[str, Any],
     detail: str,
     *,
     require_warning: bool = False,
+    warning_identifier: str | None = None,
 ) -> bool:
-    """Abort the active warning or finish the run if cancellation is unsafe."""
+    """Abort the active warning or finish the run if cancellation is unsafe.
+
+    A warning that a confirmation recheck withdrew in the meantime does not
+    count as a failed abort: the run state is reloaded under the completion
+    lock, the caller's dict is synced to the fresh state, and monitoring
+    continues instead of failing the run.
+    """
     result = abort_shutdown_if_ours(state.get("run_id"))
     if result is True or (result is None and not require_warning):
         return True
+    if warning_identifier is not None:
+        with completion_lock():
+            current = active_run(state.get("run_id"))
+            if warning_was_withdrawn(current, warning_identifier):
+                state.clear()
+                state.update(current)
+                log("Confirmation safety check withdrew the warning; monitoring continues")
+                return True
     finish(state, "shutdown_abort_failed", detail)
     return False
 
@@ -1393,6 +1482,7 @@ def watch() -> int:
                             state,
                             "Internet connectivity returned but the Windows shutdown warning could not be cancelled",
                             require_warning=True,
+                            warning_identifier=warning_identifier,
                         ):
                             return 1
                         state["all_terminal_since"] = None
@@ -1408,6 +1498,7 @@ def watch() -> int:
                         state,
                         f"Herdr check failed and the Windows shutdown warning could not be cancelled: {error}",
                         require_warning=True,
+                        warning_identifier=warning_identifier,
                     ):
                         return 1
                     state["all_terminal_since"] = None
@@ -1420,8 +1511,14 @@ def watch() -> int:
                         state,
                         "Herdr refused completion and the Windows shutdown warning could not be cancelled",
                         require_warning=True,
+                        warning_identifier=warning_identifier,
                     ):
                         return 1
+                    if warning_was_withdrawn(state, warning_identifier):
+                        state["all_terminal_since"] = None
+                        write_json(state_path, state)
+                        warning_interrupted = True
+                        break
                     finish(state, "refused", ", ".join(statuses))
                     return 0
                 if result == "active":
@@ -1429,6 +1526,7 @@ def watch() -> int:
                         state,
                         "Herdr reported active work and the Windows shutdown warning could not be cancelled",
                         require_warning=True,
+                        warning_identifier=warning_identifier,
                     ):
                         return 1
                     state["all_terminal_since"] = None
@@ -1447,6 +1545,9 @@ def watch() -> int:
                     return 0
                 warning = load_json(paths()[2])
                 if not warning or warning.get("run_id") != state["run_id"]:
+                    if warning_was_withdrawn(state, warning_identifier):
+                        log("Confirmation safety check withdrew the warning before execution; monitoring continues")
+                        continue
                     log("Completion action skipped because its warning is no longer active")
                     return 0
                 if warning_reason == "network_unavailable":
@@ -1455,6 +1556,7 @@ def watch() -> int:
                             state,
                             "Internet connectivity returned but the Windows shutdown warning could not be cancelled",
                             require_warning=True,
+                            warning_identifier=warning_identifier,
                         ):
                             return 1
                         state["all_terminal_since"] = None
@@ -1469,6 +1571,7 @@ def watch() -> int:
                             state,
                             f"Final Herdr check failed and the Windows shutdown warning could not be cancelled: {error}",
                             require_warning=True,
+                            warning_identifier=warning_identifier,
                         ):
                             return 1
                         state["all_terminal_since"] = None
@@ -1480,8 +1583,14 @@ def watch() -> int:
                             state,
                             "Herdr refused completion and the Windows shutdown warning could not be cancelled",
                             require_warning=True,
+                            warning_identifier=warning_identifier,
                         ):
                             return 1
+                        if warning_was_withdrawn(state, warning_identifier):
+                            state["all_terminal_since"] = None
+                            write_json(state_path, state)
+                            log("Confirmation safety check withdrew the warning before refusing; monitoring continues")
+                            continue
                         finish(state, "refused", ", ".join(statuses))
                         return 0
                     if result != "terminal":
@@ -1489,6 +1598,7 @@ def watch() -> int:
                             state,
                             "Herdr reported active work and the Windows shutdown warning could not be cancelled",
                             require_warning=True,
+                            warning_identifier=warning_identifier,
                         ):
                             return 1
                         state["all_terminal_since"] = None
@@ -1505,8 +1615,12 @@ def watch() -> int:
                     state,
                     "The active completion warning could not be removed before completion",
                     require_warning=True,
+                    warning_identifier=warning_identifier,
                 ):
                     return 1
+                if warning_was_withdrawn(state, warning_identifier):
+                    log("Confirmation safety check withdrew the warning before the completion action; monitoring continues")
+                    continue
                 if action == "sleep" and not state.get("demo") and not state.get("dry_run"):
                     try:
                         # Sleep can suspend the process before any following
