@@ -53,6 +53,19 @@ pub(crate) fn reorder_quota_order(
     order.insert(insert_at, provider);
 }
 
+/// The reset that ends a provider's depletion, for the minimized card row:
+/// a drained weekly budget is the real blocker, otherwise the session reset.
+pub(crate) fn minimized_reset_raw(quota: &ProviderQuota) -> Option<String> {
+    if !quota.is_throttled {
+        return None;
+    }
+    if quota.week_percent == Some(0) {
+        quota.week_reset.clone()
+    } else {
+        quota.five_hour_reset.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +130,45 @@ mod tests {
             full,
             vec![ProviderId::Claude, ProviderId::Glm, ProviderId::Agy, ProviderId::Codex]
         );
+    }
+
+    #[test]
+    fn minimized_reset_prefers_the_weekly_blocker() {
+        let week_depleted = ProviderQuota::new(
+            ProviderId::Claude,
+            "Claude",
+            "Anthropic",
+            Some(100),
+            Some("21:00".into()),
+            Some(0),
+            Some("31.10. (02:08)".into()),
+        );
+        assert_eq!(
+            minimized_reset_raw(&week_depleted).as_deref(),
+            Some("31.10. (02:08)")
+        );
+
+        let session_depleted = ProviderQuota::new(
+            ProviderId::Agy,
+            "AGI",
+            "Antigravity",
+            Some(0),
+            Some("16:34".into()),
+            Some(73),
+            Some("137h".into()),
+        );
+        assert_eq!(minimized_reset_raw(&session_depleted).as_deref(), Some("16:34"));
+
+        let healthy = ProviderQuota::new(
+            ProviderId::Glm,
+            "GLM",
+            "Z.ai",
+            Some(90),
+            Some("16:41".into()),
+            Some(85),
+            Some("01.10.".into()),
+        );
+        assert_eq!(minimized_reset_raw(&healthy), None);
     }
 
     #[test]

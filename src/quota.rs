@@ -1833,6 +1833,47 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_week_disables_the_whole_provider_card() {
+        // Simon's case: weekly budget at zero while the session window shows
+        // 100% - the session limit is worthless without weekly budget, so the
+        // card must render fully disabled (is_throttled drives both blocks).
+        let claude = ProviderQuota::new(
+            ProviderId::Claude,
+            "Claude",
+            "Anthropic",
+            Some(100),
+            Some("22:00".into()),
+            Some(0),
+            Some("30.10.".into()),
+        );
+        assert!(claude.is_throttled);
+
+        // Session at zero alone also disables the provider.
+        let agy = ProviderQuota::new(
+            ProviderId::Agy,
+            "AGI",
+            "Antigravity",
+            Some(0),
+            Some("19:45".into()),
+            Some(73),
+            Some("137h".into()),
+        );
+        assert!(agy.is_throttled);
+
+        // Healthy budgets stay active.
+        let glm = ProviderQuota::new(
+            ProviderId::Glm,
+            "GLM",
+            "Z.ai",
+            Some(90),
+            Some("16:41".into()),
+            Some(85),
+            Some("01.10.".into()),
+        );
+        assert!(!glm.is_throttled);
+    }
+
+    #[test]
     fn claude_rate_limits_convert_used_percent_to_remaining_percent() {
         let mut snapshot = QuotaSnapshot::measured_baseline();
         update_snapshot_with_claude_json(
@@ -2187,7 +2228,13 @@ mod tests {
         let agi = snapshot.get(ProviderId::Agy).expect("AGI exists");
         assert_eq!(agi.five_hour_percent, Some(92));
         assert_eq!(agi.week_percent, Some(89));
-        assert_eq!(agi.week_reset, Some("25.09. (12:53)".to_string()));
+        // The reset conversion applies the local offset valid at test runtime
+        // (Berlin yields 12:53 in summer time, 11:53 in winter time), so the
+        // expectation mirrors exactly that rule instead of one season.
+        let offset = local_timezone_offset_minutes();
+        let total = (10i32 * 60 + 53 + offset).rem_euclid(24 * 60);
+        let expected = format!("25.09. ({:02}:{:02})", total / 60, total % 60);
+        assert_eq!(agi.week_reset, Some(expected));
         assert!(agi.five_hour_reset.is_some());
     }
 
