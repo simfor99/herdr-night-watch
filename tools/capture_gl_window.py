@@ -23,7 +23,11 @@ from pathlib import Path
 
 from PIL import Image
 
+PW_CLIENTONLY = 0x00000001
 PW_RENDERFULLCONTENT = 0x00000002
+# Console windows often carry the command line in their title, which would
+# match the needle; they never host the app we want.
+CONSOLE_WINDOW_CLASSES = {"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"}
 FLAT_TOP_COLOR_SHARE = 0.90
 FLAT_DISTINCT_COLORS = 50
 
@@ -39,6 +43,10 @@ def find_window(needle: str):
     @WNDENUMPROC
     def callback(hwnd, _lparam):
         if user32.IsWindowVisible(hwnd):
+            class_buffer = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, class_buffer, 64)
+            if class_buffer.value in CONSOLE_WINDOW_CLASSES:
+                return True
             length = user32.GetWindowTextLengthW(hwnd)
             buffer = ctypes.create_unicode_buffer(length + 1)
             user32.GetWindowTextW(hwnd, buffer, length + 1)
@@ -74,7 +82,7 @@ def capture_printwindow(hwnd) -> Image.Image | None:
     bitmap = gdi32.CreateCompatibleBitmap(hdc, width, height)
     old = gdi32.SelectObject(memdc, bitmap)
     try:
-        rendered = user32.PrintWindow(hwnd, memdc, PW_RENDERFULLCONTENT)
+        rendered = user32.PrintWindow(hwnd, memdc, PW_CLIENTONLY | PW_RENDERFULLCONTENT)
         if not rendered:
             return None
 

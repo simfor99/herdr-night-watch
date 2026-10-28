@@ -6758,7 +6758,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 let providers_top = content_top + 36.0;
                                 let mut providers_to_config = vec![
                                 (ProviderId::Glm, "GLM", "Z.ai", app.quota_show_glm),
-                                (ProviderId::Agy, "AGY", "Google", app.quota_show_agi),
+                                (ProviderId::Agy, "AGI", "Google", app.quota_show_agi),
                                 (ProviderId::Codex, "CODEX", "OpenAI", app.quota_show_codex),
                                 (ProviderId::Claude, "CLAUDE", "Anthropic", app.quota_show_claude),
                             ];
