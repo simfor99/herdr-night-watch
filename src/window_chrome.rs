@@ -518,14 +518,132 @@ pub fn sync_satellite_size(
     _is_docked: bool,
 ) {}
 
+/// The current effective scale factor of the monitor the window is on
+/// (effective DPI / 96).
+///
+/// This is the live value from the display subsystem, unlike the scale
+/// factor cached by winit (which only refreshes on `WM_DPICHANGED`) and
+/// unlike `GetDpiForWindow` (which returns the window's own possibly stale
+/// DPI assignment). Returns `None` when the query fails.
+#[cfg(windows)]
+pub fn monitor_scale_factor_for_window(hwnd: HWND) -> Option<f32> {
+    use windows_sys::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_null() {
+        return None;
+    }
+    let mut dpi_x = 0u32;
+    let mut dpi_y = 0u32;
+    if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) } >= 0
+        && dpi_x > 0
+    {
+        Some(dpi_x as f32 / 96.0)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+pub fn monitor_scale_factor_for_window(_hwnd: HWND) -> Option<f32> {
+    None
+}
+
+/// True when the scale factor cached by winit/egui disagrees with the
+/// effective DPI of the monitor the window is on.
+///
+/// winit only refreshes its cached scale factor when `WM_DPICHANGED`
+/// arrives, and a window created while the display subsystem still settles,
+/// for example right after a cold boot, can keep a stale factor forever:
+/// the window then renders consistently at the wrong `pixels_per_point`
+/// and stays far too small (96 DPI fallback instead of the monitor's real
+/// scaling) until it is moved by hand.
+pub fn scale_mismatch(native: Option<f32>, monitor: Option<f32>) -> bool {
+    match (native, monitor) {
+        // Real DPI steps are at least 25 % apart; 5 % tolerates float noise
+        // without ever masking a genuine step.
+        (Some(native), Some(monitor)) => (native - monitor).abs() > 0.05,
+        _ => false,
+    }
+}
+
+/// Ask Windows to re-evaluate the DPI of a window with a stale cached scale
+/// factor.
+///
+/// Moving a per-monitor-aware window, even by a single pixel, makes the
+/// window manager re-check its DPI and send `WM_DPICHANGED` when the cached
+/// value differs; winit then refreshes its scale factor and the existing
+/// size reconciliation settles the window. This is the programmatic
+/// equivalent of the manual fix of briefly dragging the window, which is
+/// why it is tried first and bounded by a small retry budget in the
+/// caller. Returns `false` when the window cannot be queried.
+#[cfg(windows)]
+pub fn heal_stale_window_scale(hwnd: HWND) -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return false;
+    }
+    // A move by one pixel is a real move; moving back keeps the docked and
+    // persisted positions intact. WM_DPICHANGED is delivered synchronously
+    // on the calling (window) thread.
+    for dx in [1, 0] {
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                rect.left + dx,
+                rect.top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+    }
+    true
+}
+
+#[cfg(not(windows))]
+pub fn heal_stale_window_scale(_hwnd: HWND) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::layered_window_alpha;
+    use super::scale_mismatch;
 
     #[test]
     fn full_opacity_does_not_use_layered_style() {
         assert_eq!(layered_window_alpha(100), None);
         assert_eq!(layered_window_alpha(101), None);
+    }
+
+    #[test]
+    fn missing_scale_inputs_are_never_a_mismatch() {
+        assert!(!scale_mismatch(None, None));
+        assert!(!scale_mismatch(Some(1.0), None));
+        assert!(!scale_mismatch(None, Some(1.5)));
+    }
+
+    #[test]
+    fn matching_scales_are_not_a_mismatch() {
+        assert!(!scale_mismatch(Some(1.0), Some(1.0)));
+        assert!(!scale_mismatch(Some(1.5), Some(1.5)));
+        assert!(!scale_mismatch(Some(1.5), Some(1.48)));
+    }
+
+    #[test]
+    fn stale_dpi_step_is_a_mismatch() {
+        // Satellite created at the 96 DPI fallback while the monitor runs
+        // at 150 %: exactly the cold-boot case.
+        assert!(scale_mismatch(Some(1.0), Some(1.5)));
+        assert!(scale_mismatch(Some(1.5), Some(1.0)));
     }
 
     #[test]
