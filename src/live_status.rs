@@ -1658,7 +1658,6 @@ struct LiveStatusApp {
     main_dpi_heal: Option<(Instant, u8)>,
     satellite_dpi_heal: Option<(Instant, u8)>,
     satellite_dpi_recreate_at: Option<Instant>,
-    satellite_dpi_scheduled_scale: Option<f32>,
     satellite_dpi_recreations: u8,
 }
 
@@ -1788,7 +1787,6 @@ impl LiveStatusApp {
             main_dpi_heal: None,
             satellite_dpi_heal: None,
             satellite_dpi_recreate_at: None,
-            satellite_dpi_scheduled_scale: None,
             satellite_dpi_recreations: 0,
         }
     }
@@ -2240,7 +2238,6 @@ impl eframe::App for LiveStatusApp {
             // A recreation pending while the satellite was closed must not
             // burn a recreation slot or skip frames on the next open.
             self.satellite_dpi_recreate_at = None;
-            self.satellite_dpi_scheduled_scale = None;
             self.satellite_dpi_heal = None;
         }
 
@@ -6279,7 +6276,9 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
     // the satellite still disagrees with its monitor, the viewport stays
     // closed for a moment and is then recreated, so a fresh native window
     // is born at the settled monitor DPI. Not calling show_viewport_immediate
-    // for a frame is egui's own way of closing an immediate viewport.
+    // for a frame is egui's own way of closing an immediate viewport; once
+    // frames were skipped the window is recreated either way, so the
+    // recreation is always counted and fully reset.
     if let Some(started) = app.satellite_dpi_recreate_at {
         let elapsed = started.elapsed();
         if elapsed < DPI_SATELLITE_RECREATE_SKIP {
@@ -6292,31 +6291,12 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
         if app.quota_drag_active && elapsed < DPI_SATELLITE_RECREATE_FORCE {
             return;
         }
-        // While docked the satellite sits on the main window's monitor: if
-        // that monitor now matches the scale factor observed when the
-        // recreation was scheduled, the mismatch dissolved on its own and
-        // an unnecessary visible recreation is skipped.
-        let mismatch_dissolved = app.quota_docked
-            && app
-                .satellite_dpi_scheduled_scale
-                .zip(app.main_hwnd.and_then(|hwnd| {
-                    window_chrome::monitor_scale_factor_for_window(hwnd)
-                }))
-                .is_some_and(|(scheduled, current)| {
-                    !window_chrome::scale_mismatch(Some(scheduled), Some(current))
-                });
         app.satellite_dpi_recreate_at = None;
-        app.satellite_dpi_scheduled_scale = None;
-        if mismatch_dissolved {
-            app.satellite_dpi_heal = None;
-            app.satellite_frames_painted = 0;
-        } else {
-            app.satellite_hwnd = None;
-            app.satellite_configured_hwnd = None;
-            app.satellite_frames_painted = 0;
-            app.satellite_opacity_applied = None;
-            app.satellite_dpi_recreations = app.satellite_dpi_recreations.saturating_add(1);
-        }
+        app.satellite_hwnd = None;
+        app.satellite_configured_hwnd = None;
+        app.satellite_frames_painted = 0;
+        app.satellite_opacity_applied = None;
+        app.satellite_dpi_recreations = app.satellite_dpi_recreations.saturating_add(1);
     }
 
     let quota_viewport_id = egui::ViewportId::from_hash_of("live_status_quota_viewport");
@@ -6425,12 +6405,18 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
             && window_chrome::scale_mismatch(sat_native_ppp, sat_monitor_ppp)
         {
             let attempts_used = app.satellite_dpi_heal.map(|(_, count)| count).unwrap_or(0);
+            // The third nudge gets the same settling time as the first
+            // two: only schedule the visible recreation once it had its
+            // full chance to make winit refresh the scale factor.
+            let last_nudge_settled = app
+                .satellite_dpi_heal
+                .is_some_and(|(last_attempt, _)| last_attempt.elapsed() >= DPI_HEAL_RETRY_DELAY);
             if attempts_used >= DPI_HEAL_MAX_ATTEMPTS {
-                if app.satellite_dpi_recreate_at.is_none()
+                if last_nudge_settled
+                    && app.satellite_dpi_recreate_at.is_none()
                     && app.satellite_dpi_recreations < DPI_SATELLITE_MAX_RECREATIONS
                 {
                     app.satellite_dpi_recreate_at = Some(Instant::now());
-                    app.satellite_dpi_scheduled_scale = sat_native_ppp;
                     app.satellite_dpi_heal = None;
                     record_ui_error(
                         LIVE_STATUS_DPI_HEAL_EVENT,
