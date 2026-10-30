@@ -162,6 +162,7 @@ const LIVE_INSTANCE_RELEASE_DELAY: Duration = Duration::from_millis(300);
 const OWNER_PID_PREFIX: &str = "--owner-pid=";
 const LIVE_OPEN_ATTEMPT_MUTEX: &str = "Local\\HerdrNachtwaechter.LiveOpenAttempt";
 const LIVE_STATUS_OPEN_FAILURE_EVENT: &str = "live_status_open_failed";
+const LIVE_STATUS_DPI_HEAL_EVENT: &str = "live_status_dpi_healed";
 const LIVE_STATUS_PANIC_EVENT: &str = "live_status_panic";
 #[cfg(test)]
 const LIVE_OPEN_ATTEMPT_MUTEX_ENV: &str = "HERDR_LIVE_OPEN_ATTEMPT_MUTEX";
@@ -1654,6 +1655,10 @@ struct LiveStatusApp {
     satellite_frames_painted: usize,
     satellite_opacity_applied: Option<(HWND, u8)>,
     last_synced_sat_height: Option<f32>,
+    main_dpi_heal: Option<(Instant, u8)>,
+    satellite_dpi_heal: Option<(Instant, u8)>,
+    satellite_dpi_recreate_at: Option<Instant>,
+    satellite_dpi_recreations: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1779,6 +1784,10 @@ impl LiveStatusApp {
             satellite_frames_painted: 0,
             satellite_opacity_applied: None,
             last_synced_sat_height: None,
+            main_dpi_heal: None,
+            satellite_dpi_heal: None,
+            satellite_dpi_recreate_at: None,
+            satellite_dpi_recreations: 0,
         }
     }
 
@@ -2226,10 +2235,44 @@ impl eframe::App for LiveStatusApp {
             self.satellite_frames_painted = 0;
             self.satellite_opacity_applied = None;
             self.last_synced_sat_height = None;
+            // A recreation pending while the satellite was closed must not
+            // burn a recreation slot or skip frames on the next open.
+            self.satellite_dpi_recreate_at = None;
+            self.satellite_dpi_heal = None;
         }
 
         if hwnds_changed {
             self.sync_corner_regions();
+        }
+
+        // A window created while the display subsystem still settles (the
+        // cold-boot case) can keep a stale native scale factor forever,
+        // because winit only refreshes it on WM_DPICHANGED. Comparing the
+        // cached factor against the live monitor DPI detects that state;
+        // an invisible 1-px nudge asks Windows to re-evaluate the DPI,
+        // which is the same mechanism as briefly dragging the window by
+        // hand. No zoom compensation is used: egui's zoom factor is global
+        // across viewports and only applies on the next pass, so it cannot
+        // fix one window without breaking another.
+        if let Some(main_hwnd) = self.main_hwnd {
+            let native_ppp = ui.ctx().input(|i| i.viewport().native_pixels_per_point);
+            let monitor_ppp = window_chrome::monitor_scale_factor_for_window(main_hwnd);
+            if window_chrome::scale_mismatch(native_ppp, monitor_ppp) {
+                if dpi_heal_due(&mut self.main_dpi_heal, Instant::now())
+                    && window_chrome::heal_stale_window_scale(main_hwnd)
+                {
+                    record_ui_error(
+                        LIVE_STATUS_DPI_HEAL_EVENT,
+                        &format!(
+                            "main nudge attempt native_ppp={native_ppp:?} monitor_ppp={monitor_ppp:?}"
+                        ),
+                    );
+                }
+            } else {
+                self.main_dpi_heal = None;
+            }
+        } else {
+            self.main_dpi_heal = None;
         }
 
         let now = Instant::now();
@@ -2742,6 +2785,38 @@ impl eframe::App for LiveStatusApp {
             ui.ctx().request_repaint();
         }
         ui.ctx().request_repaint_after(repaint_delay);
+    }
+}
+
+/// A cold boot can leave a window with a stale native scale factor cached
+/// by winit (it only refreshes on WM_DPICHANGED). Healing is layered: a
+/// bounded run of invisible 1-px nudges, then - for the satellite only -
+/// one deterministic viewport recreation that is born at the settled
+/// monitor DPI. The budgets stop a hostile display setup from creating a
+/// nudge or recreation loop.
+const DPI_HEAL_MAX_ATTEMPTS: u8 = 3;
+const DPI_HEAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+const DPI_SATELLITE_RECREATE_SKIP: Duration = Duration::from_millis(400);
+const DPI_SATELLITE_RECREATE_FORCE: Duration = Duration::from_secs(5);
+const DPI_SATELLITE_MAX_RECREATIONS: u8 = 2;
+
+fn dpi_heal_due(state: &mut Option<(Instant, u8)>, now: Instant) -> bool {
+    match state {
+        None => {
+            *state = Some((now, 1));
+            true
+        }
+        Some((last_attempt, attempts)) => {
+            if *attempts >= DPI_HEAL_MAX_ATTEMPTS {
+                false
+            } else if now.duration_since(*last_attempt) >= DPI_HEAL_RETRY_DELAY {
+                *last_attempt = now;
+                *attempts += 1;
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -6197,6 +6272,33 @@ fn media_info_row(
 }
 
 fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
+    // Deterministic DPI backstop: when the nudge budget is exhausted and
+    // the satellite still disagrees with its monitor, the viewport stays
+    // closed for a moment and is then recreated, so a fresh native window
+    // is born at the settled monitor DPI. Not calling show_viewport_immediate
+    // for a frame is egui's own way of closing an immediate viewport; once
+    // frames were skipped the window is recreated either way, so the
+    // recreation is always counted and fully reset.
+    if let Some(started) = app.satellite_dpi_recreate_at {
+        let elapsed = started.elapsed();
+        if elapsed < DPI_SATELLITE_RECREATE_SKIP {
+            return;
+        }
+        // Never recreate in the middle of a user drag: the window would
+        // reappear detached from the pointer at the OS default position.
+        // A hard force deadline prevents a stale drag flag from keeping
+        // the satellite closed forever.
+        if app.quota_drag_active && elapsed < DPI_SATELLITE_RECREATE_FORCE {
+            return;
+        }
+        app.satellite_dpi_recreate_at = None;
+        app.satellite_hwnd = None;
+        app.satellite_configured_hwnd = None;
+        app.satellite_frames_painted = 0;
+        app.satellite_opacity_applied = None;
+        app.satellite_dpi_recreations = app.satellite_dpi_recreations.saturating_add(1);
+    }
+
     let quota_viewport_id = egui::ViewportId::from_hash_of("live_status_quota_viewport");
     let title = match app.language {
         Language::German => "Herdr-Nachtwächter - Limits",
@@ -6283,6 +6385,61 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
         if app.satellite_frames_painted == 1 {
             sat_ctx.request_repaint();
             app.sync_corner_regions();
+        }
+
+        // A satellite created while the display subsystem still settles can
+        // keep a stale 96 DPI scale factor cached by winit, which leaves the
+        // window persistently too small while the size reconcile below
+        // stays silent (the point size looks correct at the wrong
+        // pixels_per_point). Heal with bounded invisible nudges first; once
+        // that budget is spent, schedule the deterministic viewport
+        // recreation handled at the top of render_quota_satellite_window.
+        // The zoom factor stays at the plain app scale: it is global across
+        // viewports in egui, so compensating it for one window would scale
+        // every other window wrongly.
+        let sat_native_ppp = sat_ctx.input(|i| i.viewport().native_pixels_per_point);
+        let sat_monitor_ppp = app
+            .satellite_hwnd
+            .and_then(|hwnd| window_chrome::monitor_scale_factor_for_window(hwnd));
+        if !app.quota_drag_active
+            && window_chrome::scale_mismatch(sat_native_ppp, sat_monitor_ppp)
+        {
+            let attempts_used = app.satellite_dpi_heal.map(|(_, count)| count).unwrap_or(0);
+            // The third nudge gets the same settling time as the first
+            // two: only schedule the visible recreation once it had its
+            // full chance to make winit refresh the scale factor.
+            let last_nudge_settled = app
+                .satellite_dpi_heal
+                .is_some_and(|(last_attempt, _)| last_attempt.elapsed() >= DPI_HEAL_RETRY_DELAY);
+            if attempts_used >= DPI_HEAL_MAX_ATTEMPTS {
+                if last_nudge_settled
+                    && app.satellite_dpi_recreate_at.is_none()
+                    && app.satellite_dpi_recreations < DPI_SATELLITE_MAX_RECREATIONS
+                {
+                    app.satellite_dpi_recreate_at = Some(Instant::now());
+                    app.satellite_dpi_heal = None;
+                    record_ui_error(
+                        LIVE_STATUS_DPI_HEAL_EVENT,
+                        &format!(
+                            "satellite recreate scheduled native_ppp={sat_native_ppp:?} monitor_ppp={sat_monitor_ppp:?}"
+                        ),
+                    );
+                }
+            } else if dpi_heal_due(&mut app.satellite_dpi_heal, Instant::now())
+                && app
+                    .satellite_hwnd
+                    .map(|sat_hwnd| window_chrome::heal_stale_window_scale(sat_hwnd))
+                    .unwrap_or(false)
+            {
+                record_ui_error(
+                    LIVE_STATUS_DPI_HEAL_EVENT,
+                    &format!(
+                        "satellite nudge attempt native_ppp={sat_native_ppp:?} monitor_ppp={sat_monitor_ppp:?}"
+                    ),
+                );
+            }
+        } else {
+            app.satellite_dpi_heal = None;
         }
         sat_ctx.set_zoom_factor(scale);
 
@@ -8922,6 +9079,46 @@ fn configure_visuals(context: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dpi_heal_budget_allows_first_attempt_immediately() {
+        let now = Instant::now();
+        let mut state = None;
+        assert!(dpi_heal_due(&mut state, now));
+        assert_eq!(state.map(|(_, attempts)| attempts), Some(1));
+    }
+
+    #[test]
+    fn dpi_heal_budget_spaces_retries_and_exhausts() {
+        let now = Instant::now();
+        let mut state = None;
+        assert!(dpi_heal_due(&mut state, now));
+        assert!(
+            !dpi_heal_due(&mut state, now + Duration::from_millis(500)),
+            "a retry must wait out the spacing delay"
+        );
+        assert!(dpi_heal_due(&mut state, now + Duration::from_secs(3)));
+        assert!(dpi_heal_due(&mut state, now + Duration::from_secs(6)));
+        assert!(
+            !dpi_heal_due(&mut state, now + Duration::from_secs(9)),
+            "the attempt budget must exhaust"
+        );
+        assert_eq!(
+            state.map(|(_, attempts)| attempts),
+            Some(DPI_HEAL_MAX_ATTEMPTS)
+        );
+    }
+
+    #[test]
+    fn dpi_heal_budget_resets_after_clearing() {
+        let now = Instant::now();
+        let mut state = None;
+        assert!(dpi_heal_due(&mut state, now));
+        assert!(dpi_heal_due(&mut state, now + Duration::from_secs(3)));
+        state = None; // mismatch resolved between frames
+        assert!(dpi_heal_due(&mut state, now + Duration::from_secs(4)));
+        assert_eq!(state.map(|(_, attempts)| attempts), Some(1));
+    }
 
     static LIVE_OPEN_ATTEMPT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
