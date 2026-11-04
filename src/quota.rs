@@ -1,4 +1,4 @@
-//! KI-Budget-Limits (GLM, Agy, Codex, Claude) Telemetry & Management for Herdr Night Watch.
+//! KI-Budget-Limits (GLM, Agy, Codex, Claude, Qwen) Telemetry & Management for Herdr Night Watch.
 //!
 //! Provides data structures, parsers, and background sampling for provider quotas.
 //! Fail-closed: values are strictly informational and never participate in shutdown decisions.
@@ -36,9 +36,10 @@ pub enum ProviderId {
     Agy,
     Codex,
     Claude,
+    Qwen,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProviderQuota {
     pub id: ProviderId,
     pub title: &'static str,
@@ -48,6 +49,14 @@ pub struct ProviderQuota {
     pub week_percent: Option<u8>,
     pub week_reset: Option<String>,
     pub is_throttled: bool,
+    /// True when the large window is a monthly (not weekly) cycle.
+    pub month_cycle: bool,
+    /// Exact cycle length in days when the live payload reports the window
+    /// start; `None` when only the reset date is known.
+    pub cycle_days: Option<f32>,
+    /// Unrounded consumption of the large window (0-100) when the payload
+    /// carries it; keeps the pace forecast free of integer-percent noise.
+    pub week_consumed_pct: Option<f32>,
 }
 
 impl ProviderQuota {
@@ -71,6 +80,11 @@ impl ProviderQuota {
             week_percent,
             week_reset,
             is_throttled,
+            // Z.ai and the QwenCloud Token Plan renew their large window
+            // monthly; a live Qwen payload may correct this per cycle field.
+            month_cycle: matches!(id, ProviderId::Glm | ProviderId::Qwen),
+            cycle_days: None,
+            week_consumed_pct: None,
         }
     }
 
@@ -86,7 +100,7 @@ impl ProviderQuota {
     }
 
     pub fn cycle_label(&self) -> &'static str {
-        if self.id == ProviderId::Glm {
+        if self.month_cycle || self.id == ProviderId::Glm {
             "Mo"
         } else if let Some(reset) = &self.week_reset {
             if reset.starts_with("01.") {
@@ -100,12 +114,14 @@ impl ProviderQuota {
     }
 
     pub fn pacing_forecast(&self) -> PacingForecast {
-        pacing_forecast_for(
+        pacing_forecast_with_cycle_days(
             self.is_throttled,
             self.week_percent,
             self.week_reset.as_deref(),
             self.five_hour_percent,
             self.five_hour_reset.as_deref(),
+            self.cycle_days,
+            self.week_consumed_pct,
             None,
             None,
         )
@@ -1064,6 +1080,30 @@ pub fn pacing_forecast_for(
     custom_today: Option<(i32, u32, u32)>,
     custom_time: Option<(u32, u32)>,
 ) -> PacingForecast {
+    pacing_forecast_with_cycle_days(
+        is_throttled,
+        week_percent,
+        week_reset,
+        five_hour_percent,
+        five_hour_reset,
+        None,
+        None,
+        custom_today,
+        custom_time,
+    )
+}
+
+pub fn pacing_forecast_with_cycle_days(
+    is_throttled: bool,
+    week_percent: Option<u8>,
+    week_reset: Option<&str>,
+    five_hour_percent: Option<u8>,
+    five_hour_reset: Option<&str>,
+    cycle_days: Option<f32>,
+    consumed_override: Option<f32>,
+    custom_today: Option<(i32, u32, u32)>,
+    custom_time: Option<(u32, u32)>,
+) -> PacingForecast {
     let today = custom_today.unwrap_or_else(current_forecast_today);
     let now_hm = custom_time.unwrap_or_else(current_hm);
 
@@ -1142,15 +1182,62 @@ pub fn pacing_forecast_for(
         }
         None => 7.0,
     };
-    let total_days = if remaining_days > 7.5 { 30.0 } else { 7.0 };
+    let total_days = cycle_days.unwrap_or(if remaining_days > 7.5 { 30.0 } else { 7.0 });
     let has_reset_time = week_reset
         .and_then(|raw| parse_target_datetime(raw, today))
         .is_some_and(|(_, time)| time.is_some());
     // Exact reset times reveal the actual cycle age. A fixed 4.8-hour floor
     // invents consumption history near the start of a weekly period.
     let min_elapsed = if has_reset_time { 1.0 / 1440.0 } else { 0.2 };
+    // A just-started cycle has no meaningful burn history. Without the exact
+    // cycle length the guessed total collapses elapsed to the floor and turns
+    // a few percent of consumption into a wildly false pace (observed 432x on
+    // a three-hour-old monthly window). Show no forecast in that case.
+    if cycle_days.is_none() && total_days - remaining_days <= min_elapsed {
+        let mut fc = PacingForecast {
+            pace_ratio: None,
+            runway_days: None,
+            delta_days: None,
+            remaining_days,
+            health: PacingHealth::Surplus,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast,
+            week_exhaustion_date: None,
+            reset_str: saved_reset,
+            today,
+        };
+        fc.badge_text = fc.localized_upper_line(Language::German);
+        fc.summary_text = fc.localized_lower_line(Language::German);
+        return fc;
+    }
     let elapsed_days = (total_days - remaining_days).max(min_elapsed);
-    let consumed_pct = (100u8.saturating_sub(rem_pct)) as f32;
+    let consumed_pct = consumed_override
+        .filter(|value| (0.0..=100.0).contains(value))
+        .unwrap_or((100u8.saturating_sub(rem_pct)) as f32);
+    // Fresh-cycle telemetry gate: while the cycle has run less than half a
+    // day and consumption stays in rounding range, every runway and deficit
+    // figure is a tiny denominator multiplied by noise (observed: "Reicht
+    // noch 12.7 Tage · -22d Defizit" at 98 % remaining, four hours into a
+    // 31-day cycle). Stay silent until the telemetry can carry a forecast.
+    if elapsed_days < 0.5 && consumed_pct < 5.0 {
+        let mut fc = PacingForecast {
+            pace_ratio: None,
+            runway_days: None,
+            delta_days: None,
+            remaining_days,
+            health: PacingHealth::Surplus,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast,
+            week_exhaustion_date: None,
+            reset_str: saved_reset,
+            today,
+        };
+        fc.badge_text = fc.localized_upper_line(Language::German);
+        fc.summary_text = fc.localized_lower_line(Language::German);
+        return fc;
+    }
 
     let allowed_rate = 100.0 / total_days;
     let burn_rate = consumed_pct / elapsed_days;
@@ -1303,6 +1390,7 @@ impl QuotaSnapshot {
                 None,
                 None,
             ),
+            ProviderQuota::new(ProviderId::Qwen, "Qwen", "Alibaba", None, None, None, None),
         ];
         let has_throttle = providers.iter().any(|p| p.is_throttled);
         Self {
@@ -1671,6 +1759,104 @@ pub fn update_snapshot_with_claude_json(snapshot: &mut QuotaSnapshot, json_str: 
     snapshot.last_updated = Some(Instant::now());
 }
 
+/// Qwen payloads already carry remaining percentages (the fetcher converts
+/// consumed fractions). The large window arrives either as `month` (Token
+/// Plan monthly credits) or as `week` (rolling weekly usage); whichever key
+/// the live payload reports decides the card's cycle label.
+fn read_qwen_window(
+    value: Option<&serde_json::Value>,
+    key: &str,
+    now_epoch: i64,
+) -> Option<(Option<u8>, Option<String>, Option<f32>, Option<f32>)> {
+    let window = value?.get(key)?;
+    let percent = window
+        .get("remaining_percent")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|percent| *percent <= 100)
+        .map(|percent| percent as u8);
+    let reset = window
+        .get("reset_epoch")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|epoch| *epoch > now_epoch)
+        .map(|epoch| {
+            codex_reset_epoch_to_local(
+                epoch,
+                if key == "five_hour" {
+                    "five_hour"
+                } else {
+                    "week"
+                },
+            )
+        })
+        .or_else(|| {
+            window
+                .get("reset")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    // The fetcher attaches the exact cycle length from the subscription
+    // window; without it the forecast must not guess the cycle age.
+    let cycle_days = window
+        .get("cycle_days")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|days| (0.5..=400.0).contains(days))
+        .map(|days| days as f32);
+    let consumed = window
+        .get("consumed_percent")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| (0.0..=100.0).contains(value))
+        .map(|value| value as f32);
+    if percent.is_none() && reset.is_none() {
+        return None;
+    }
+    Some((percent, reset, cycle_days, consumed))
+}
+
+pub fn update_snapshot_with_qwen_json(snapshot: &mut QuotaSnapshot, json_str: &str) {
+    let value = serde_json::from_str::<serde_json::Value>(json_str).ok();
+    let qwen = snapshot
+        .providers
+        .iter_mut()
+        .find(|p| p.id == ProviderId::Qwen);
+    let Some(qwen) = qwen else { return };
+
+    // A missing or stale capture must not leave an older quota looking current.
+    qwen.five_hour_percent = None;
+    qwen.five_hour_reset = None;
+    qwen.week_percent = None;
+    qwen.week_reset = None;
+    qwen.cycle_days = None;
+    qwen.week_consumed_pct = None;
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let payload = value.as_ref();
+    if let Some((percent, reset, _, _)) = read_qwen_window(payload, "five_hour", now_epoch) {
+        qwen.five_hour_percent = percent;
+        qwen.five_hour_reset = reset;
+    }
+    // The Token Plan reports monthly credits; a rolling week window arrives
+    // only as fallback. Whichever key carries data decides the cycle label.
+    let month_window = read_qwen_window(payload, "month", now_epoch);
+    let week_window = read_qwen_window(payload, "week", now_epoch);
+    let large_window_is_month = month_window.is_some();
+    if let Some((percent, reset, cycle_days, consumed)) = month_window.or(week_window) {
+        qwen.month_cycle = large_window_is_month;
+        qwen.week_percent = percent;
+        qwen.week_reset = reset;
+        qwen.cycle_days = cycle_days;
+        qwen.week_consumed_pct = consumed;
+    }
+    qwen.is_throttled = qwen.week_percent == Some(0) || qwen.five_hour_percent == Some(0);
+    snapshot.has_throttle = snapshot
+        .providers
+        .iter()
+        .any(|provider| provider.is_throttled);
+    snapshot.last_updated = Some(Instant::now());
+}
+
 #[cfg(windows)]
 pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
     use std::os::windows::process::CommandExt;
@@ -1749,6 +1935,30 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
             .unwrap_or("null"),
     );
 
+    // The inference key cannot query the QwenCloud billing gateway, so the
+    // fetcher uses console cookies and fails closed (no data, no card churn)
+    // when they are missing.
+    let qwen_json = Command::new("wsl.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg("-d")
+        .arg(&distro)
+        .arg("--exec")
+        .arg("python3")
+        .arg("-c")
+        .arg(include_str!("../tools/fetch_qwen_quota.py"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    update_snapshot_with_qwen_json(
+        &mut updated,
+        qwen_json
+            .as_ref()
+            .map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or("null"),
+    );
+
     updated
 }
 
@@ -1797,6 +2007,21 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
             .unwrap_or("null"),
     );
+    let qwen_json = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(include_str!("../tools/fetch_qwen_quota.py"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    update_snapshot_with_qwen_json(
+        &mut updated,
+        qwen_json
+            .as_ref()
+            .map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or("null"),
+    );
     updated
 }
 
@@ -1807,8 +2032,15 @@ mod tests {
     #[test]
     fn test_quota_snapshot_baseline() {
         let snapshot = QuotaSnapshot::measured_baseline();
-        assert_eq!(snapshot.providers.len(), 4);
+        assert_eq!(snapshot.providers.len(), 5);
         assert!(!snapshot.has_throttle);
+
+        let qwen = snapshot.get(ProviderId::Qwen).expect("Qwen present");
+        assert_eq!(qwen.title, "Qwen");
+        assert_eq!(qwen.author, "Alibaba");
+        assert_eq!(qwen.five_hour_percent, None);
+        assert_eq!(qwen.week_percent, None);
+        assert!(!qwen.is_throttled);
 
         let glm = snapshot.get(ProviderId::Glm).expect("GLM present");
         assert_eq!(glm.five_hour_percent, Some(76));
@@ -1912,6 +2144,159 @@ mod tests {
         assert_eq!(claude.five_hour_reset, None);
         assert_eq!(claude.week_reset, None);
         assert!(!claude.is_throttled);
+    }
+
+    #[test]
+    fn qwen_month_window_wins_and_sets_the_monthly_cycle_label() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_qwen_json(
+            &mut snapshot,
+            r#"{
+                "five_hour": {"remaining_percent": 84, "reset_epoch": 2000000000},
+                "month": {"remaining_percent": 61, "reset_epoch": 2000500000}
+            }"#,
+        );
+        let qwen = snapshot.get(ProviderId::Qwen).expect("Qwen present");
+        assert_eq!(qwen.five_hour_percent, Some(84));
+        assert_eq!(qwen.week_percent, Some(61));
+        assert!(qwen.month_cycle);
+        assert_eq!(qwen.cycle_label(), "Mo");
+    }
+
+    #[test]
+    fn qwen_payload_carries_the_exact_subscription_cycle_length() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_qwen_json(
+            &mut snapshot,
+            r#"{
+                "month": {"remaining_percent": 61, "reset_epoch": 2000500000, "cycle_days": 31.0, "consumed_percent": 38.75}
+            }"#,
+        );
+        let qwen = snapshot.get(ProviderId::Qwen).expect("Qwen present");
+        assert_eq!(qwen.cycle_days, Some(31.0));
+        assert_eq!(qwen.week_consumed_pct, Some(38.75));
+
+        // A payload without the cycle hint must clear it, not keep the old one.
+        update_snapshot_with_qwen_json(
+            &mut snapshot,
+            r#"{"month": {"remaining_percent": 60, "reset_epoch": 2000500000}}"#,
+        );
+        assert_eq!(snapshot.get(ProviderId::Qwen).unwrap().cycle_days, None);
+    }
+
+    #[test]
+    fn qwen_week_only_payload_falls_back_to_the_weekly_cycle() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_qwen_json(
+            &mut snapshot,
+            r#"{
+                "five_hour": {"remaining_percent": 90, "reset_epoch": 2000000000},
+                "week": {"remaining_percent": 70, "reset_epoch": 2000500000}
+            }"#,
+        );
+        let qwen = snapshot.get(ProviderId::Qwen).expect("Qwen present");
+        assert_eq!(qwen.week_percent, Some(70));
+        assert!(!qwen.month_cycle);
+        assert_eq!(qwen.cycle_label(), "Wk");
+    }
+
+    #[test]
+    fn fresh_cycle_without_known_length_shows_no_fabricated_pace() {
+        // Simon's case: a three-hour-old monthly window guessed as 30 days
+        // produced "Pace: 432.00x · -31d Defizit". Without the exact cycle
+        // length the forecast must stay silent instead.
+        let fc = pacing_forecast_with_cycle_days(
+            false,
+            Some(99),
+            Some("05.12. (17:00)"),
+            None,
+            None,
+            None,
+            None,
+            Some((2026, 11, 4)),
+            Some((21, 0)),
+        );
+        assert_eq!(fc.pace_ratio, None);
+        assert_eq!(fc.runway_days, None);
+    }
+
+    #[test]
+    fn fresh_cycle_stays_silent_even_with_exact_length() {
+        // Four hours into a 31-day cycle at 1 % consumed: too little
+        // telemetry for any runway or deficit claim - the card must show
+        // no pace instead of "-22d Defizit".
+        let fc = pacing_forecast_with_cycle_days(
+            false,
+            Some(99),
+            Some("05.12. (17:00)"),
+            None,
+            None,
+            Some(31.0),
+            Some(1.43),
+            Some((2026, 11, 4)),
+            Some((21, 0)),
+        );
+        assert_eq!(fc.pace_ratio, None);
+        assert_eq!(fc.runway_days, None);
+        assert_eq!(fc.delta_days, None);
+    }
+
+    #[test]
+    fn aged_cycle_with_exact_length_yields_sane_pace() {
+        // Ten days into a 31-day cycle at 25 % consumed: burn 2.5 %/day vs
+        // allowed 3.23 %/day -> pace below 1, no deficit.
+        let fc = pacing_forecast_with_cycle_days(
+            false,
+            Some(75),
+            Some("25.11. (17:00)"),
+            None,
+            None,
+            Some(31.0),
+            None,
+            Some((2026, 11, 4)),
+            Some((21, 0)),
+        );
+        let pace = fc.pace_ratio.expect("aged cycle carries a real pace");
+        assert!(pace < 1.2, "pace should track the plan, got {pace}");
+    }
+
+    #[test]
+    fn fresh_cycle_with_heavy_consumed_still_warns() {
+        // Two hours into the cycle but 20 % consumed: above the rounding
+        // noise band, so the forecast must speak up.
+        let fc = pacing_forecast_with_cycle_days(
+            false,
+            Some(80),
+            Some("05.12. (17:00)"),
+            None,
+            None,
+            Some(31.0),
+            Some(20.0),
+            Some((2026, 11, 4)),
+            Some((21, 0)),
+        );
+        assert!(fc.pace_ratio.is_some());
+    }
+
+    #[test]
+    fn missing_qwen_payload_clears_old_values_instead_of_showing_stale_quota() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_qwen_json(
+            &mut snapshot,
+            r#"{"five_hour": {"remaining_percent": 40, "reset_epoch": 2000000000}}"#,
+        );
+        assert_eq!(
+            snapshot.get(ProviderId::Qwen).unwrap().five_hour_percent,
+            Some(40)
+        );
+
+        update_snapshot_with_qwen_json(&mut snapshot, "null");
+        let qwen = snapshot.get(ProviderId::Qwen).expect("Qwen present");
+        assert_eq!(qwen.five_hour_percent, None);
+        assert_eq!(qwen.week_percent, None);
+        assert_eq!(qwen.five_hour_reset, None);
+        assert_eq!(qwen.week_reset, None);
+        assert!(!qwen.is_throttled);
     }
 
     #[test]

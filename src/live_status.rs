@@ -1629,12 +1629,14 @@ struct LiveStatusApp {
     quota_show_agi: bool,
     quota_show_codex: bool,
     quota_show_claude: bool,
+    quota_show_qwen: bool,
     quota_order: Vec<ProviderId>,
     quota_drag: Option<QuotaCardDrag>,
     quota_color_glm: u8,
     quota_color_agi: u8,
     quota_color_codex: u8,
     quota_color_claude: u8,
+    quota_color_qwen: u8,
     quota_settings_open: bool,
     config_tab: ConfigTab,
     corner_radius: u8,
@@ -1758,12 +1760,14 @@ impl LiveStatusApp {
             quota_show_agi: window_settings::live_status_quota_show_agi(),
             quota_show_codex: window_settings::live_status_quota_show_codex(),
             quota_show_claude: window_settings::live_status_quota_show_claude(),
+            quota_show_qwen: window_settings::live_status_quota_show_qwen(),
             quota_order: window_settings::live_status_quota_order(),
             quota_drag: None,
             quota_color_glm: window_settings::live_status_quota_color_glm(),
             quota_color_agi: window_settings::live_status_quota_color_agi(),
             quota_color_codex: window_settings::live_status_quota_color_codex(),
             quota_color_claude: window_settings::live_status_quota_color_claude(),
+            quota_color_qwen: window_settings::live_status_quota_color_qwen(),
             quota_settings_open: window_settings::live_status_quota_settings_open(),
             config_tab: ConfigTab::Window,
             corner_radius: window_settings::live_status_corner_radius(),
@@ -1901,6 +1905,7 @@ impl LiveStatusApp {
             ProviderId::Agy => self.quota_color_agi,
             ProviderId::Codex => self.quota_color_codex,
             ProviderId::Claude => self.quota_color_claude,
+            ProviderId::Qwen => self.quota_color_qwen,
         }
     }
 
@@ -1926,6 +1931,10 @@ impl LiveStatusApp {
             ProviderId::Claude => {
                 self.quota_color_claude = idx;
                 let _ = window_settings::set_live_status_quota_color_claude(idx);
+            }
+            ProviderId::Qwen => {
+                self.quota_color_qwen = idx;
+                let _ = window_settings::set_live_status_quota_color_qwen(idx);
             }
         }
     }
@@ -2313,11 +2322,13 @@ impl eframe::App for LiveStatusApp {
             self.quota_show_agi = window_settings::live_status_quota_show_agi();
             self.quota_show_codex = window_settings::live_status_quota_show_codex();
             self.quota_show_claude = window_settings::live_status_quota_show_claude();
+            self.quota_show_qwen = window_settings::live_status_quota_show_qwen();
             self.quota_order = window_settings::live_status_quota_order();
             self.quota_color_glm = window_settings::live_status_quota_color_glm();
             self.quota_color_agi = window_settings::live_status_quota_color_agi();
             self.quota_color_codex = window_settings::live_status_quota_color_codex();
             self.quota_color_claude = window_settings::live_status_quota_color_claude();
+            self.quota_color_qwen = window_settings::live_status_quota_color_qwen();
             let current_radius = window_settings::live_status_corner_radius();
             if current_radius != self.corner_radius {
                 self.set_corner_radius(current_radius);
@@ -2749,6 +2760,7 @@ impl eframe::App for LiveStatusApp {
                     self.quota_show_agi,
                     self.quota_show_codex,
                     self.quota_show_claude,
+                    self.quota_show_qwen,
                 );
                 if let Some(position) = seek_action {
                     let _ = self.media_command_tx.send(MediaCommand::Seek(position));
@@ -2925,6 +2937,7 @@ fn apply_live_status_scale(
                 ProviderId::Agy => app.quota_show_agi,
                 ProviderId::Codex => app.quota_show_codex,
                 ProviderId::Claude => app.quota_show_claude,
+                ProviderId::Qwen => app.quota_show_qwen,
             })
             .cloned()
             .collect();
@@ -3625,6 +3638,21 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
                         ui.add_space(18.0);
                         if let Some(c) = context_menu_swatches(ui, app.quota_color_claude, "ctx_sw_claude", app.language) {
                             app.set_provider_color(ProviderId::Claude, c);
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+
+                let mut show_qwen = app.quota_show_qwen;
+                if ui.checkbox(&mut show_qwen, "Qwen (Alibaba)").changed() {
+                    app.quota_show_qwen = show_qwen;
+                    let _ = window_settings::set_live_status_quota_show_qwen(show_qwen);
+                }
+                if app.quota_show_qwen {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        if let Some(c) = context_menu_swatches(ui, app.quota_color_qwen, "ctx_sw_qwen", app.language) {
+                            app.set_provider_color(ProviderId::Qwen, c);
                         }
                     });
                     ui.add_space(2.0);
@@ -6006,6 +6034,7 @@ fn media_info_row(
     show_agi: bool,
     show_codex: bool,
     show_claude: bool,
+    show_qwen: bool,
 ) -> (Option<i64>, bool) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
@@ -6060,6 +6089,7 @@ fn media_info_row(
                 ProviderId::Agy => show_agi,
                 ProviderId::Codex => show_codex,
                 ProviderId::Claude => show_claude,
+                ProviderId::Qwen => show_qwen,
             };
             visible && p.is_throttled
         })
@@ -6312,6 +6342,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
     let show_agi = app.quota_show_agi;
     let show_codex = app.quota_show_codex;
     let show_claude = app.quota_show_claude;
+    let show_qwen = app.quota_show_qwen;
 
     let mut visible_providers: Vec<ProviderQuota> = app
         .quota_snapshot
@@ -6322,6 +6353,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
             ProviderId::Agy => show_agi,
             ProviderId::Codex => show_codex,
             ProviderId::Claude => show_claude,
+            ProviderId::Qwen => show_qwen,
         })
         .cloned()
         .collect();
@@ -6918,6 +6950,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 (ProviderId::Agy, "AGY", "Google", app.quota_show_agi),
                                 (ProviderId::Codex, "CODEX", "OpenAI", app.quota_show_codex),
                                 (ProviderId::Claude, "CLAUDE", "Anthropic", app.quota_show_claude),
+                                (ProviderId::Qwen, "QWEN", "Alibaba", app.quota_show_qwen),
                             ];
                             // Follow the same persisted card order as the quota cards.
                             providers_to_config.sort_by_key(|(pid, _, _, _)| {
@@ -7059,6 +7092,10 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                         ProviderId::Claude => {
                                             app.quota_show_claude = new_val;
                                             let _ = window_settings::set_live_status_quota_show_claude(new_val);
+                                        }
+                                        ProviderId::Qwen => {
+                                            app.quota_show_qwen = new_val;
+                                            let _ = window_settings::set_live_status_quota_show_qwen(new_val);
                                         }
                                     }
                                 }
@@ -8229,6 +8266,7 @@ fn draw_provider_card(
         ProviderId::Agy => "Google",
         ProviderId::Codex => "OpenAI",
         ProviderId::Claude => "Anthropic",
+        ProviderId::Qwen => "Alibaba",
     };
     let name_galley = painter.layout_no_wrap(
         full_name.into(),
