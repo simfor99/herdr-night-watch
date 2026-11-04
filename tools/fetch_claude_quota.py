@@ -12,10 +12,19 @@ from pathlib import Path
 import sys
 import tempfile
 from typing import Any
+import urllib.error
+import urllib.request
 
 
 MAX_AGE_SECONDS = 24 * 60 * 60
 WINDOWS = {"five_hour": "five_hour", "seven_day": "week"}
+# OAuth fallback: active status-line captures only arrive from first-party
+# Claude sessions. When every session runs through a proxy profile (ccqwen,
+# ccglm), the widget would show nothing although the local Claude Code
+# credentials can answer the official usage endpoint directly.
+OAUTH_MAX_AGE_SECONDS = 10 * 60
+OAUTH_WINDOWS = {"five_hour": "five_hour", "seven_day": "week"}
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
 
 def state_path() -> Path:
@@ -57,7 +66,9 @@ def clean_rate_limits(rate_limits: Any, now: float) -> dict[str, dict[str, int |
     return cleaned
 
 
-def capture_statusline_payload(payload: Any, now: float | None = None) -> bool:
+def capture_statusline_payload(
+    payload: Any, now: float | None = None, source: str | None = None
+) -> bool:
     if not isinstance(payload, dict) or "rate_limits" not in payload:
         return False
     observed_at = dt.datetime.now(dt.timezone.utc).timestamp() if now is None else now
@@ -70,10 +81,13 @@ def capture_statusline_payload(payload: Any, now: float | None = None) -> bool:
     file_descriptor, temporary_name = tempfile.mkstemp(
         prefix=".claude-quota-", dir=destination.parent
     )
+    record: dict[str, Any] = {"captured_at": observed_at, "rate_limits": windows}
+    if source:
+        record["source"] = source
     try:
         os.fchmod(file_descriptor, 0o600)
         with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
-            json.dump({"captured_at": observed_at, "rate_limits": windows}, handle)
+            json.dump(record, handle)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -91,21 +105,108 @@ def capture_statusline_payload(payload: Any, now: float | None = None) -> bool:
     return True
 
 
+def oauth_credentials_path() -> Path:
+    return Path.home() / ".claude" / ".credentials.json"
+
+
+def oauth_access_token(now: float) -> str | None:
+    """Return the locally stored Claude Code OAuth token while it is valid."""
+    try:
+        credentials = json.loads(oauth_credentials_path().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(credentials, dict):
+        return None
+    oauth = credentials.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token.strip():
+        return None
+    expires_at = oauth.get("expiresAt")
+    if valid_number(expires_at) and expires_at / 1000.0 <= now:
+        return None
+    return token
+
+
+def fetch_oauth_windows(now: float) -> dict[str, dict[str, int | float]] | None:
+    token = oauth_access_token(now)
+    if token is None:
+        return None
+    request = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "herdr-night-watch/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError, UnicodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    windows: dict[str, dict[str, int | float]] = {}
+    for source, target in OAUTH_WINDOWS.items():
+        window = payload.get(source)
+        if not isinstance(window, dict):
+            continue
+        utilization = window.get("utilization")
+        if not valid_number(utilization) or not 0.0 <= utilization <= 100.0:
+            continue
+        entry: dict[str, int | float] = {"used_percentage": utilization}
+        resets_at = window.get("resets_at")
+        if resets_at is not None:
+            epoch: float | None = None
+            if isinstance(resets_at, str):
+                try:
+                    epoch = dt.datetime.fromisoformat(resets_at.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    epoch = None
+            elif valid_number(resets_at):
+                epoch = resets_at
+            # A reset timestamp in the past describes an already-closed
+            # window; reporting its old consumption as current would lie.
+            if not valid_number(epoch) or epoch <= now:
+                continue
+            entry["resets_at"] = int(epoch)
+        windows[target] = entry
+    return windows or None
+
+
 def read_quota(now: float | None = None) -> dict[str, dict[str, int | float]] | None:
     current_time = dt.datetime.now(dt.timezone.utc).timestamp() if now is None else now
     try:
         with state_path().open(encoding="utf-8") as handle:
             cached = json.load(handle)
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
+        cached = None
 
-    if not isinstance(cached, dict):
+    if isinstance(cached, dict):
+        captured_at = cached.get("captured_at")
+        oauth_sourced = cached.get("source") == "oauth"
+        max_age = OAUTH_MAX_AGE_SECONDS if oauth_sourced else MAX_AGE_SECONDS
+        if valid_number(captured_at) and 0 <= current_time - captured_at <= max_age:
+            windows = clean_rate_limits(cached.get("rate_limits"), current_time)
+            # An OAuth capture refreshes itself; only its windows expire.
+            if windows or not oauth_sourced:
+                return windows or None
+
+    # No usable status-line cache: ask the official usage endpoint with the
+    # local Claude Code OAuth credentials and persist the answer briefly.
+    windows = fetch_oauth_windows(current_time)
+    if windows is None:
         return None
-    captured_at = cached.get("captured_at")
-    if not valid_number(captured_at) or not 0 <= current_time - captured_at <= MAX_AGE_SECONDS:
-        return None
-    windows = clean_rate_limits(cached.get("rate_limits"), current_time)
-    return windows or None
+    try:
+        capture_statusline_payload(
+            {"rate_limits": windows}, now=current_time, source="oauth"
+        )
+    except OSError:
+        pass
+    return windows
 
 
 def main(argv: list[str] | None = None) -> int:
