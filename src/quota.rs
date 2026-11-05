@@ -184,6 +184,14 @@ impl PacingForecast {
         })
     }
 
+    /// Protection shield in color form (parity with the health rule): with at
+    /// least 50 % remaining and a pace of at most 1.25x, a small deficit is a
+    /// warning, not a red alert. Keeps a 98 % monthly card from flashing red
+    /// over "-2d" while the pace itself is near plan.
+    pub fn week_deficit_shielded(&self, remaining_percent: u8) -> bool {
+        remaining_percent >= 50 && self.pace_ratio.map_or(false, |ratio| ratio <= 1.25)
+    }
+
     pub fn localized_upper_line(&self, language: Language) -> String {
         if self.health == PacingHealth::Throttled {
             return language.text("Gedrosselt", "Throttled").to_string();
@@ -2144,6 +2152,33 @@ mod tests {
         assert_eq!(claude.five_hour_reset, None);
         assert_eq!(claude.week_reset, None);
         assert!(!claude.is_throttled);
+    }
+
+    #[test]
+    fn protection_shield_softens_small_deficits_on_rich_cards() {
+        // Simon's case: 98 % left, pace 1.08x, -2 d projection must read as a
+        // yellow warning, not a red alert; AGY's 5 % card stays unshielded.
+        let fc = PacingForecast {
+            pace_ratio: Some(1.08),
+            runway_days: Some(28.0),
+            delta_days: Some(-2),
+            remaining_days: 30.3,
+            health: PacingHealth::Surplus,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast: None,
+            week_exhaustion_date: Some((12, 3)),
+            reset_str: Some("05.12. (17:00)".into()),
+            today: (2026, 11, 5),
+        };
+        assert!(fc.week_is_deficit());
+        assert!(fc.week_deficit_shielded(98));
+        assert!(!fc.week_deficit_shielded(5));
+        let fast = PacingForecast {
+            pace_ratio: Some(1.6),
+            ..fc.clone()
+        };
+        assert!(!fast.week_deficit_shielded(98));
     }
 
     #[test]

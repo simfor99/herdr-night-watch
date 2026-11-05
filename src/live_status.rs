@@ -8072,10 +8072,11 @@ fn draw_smooth_limit_block(
         }
     } else {
         let diff_days = forecast.runway_days.map(|rw| rw - forecast.remaining_days);
+        let shielded = forecast.week_deficit_shielded(pct);
         if pct < 10 {
             (egui::Color32::from_rgb(252, 165, 165), true, false)
         } else if let Some(diff) = diff_days {
-            if diff < -0.85 {
+            if diff < -0.85 && !shielded {
                 // Severe deficit: exhausted nearly a day or more before reset
                 (egui::Color32::from_rgb(252, 165, 165), true, false)
             } else if diff < -0.04 {
@@ -8598,7 +8599,8 @@ fn render_quota_tooltip(
 
                 if let Some(ratio) = forecast.pace_ratio {
                     ui.label(egui::RichText::new(language.text("Pace:", "Pace:")).color(egui::Color32::from_rgb(148, 163, 184)));
-                    let pace_color = if forecast.week_is_deficit() {
+                    let shielded = forecast.week_deficit_shielded(pct);
+                    let pace_color = if forecast.week_is_deficit() && !shielded {
                         egui::Color32::from_rgb(252, 165, 165)
                     } else if ratio < 1.0 {
                         egui::Color32::from_rgb(120, 184, 134)
