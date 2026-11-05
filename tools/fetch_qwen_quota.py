@@ -44,6 +44,21 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
 )
 HTTP_TIMEOUT_SECONDS = 10
+# Global wall-clock budget across every step (cookie attempts, CDP refresh,
+# retries). The widget refreshes all providers sequentially every 45 s; an
+# unbounded Qwen failure must never delay the other cards.
+TOTAL_BUDGET_SECONDS = 20
+_BUDGET_START = time.monotonic()
+
+
+def budget_left() -> float:
+    return TOTAL_BUDGET_SECONDS - (time.monotonic() - _BUDGET_START)
+
+
+def out_of_budget() -> bool:
+    return budget_left() <= 1.0
+
+
 COOKIE_FILE_AGE_SECONDS = 6 * 60 * 60
 CDP_PORT = 9222
 # Cookie names the console session needs (per CodexBar#2328 findings plus the
@@ -114,8 +129,10 @@ def cdp_hosts() -> list[str]:
 
 
 def http_json(url: str) -> object | None:
+    if out_of_budget():
+        return None
     try:
-        with urllib.request.urlopen(url, timeout=3) as response:
+        with urllib.request.urlopen(url, timeout=min(3.0, max(0.5, budget_left()))) as response:
             return json.loads(response.read())
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return None
@@ -215,6 +232,8 @@ class CdpSocket:
 
 
 def cookies_via_cdp() -> str | None:
+    if out_of_budget():
+        return None
     endpoint = cdp_find_socket()
     if endpoint is None:
         return None
@@ -227,7 +246,7 @@ def cookies_via_cdp() -> str | None:
         return None
     try:
         client.send({"id": 1, "method": "Storage.getCookies"})
-        answer = client.recv_json(1, time.time() + 8)
+        answer = client.recv_json(1, time.time() + max(0.5, min(8.0, budget_left())))
     finally:
         client.close()
     if not isinstance(answer, dict):
@@ -254,6 +273,8 @@ def cookies_via_cdp() -> str | None:
 
 
 def request(url: str, cookie: str, data: bytes | None = None) -> bytes:
+    if out_of_budget():
+        raise TimeoutError("qwen fetch budget exhausted")
     headers = {
         "Cookie": cookie,
         "User-Agent": BROWSER_UA,
@@ -368,9 +389,12 @@ def usage_with_cookie(cookie: str) -> dict | None:
             and end > start
         ):
             cycle_days = round((end - start) / 86_400_000.0, 2)
-            for key in ("month", "week"):
-                if key in result:
-                    result[key]["cycle_days"] = cycle_days
+            # The subscription length only describes the monthly window. A
+            # rolling week window must keep the 7-day pacing guess; stamping
+            # ~31 days onto it would age the cycle artificially and quiet a
+            # real bottleneck.
+            if "month" in result:
+                result["month"]["cycle_days"] = cycle_days
     return result
 
 

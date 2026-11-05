@@ -62,6 +62,30 @@ class QwenUsagePipelineTests(unittest.TestCase):
         self.assertEqual(result["month"]["remaining_percent"], 75)
         self.assertTrue(28.0 <= result["month"]["cycle_days"] <= 32.0)
 
+    def test_subscription_cycle_never_stamps_the_week_window(self) -> None:
+        # A ~31-day subscription length describing a rolling 7-day week window
+        # would age the cycle artificially and quiet real bottlenecks.
+        usage = {
+            "per1WeekPercentage": 0.5,
+            "per1WeekResetTime": int((time.time() + 3 * 86400) * 1000),
+        }
+        subscription = {
+            "startTime": int((time.time() - 30 * 86400) * 1000),
+            "endTime": int((time.time() + 1 * 86400) * 1000),
+        }
+
+        def fake_gateway(cookie, sec_token, endpoint):
+            return usage if endpoint == "usage" else subscription
+
+        fake_request = lambda *args, **kwargs: b'{"data": {"secToken": "test-token"}}'
+        with patch.object(qwen_quota, "request", fake_request), patch.object(
+            qwen_quota, "gateway_call", side_effect=fake_gateway
+        ):
+            result = qwen_quota.usage_with_cookie("cookie")
+
+        self.assertIn("week", result)
+        self.assertNotIn("cycle_days", result["week"])
+
     def test_usage_endpoint_failure_yields_no_result(self) -> None:
         fake_request = lambda *args, **kwargs: b'{"data": {"secToken": "test-token"}}'
         with patch.object(qwen_quota, "request", fake_request), patch.object(
