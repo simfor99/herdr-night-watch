@@ -101,6 +101,25 @@ class QwenUsagePipelineTests(unittest.TestCase):
             self.assertIsNone(qwen_quota.usage_with_cookie("cookie"))
             gateway.assert_not_called()
 
+    def test_cdp_read_stops_at_the_global_budget(self) -> None:
+        # A slow-drip peer that keeps trickling bytes inside each per-recv
+        # timeout must not extend the read past the promised global budget.
+        class DripSocket:
+            def settimeout(self, timeout: float) -> None:
+                pass
+
+            def recv(self, _size: int) -> bytes:
+                return b"x"
+
+        client = qwen_quota.CdpSocket.__new__(qwen_quota.CdpSocket)
+        client._sock = DripSocket()
+        client._buffer = b""
+        # Simulated clock: each arm consumes five seconds of budget.
+        remaining = iter([15.0, 10.0, 5.0, 1.0, 0.0])
+        with patch.object(qwen_quota, "budget_left", lambda: next(remaining, 0.0)):
+            with self.assertRaises(OSError):
+                client._read(16)
+
     def test_cookie_file_round_trip_is_private_and_bounded(self) -> None:
         qwen_quota.write_cookie_file("cna=x; login_qwencloud_ticket=y")
         path = Path(qwen_quota.cookie_file_path())

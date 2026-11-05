@@ -31,6 +31,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -157,7 +158,20 @@ def cdp_find_socket() -> str | None:
 
 
 class CdpSocket:
-    """Minimal stdlib WebSocket client for one CDP request/response pair."""
+    """Minimal stdlib WebSocket client for one CDP request/response pair.
+
+    Every blocking read re-arms the socket timeout from the global budget, so
+    a slow-drip peer cannot keep the process alive past the 20 s promise the
+    Rust caller relies on for its sequential all-provider refresh.
+    """
+
+    def _arm_timeout(self) -> float:
+        remaining = budget_left()
+        if remaining <= 0.0:
+            raise OSError("CDP read exceeded the global budget")
+        timeout = min(8.0, remaining)
+        self._sock.settimeout(timeout)
+        return timeout
 
     def __init__(self, host: str, port: int, path: str) -> None:
         self._sock = socket.create_connection(
@@ -172,6 +186,7 @@ class CdpSocket:
         self._sock.sendall(handshake.encode())
         self._buffer = b""
         while b"\r\n\r\n" not in self._buffer:
+            self._arm_timeout()
             chunk = self._sock.recv(4096)
             if not chunk:
                 raise OSError("CDP handshake closed")
@@ -182,6 +197,7 @@ class CdpSocket:
 
     def _read(self, size: int) -> bytes:
         while len(self._buffer) < size:
+            self._arm_timeout()
             chunk = self._sock.recv(65536)
             if not chunk:
                 raise OSError("CDP socket closed")
@@ -402,6 +418,12 @@ def usage_with_cookie(cookie: str) -> dict | None:
 
 
 def main() -> int:
+    # Hard watchdog: no blocking HTTP or CDP read may outlive the promised
+    # budget; the Rust caller waits for this process and refreshes every
+    # provider sequentially. Fail closed with no stdout.
+    watchdog = threading.Timer(TOTAL_BUDGET_SECONDS + 2.0, lambda: os._exit(1))
+    watchdog.daemon = True
+    watchdog.start()
     cookie = os.environ.get("QWEN_CLOUD_COOKIE", "").strip() or read_cookie_file()
     result = usage_with_cookie(cookie) if cookie else None
     if result is None:
