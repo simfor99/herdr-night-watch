@@ -1629,12 +1629,14 @@ struct LiveStatusApp {
     quota_show_agi: bool,
     quota_show_codex: bool,
     quota_show_claude: bool,
+    quota_show_qwen: bool,
     quota_order: Vec<ProviderId>,
     quota_drag: Option<QuotaCardDrag>,
     quota_color_glm: u8,
     quota_color_agi: u8,
     quota_color_codex: u8,
     quota_color_claude: u8,
+    quota_color_qwen: u8,
     quota_settings_open: bool,
     config_tab: ConfigTab,
     corner_radius: u8,
@@ -1758,12 +1760,14 @@ impl LiveStatusApp {
             quota_show_agi: window_settings::live_status_quota_show_agi(),
             quota_show_codex: window_settings::live_status_quota_show_codex(),
             quota_show_claude: window_settings::live_status_quota_show_claude(),
+            quota_show_qwen: window_settings::live_status_quota_show_qwen(),
             quota_order: window_settings::live_status_quota_order(),
             quota_drag: None,
             quota_color_glm: window_settings::live_status_quota_color_glm(),
             quota_color_agi: window_settings::live_status_quota_color_agi(),
             quota_color_codex: window_settings::live_status_quota_color_codex(),
             quota_color_claude: window_settings::live_status_quota_color_claude(),
+            quota_color_qwen: window_settings::live_status_quota_color_qwen(),
             quota_settings_open: window_settings::live_status_quota_settings_open(),
             config_tab: ConfigTab::Window,
             corner_radius: window_settings::live_status_corner_radius(),
@@ -1805,7 +1809,16 @@ impl LiveStatusApp {
             }
         }
         if let Some(sat_hwnd) = self.satellite_hwnd {
-            let sat_h = self.last_synced_sat_height.unwrap_or(SETTINGS_OPEN_DESIGN_HEIGHT);
+            // Startup fallback mirrors the live formula so a settings window
+            // recreated before the first height sync never gets the old
+            // four-row height.
+            let sat_h = self.last_synced_sat_height.unwrap_or_else(|| {
+                quota_satellite_design_height(
+                    &[],
+                    self.quota_settings_open,
+                    self.quota_minimize_depleted,
+                )
+            });
             window_chrome::sync_satellite_size(sat_hwnd, sat_h, self.main_hwnd, r, is_docked);
             window_chrome::ensure_window_chrome_synced(sat_hwnd, op, self.window_level);
             if !taskbar::is_satellite_exempt_synced(sat_hwnd) {
@@ -1901,6 +1914,7 @@ impl LiveStatusApp {
             ProviderId::Agy => self.quota_color_agi,
             ProviderId::Codex => self.quota_color_codex,
             ProviderId::Claude => self.quota_color_claude,
+            ProviderId::Qwen => self.quota_color_qwen,
         }
     }
 
@@ -1926,6 +1940,10 @@ impl LiveStatusApp {
             ProviderId::Claude => {
                 self.quota_color_claude = idx;
                 let _ = window_settings::set_live_status_quota_color_claude(idx);
+            }
+            ProviderId::Qwen => {
+                self.quota_color_qwen = idx;
+                let _ = window_settings::set_live_status_quota_color_qwen(idx);
             }
         }
     }
@@ -2013,8 +2031,10 @@ impl LiveStatusApp {
         self.last_quota_fetch = Some(Instant::now());
         let sender = self.quota_tx.clone();
         let snapshot = self.quota_snapshot.clone();
+        // A hidden Qwen card never reaches the network or the agent Chrome.
+        let show_qwen = self.quota_show_qwen;
         thread::spawn(move || {
-            let updated = crate::quota::fetch_live_snapshot(&snapshot);
+            let updated = crate::quota::fetch_live_snapshot(&snapshot, show_qwen);
             let _ = sender.send(updated);
         });
     }
@@ -2313,11 +2333,13 @@ impl eframe::App for LiveStatusApp {
             self.quota_show_agi = window_settings::live_status_quota_show_agi();
             self.quota_show_codex = window_settings::live_status_quota_show_codex();
             self.quota_show_claude = window_settings::live_status_quota_show_claude();
+            self.quota_show_qwen = window_settings::live_status_quota_show_qwen();
             self.quota_order = window_settings::live_status_quota_order();
             self.quota_color_glm = window_settings::live_status_quota_color_glm();
             self.quota_color_agi = window_settings::live_status_quota_color_agi();
             self.quota_color_codex = window_settings::live_status_quota_color_codex();
             self.quota_color_claude = window_settings::live_status_quota_color_claude();
+            self.quota_color_qwen = window_settings::live_status_quota_color_qwen();
             let current_radius = window_settings::live_status_corner_radius();
             if current_radius != self.corner_radius {
                 self.set_corner_radius(current_radius);
@@ -2749,6 +2771,7 @@ impl eframe::App for LiveStatusApp {
                     self.quota_show_agi,
                     self.quota_show_codex,
                     self.quota_show_claude,
+                    self.quota_show_qwen,
                 );
                 if let Some(position) = seek_action {
                     let _ = self.media_command_tx.send(MediaCommand::Seek(position));
@@ -2876,7 +2899,12 @@ fn provider_card_height(quota: &ProviderQuota, minimize_depleted: bool) -> f32 {
 }
 
 /// Shared so the startup fallback cannot drift from the real layout.
+/// Historical value: calibrated for exactly four provider rows.
 const SETTINGS_OPEN_DESIGN_HEIGHT: f32 = 350.0;
+/// Fixed chrome above the provider rows (titlebar, tab bar, gap, min-toggle)
+/// plus bottom padding, and one provider row with its gap.
+const SETTINGS_ROWS_BASE_HEIGHT: f32 = 106.0;
+const SETTINGS_ROW_PITCH: f32 = 61.0;
 
 fn quota_satellite_design_height(
     visible_providers: &[ProviderQuota],
@@ -2884,7 +2912,10 @@ fn quota_satellite_design_height(
     minimize_depleted: bool,
 ) -> f32 {
     if settings_open {
-        return SETTINGS_OPEN_DESIGN_HEIGHT;
+        // The ⚡-Limits tab always lists every configured provider, hidden
+        // ones included; a fixed height clipped the fifth row's swatches.
+        let rows = crate::quota::PROVIDER_COUNT.max(4) as f32;
+        return (SETTINGS_ROWS_BASE_HEIGHT + rows * SETTINGS_ROW_PITCH).max(SETTINGS_OPEN_DESIGN_HEIGHT);
     }
     if visible_providers.is_empty() {
         return 38.0 + 42.0 + 8.0;
@@ -2925,6 +2956,7 @@ fn apply_live_status_scale(
                 ProviderId::Agy => app.quota_show_agi,
                 ProviderId::Codex => app.quota_show_codex,
                 ProviderId::Claude => app.quota_show_claude,
+                ProviderId::Qwen => app.quota_show_qwen,
             })
             .cloned()
             .collect();
@@ -3625,6 +3657,21 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
                         ui.add_space(18.0);
                         if let Some(c) = context_menu_swatches(ui, app.quota_color_claude, "ctx_sw_claude", app.language) {
                             app.set_provider_color(ProviderId::Claude, c);
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+
+                let mut show_qwen = app.quota_show_qwen;
+                if ui.checkbox(&mut show_qwen, "Qwen (Alibaba)").changed() {
+                    app.quota_show_qwen = show_qwen;
+                    let _ = window_settings::set_live_status_quota_show_qwen(show_qwen);
+                }
+                if app.quota_show_qwen {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        if let Some(c) = context_menu_swatches(ui, app.quota_color_qwen, "ctx_sw_qwen", app.language) {
+                            app.set_provider_color(ProviderId::Qwen, c);
                         }
                     });
                     ui.add_space(2.0);
@@ -6006,6 +6053,7 @@ fn media_info_row(
     show_agi: bool,
     show_codex: bool,
     show_claude: bool,
+    show_qwen: bool,
 ) -> (Option<i64>, bool) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
@@ -6060,6 +6108,7 @@ fn media_info_row(
                 ProviderId::Agy => show_agi,
                 ProviderId::Codex => show_codex,
                 ProviderId::Claude => show_claude,
+                ProviderId::Qwen => show_qwen,
             };
             visible && p.is_throttled
         })
@@ -6312,6 +6361,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
     let show_agi = app.quota_show_agi;
     let show_codex = app.quota_show_codex;
     let show_claude = app.quota_show_claude;
+    let show_qwen = app.quota_show_qwen;
 
     let mut visible_providers: Vec<ProviderQuota> = app
         .quota_snapshot
@@ -6322,6 +6372,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
             ProviderId::Agy => show_agi,
             ProviderId::Codex => show_codex,
             ProviderId::Claude => show_claude,
+            ProviderId::Qwen => show_qwen,
         })
         .cloned()
         .collect();
@@ -6918,6 +6969,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 (ProviderId::Agy, "AGY", "Google", app.quota_show_agi),
                                 (ProviderId::Codex, "CODEX", "OpenAI", app.quota_show_codex),
                                 (ProviderId::Claude, "CLAUDE", "Anthropic", app.quota_show_claude),
+                                (ProviderId::Qwen, "QWEN", "Alibaba", app.quota_show_qwen),
                             ];
                             // Follow the same persisted card order as the quota cards.
                             providers_to_config.sort_by_key(|(pid, _, _, _)| {
@@ -7059,6 +7111,10 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                         ProviderId::Claude => {
                                             app.quota_show_claude = new_val;
                                             let _ = window_settings::set_live_status_quota_show_claude(new_val);
+                                        }
+                                        ProviderId::Qwen => {
+                                            app.quota_show_qwen = new_val;
+                                            let _ = window_settings::set_live_status_quota_show_qwen(new_val);
                                         }
                                     }
                                 }
@@ -8035,10 +8091,11 @@ fn draw_smooth_limit_block(
         }
     } else {
         let diff_days = forecast.runway_days.map(|rw| rw - forecast.remaining_days);
+        let shielded = forecast.week_deficit_shielded(pct);
         if pct < 10 {
             (egui::Color32::from_rgb(252, 165, 165), true, false)
         } else if let Some(diff) = diff_days {
-            if diff < -0.85 {
+            if diff < -0.85 && !shielded {
                 // Severe deficit: exhausted nearly a day or more before reset
                 (egui::Color32::from_rgb(252, 165, 165), true, false)
             } else if diff < -0.04 {
@@ -8229,6 +8286,7 @@ fn draw_provider_card(
         ProviderId::Agy => "Google",
         ProviderId::Codex => "OpenAI",
         ProviderId::Claude => "Anthropic",
+        ProviderId::Qwen => "Alibaba",
     };
     let name_galley = painter.layout_no_wrap(
         full_name.into(),
@@ -8560,7 +8618,8 @@ fn render_quota_tooltip(
 
                 if let Some(ratio) = forecast.pace_ratio {
                     ui.label(egui::RichText::new(language.text("Pace:", "Pace:")).color(egui::Color32::from_rgb(148, 163, 184)));
-                    let pace_color = if forecast.week_is_deficit() {
+                    let shielded = forecast.week_deficit_shielded(pct);
+                    let pace_color = if forecast.week_is_deficit() && !shielded {
                         egui::Color32::from_rgb(252, 165, 165)
                     } else if ratio < 1.0 {
                         egui::Color32::from_rgb(120, 184, 134)
@@ -10374,9 +10433,11 @@ mod tests {
 
     #[test]
     fn test_quota_satellite_design_height() {
-        assert_eq!(quota_satellite_design_height(&[], true, false), 350.0);
+        // Settings tab grows with the configured provider count:
+        // 106 base + 5 rows * 61 (row 56 + gap 5) = 411.
+        assert_eq!(quota_satellite_design_height(&[], true, false), 411.0);
         assert_eq!(quota_satellite_design_height(&[], false, false), 88.0);
-        assert_eq!(quota_satellite_design_height(&[], true, true), 350.0);
+        assert_eq!(quota_satellite_design_height(&[], true, true), 411.0);
 
         let glm = ProviderQuota::new(ProviderId::Glm, "GLM", "Z.ai", None, None, Some(90), Some("01.10.".into()));
         assert_eq!(provider_card_height(&glm, false), 68.0);

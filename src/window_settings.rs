@@ -22,10 +22,12 @@ const LIVE_STATUS_MINIMIZE_DEPLETED_VALUE: &str = "LiveStatusMinimizeDepleted";
 const LIVE_STATUS_QUOTA_SHOW_AGI_VALUE: &str = "LiveStatusQuotaShowAgi";
 const LIVE_STATUS_QUOTA_SHOW_CODEX_VALUE: &str = "LiveStatusQuotaShowCodex";
 const LIVE_STATUS_QUOTA_SHOW_CLAUDE_VALUE: &str = "LiveStatusQuotaShowClaude";
+const LIVE_STATUS_QUOTA_SHOW_QWEN_VALUE: &str = "LiveStatusQuotaShowQwen";
 const LIVE_STATUS_QUOTA_COLOR_GLM_VALUE: &str = "LiveStatusQuotaColorGlm";
 const LIVE_STATUS_QUOTA_COLOR_AGI_VALUE: &str = "LiveStatusQuotaColorAgi";
 const LIVE_STATUS_QUOTA_COLOR_CODEX_VALUE: &str = "LiveStatusQuotaColorCodex";
 const LIVE_STATUS_QUOTA_COLOR_CLAUDE_VALUE: &str = "LiveStatusQuotaColorClaude";
+const LIVE_STATUS_QUOTA_COLOR_QWEN_VALUE: &str = "LiveStatusQuotaColorQwen";
 const LIVE_STATUS_CORNER_RADIUS_VALUE: &str = "LiveStatusCornerRadius";
 const LIVE_STATUS_QUOTA_SETTINGS_OPEN_VALUE: &str = "LiveStatusQuotaSettingsOpen";
 const LIVE_STATUS_QUOTA_ORDER_VALUE: &str = "LiveStatusQuotaOrder";
@@ -194,6 +196,7 @@ fn provider_id_token(provider: crate::quota::ProviderId) -> &'static str {
         crate::quota::ProviderId::Agy => "Agi",
         crate::quota::ProviderId::Codex => "Codex",
         crate::quota::ProviderId::Claude => "Claude",
+        crate::quota::ProviderId::Qwen => "Qwen",
     }
 }
 
@@ -203,6 +206,7 @@ fn provider_id_from_token(token: &str) -> Option<crate::quota::ProviderId> {
         "Agi" => Some(crate::quota::ProviderId::Agy),
         "Codex" => Some(crate::quota::ProviderId::Codex),
         "Claude" => Some(crate::quota::ProviderId::Claude),
+        "Qwen" => Some(crate::quota::ProviderId::Qwen),
         _ => None,
     }
 }
@@ -213,6 +217,7 @@ pub fn default_quota_order() -> Vec<crate::quota::ProviderId> {
         crate::quota::ProviderId::Agy,
         crate::quota::ProviderId::Codex,
         crate::quota::ProviderId::Claude,
+        crate::quota::ProviderId::Qwen,
     ]
 }
 
@@ -406,6 +411,14 @@ pub fn set_live_status_quota_show_claude(show: bool) -> anyhow::Result<()> {
     write_bool_setting(LIVE_STATUS_QUOTA_SHOW_CLAUDE_VALUE, show)
 }
 
+pub fn live_status_quota_show_qwen() -> bool {
+    read_bool_setting(LIVE_STATUS_QUOTA_SHOW_QWEN_VALUE, true)
+}
+
+pub fn set_live_status_quota_show_qwen(show: bool) -> anyhow::Result<()> {
+    write_bool_setting(LIVE_STATUS_QUOTA_SHOW_QWEN_VALUE, show)
+}
+
 fn read_u32_setting(value_name: &str, default: u32) -> u32 {
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(KEY)
@@ -449,6 +462,14 @@ pub fn live_status_quota_color_claude() -> u8 {
 
 pub fn set_live_status_quota_color_claude(idx: u8) -> anyhow::Result<()> {
     write_u32_setting(LIVE_STATUS_QUOTA_COLOR_CLAUDE_VALUE, idx.min(9) as u32)
+}
+
+pub fn live_status_quota_color_qwen() -> u8 {
+    read_u32_setting(LIVE_STATUS_QUOTA_COLOR_QWEN_VALUE, 9).min(9) as u8
+}
+
+pub fn set_live_status_quota_color_qwen(idx: u8) -> anyhow::Result<()> {
+    write_u32_setting(LIVE_STATUS_QUOTA_COLOR_QWEN_VALUE, idx.min(9) as u32)
 }
 
 pub fn clamp_corner_radius(radius: u8) -> u8 {
@@ -516,6 +537,7 @@ mod tests {
             LIVE_STATUS_QUOTA_SHOW_AGI_VALUE,
             LIVE_STATUS_QUOTA_SHOW_CODEX_VALUE,
             LIVE_STATUS_QUOTA_SHOW_CLAUDE_VALUE,
+            LIVE_STATUS_QUOTA_SHOW_QWEN_VALUE,
         ];
         for (i, a) in keys.iter().enumerate() {
             for (j, b) in keys.iter().enumerate() {
@@ -533,6 +555,7 @@ mod tests {
             LIVE_STATUS_QUOTA_COLOR_AGI_VALUE,
             LIVE_STATUS_QUOTA_COLOR_CODEX_VALUE,
             LIVE_STATUS_QUOTA_COLOR_CLAUDE_VALUE,
+            LIVE_STATUS_QUOTA_COLOR_QWEN_VALUE,
         ];
         for (i, a) in keys.iter().enumerate() {
             for (j, b) in keys.iter().enumerate() {

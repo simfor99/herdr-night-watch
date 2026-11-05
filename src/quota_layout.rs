@@ -9,6 +9,7 @@ pub(crate) fn provider_slot(provider: ProviderId) -> u8 {
         ProviderId::Agy => 1,
         ProviderId::Codex => 2,
         ProviderId::Claude => 3,
+        ProviderId::Qwen => 4,
     }
 }
 
@@ -178,6 +179,7 @@ mod tests {
             provider_slot(ProviderId::Agy),
             provider_slot(ProviderId::Codex),
             provider_slot(ProviderId::Claude),
+            provider_slot(ProviderId::Qwen),
         ];
         for (index, slot) in slots.iter().enumerate() {
             assert_eq!(*slot, index as u8);
