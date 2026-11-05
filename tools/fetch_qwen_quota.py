@@ -160,7 +160,9 @@ class CdpSocket:
     """Minimal stdlib WebSocket client for one CDP request/response pair."""
 
     def __init__(self, host: str, port: int, path: str) -> None:
-        self._sock = socket.create_connection((host, port), timeout=8)
+        self._sock = socket.create_connection(
+            (host, port), timeout=max(0.5, min(8.0, budget_left()))
+        )
         key = base64.b64encode(os.urandom(16)).decode()
         handshake = (
             f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
@@ -284,7 +286,8 @@ def request(url: str, cookie: str, data: bytes | None = None) -> bytes:
     if data is not None:
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as response:
+    timeout = max(0.5, min(HTTP_TIMEOUT_SECONDS, budget_left()))
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.read()
 
 

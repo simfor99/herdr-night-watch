@@ -1121,6 +1121,16 @@ pub fn pacing_forecast_with_cycle_days(
     let now_hm = custom_time.unwrap_or_else(current_hm);
 
     let five_hour_forecast = calculate_five_hour_forecast(five_hour_percent, five_hour_reset, now_hm);
+    // Silent forecast paths must keep a session-window exhaustion visible.
+    let silent_health = if five_hour_forecast
+        .as_ref()
+        .map(|fh| fh.is_exhausted_before_reset)
+        .unwrap_or(false)
+    {
+        PacingHealth::Tight
+    } else {
+        PacingHealth::Surplus
+    };
 
     let rem_pct = week_percent.or(five_hour_percent).unwrap_or(100);
     let saved_reset = week_reset.map(|s| s.to_string());
@@ -1181,7 +1191,7 @@ pub fn pacing_forecast_with_cycle_days(
                 runway_days: None,
                 delta_days: None,
                 remaining_days: 0.0,
-                health: PacingHealth::Surplus,
+                health: silent_health,
                 badge_text: String::new(),
                 summary_text: String::new(),
                 five_hour_forecast,
@@ -1212,7 +1222,7 @@ pub fn pacing_forecast_with_cycle_days(
             runway_days: None,
             delta_days: None,
             remaining_days,
-            health: PacingHealth::Surplus,
+            health: silent_health,
             badge_text: String::new(),
             summary_text: String::new(),
             five_hour_forecast,
@@ -1239,7 +1249,7 @@ pub fn pacing_forecast_with_cycle_days(
             runway_days: None,
             delta_days: None,
             remaining_days,
-            health: PacingHealth::Surplus,
+            health: silent_health,
             badge_text: String::new(),
             summary_text: String::new(),
             five_hour_forecast,
@@ -1871,7 +1881,7 @@ pub fn update_snapshot_with_qwen_json(snapshot: &mut QuotaSnapshot, json_str: &s
 }
 
 #[cfg(windows)]
-pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
+pub fn fetch_live_snapshot(current: &QuotaSnapshot, show_qwen: bool) -> QuotaSnapshot {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
 
@@ -1950,19 +1960,23 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
 
     // The inference key cannot query the QwenCloud billing gateway, so the
     // fetcher uses console cookies and fails closed (no data, no card churn)
-    // when they are missing.
-    let qwen_json = Command::new("wsl.exe")
-        .creation_flags(CREATE_NO_WINDOW)
-        .arg("-d")
-        .arg(&distro)
-        .arg("--exec")
-        .arg("python3")
-        .arg("-c")
-        .arg(include_str!("../tools/fetch_qwen_quota.py"))
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success());
+    // when they are missing. Hidden providers skip the network entirely.
+    let qwen_json = if show_qwen {
+        Command::new("wsl.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .arg("-d")
+            .arg(&distro)
+            .arg("--exec")
+            .arg("python3")
+            .arg("-c")
+            .arg(include_str!("../tools/fetch_qwen_quota.py"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+    } else {
+        None
+    };
     update_snapshot_with_qwen_json(
         &mut updated,
         qwen_json
@@ -1977,7 +1991,7 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
 
 #[cfg(not(windows))]
 #[allow(dead_code)]
-pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
+pub fn fetch_live_snapshot(current: &QuotaSnapshot, show_qwen: bool) -> QuotaSnapshot {
     let mut updated = current.clone();
     if let Ok(output) = std::process::Command::new("/home/simon/.local/bin/agy")
         .args(["-p", "/usage"])
@@ -2020,13 +2034,17 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot) -> QuotaSnapshot {
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
             .unwrap_or("null"),
     );
-    let qwen_json = std::process::Command::new("python3")
-        .arg("-c")
-        .arg(include_str!("../tools/fetch_qwen_quota.py"))
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success());
+    let qwen_json = if show_qwen {
+        std::process::Command::new("python3")
+            .arg("-c")
+            .arg(include_str!("../tools/fetch_qwen_quota.py"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+    } else {
+        None
+    };
     update_snapshot_with_qwen_json(
         &mut updated,
         qwen_json
@@ -2157,6 +2175,17 @@ mod tests {
         assert_eq!(claude.five_hour_reset, None);
         assert_eq!(claude.week_reset, None);
         assert!(!claude.is_throttled);
+    }
+
+    #[test]
+    fn provider_count_matches_the_baseline_card_set() {
+        assert_eq!(PROVIDER_COUNT, QuotaSnapshot::measured_baseline().providers.len());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provider_count_matches_the_default_order() {
+        assert_eq!(PROVIDER_COUNT, crate::window_settings::default_quota_order().len());
     }
 
     #[test]

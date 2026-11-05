@@ -2031,8 +2031,10 @@ impl LiveStatusApp {
         self.last_quota_fetch = Some(Instant::now());
         let sender = self.quota_tx.clone();
         let snapshot = self.quota_snapshot.clone();
+        // A hidden Qwen card never reaches the network or the agent Chrome.
+        let show_qwen = self.quota_show_qwen;
         thread::spawn(move || {
-            let updated = crate::quota::fetch_live_snapshot(&snapshot);
+            let updated = crate::quota::fetch_live_snapshot(&snapshot, show_qwen);
             let _ = sender.send(updated);
         });
     }
