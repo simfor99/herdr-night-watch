@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -100,6 +102,38 @@ class QwenUsagePipelineTests(unittest.TestCase):
         ) as gateway:
             self.assertIsNone(qwen_quota.usage_with_cookie("cookie"))
             gateway.assert_not_called()
+
+    def test_watchdog_hard_stops_a_blocking_run(self) -> None:
+        # A peer that keeps the connection open past the global budget must
+        # take the whole process down at the budget deadline - including time
+        # already spent before main() (the pre-fix grace timer survived that).
+        module_dir = os.path.dirname(os.path.abspath(qwen_quota.__file__))
+        lines = [
+            "import sys, time",
+            f"sys.path.insert(0, {module_dir!r})",
+            "import fetch_qwen_quota as q",
+            # 16 of the 20 budget seconds were already spent before main().
+            "q._BUDGET_START = time.monotonic() - 16.0",
+            "import socket",
+            "def slow_connect(self, address, timeout=None):",
+            "    time.sleep(30)",
+            "    raise OSError('connect blocked')",
+            "socket.socket.connect = slow_connect",
+            "q.main()",
+        ]
+        code = "\n".join(lines)
+        env = {**os.environ, "HOME": str(self.home), "QWEN_CLOUD_COOKIE": ""}
+        start = time.monotonic()
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, timeout=40, env=env
+        )
+        elapsed = time.monotonic() - start
+        # Four budget seconds remain at main() start, so the watchdog must
+        # kill the process at ~4 s - well before the 30 s block ends. The old
+        # grace formula (budget + 2 s counted from main entry) would have
+        # slept the full 30 s and only then exited.
+        self.assertLess(elapsed, 20.0, f"watchdog let the run last {elapsed:.1f}s")
+        self.assertEqual(result.returncode, 1, result.stderr[-400:].decode(errors="replace"))
 
     def test_cdp_read_stops_at_the_global_budget(self) -> None:
         # A slow-drip peer that keeps trickling bytes inside each per-recv

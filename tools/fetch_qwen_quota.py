@@ -420,8 +420,10 @@ def usage_with_cookie(cookie: str) -> dict | None:
 def main() -> int:
     # Hard watchdog: no blocking HTTP or CDP read may outlive the promised
     # budget; the Rust caller waits for this process and refreshes every
-    # provider sequentially. Fail closed with no stdout.
-    watchdog = threading.Timer(TOTAL_BUDGET_SECONDS + 2.0, lambda: os._exit(1))
+    # provider sequentially. The timer fires at the exact end of the global
+    # budget (measured from module import), not main() entry plus grace.
+    # Fail closed with no stdout.
+    watchdog = threading.Timer(max(0.1, budget_left()), lambda: os._exit(1))
     watchdog.daemon = True
     watchdog.start()
     cookie = os.environ.get("QWEN_CLOUD_COOKIE", "").strip() or read_cookie_file()
