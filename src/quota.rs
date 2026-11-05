@@ -39,6 +39,11 @@ pub enum ProviderId {
     Qwen,
 }
 
+/// Number of providers the settings tab can ever list. Keep in sync with
+/// `ProviderId`; the satellite height derives from this so a newly added
+/// provider never clips off-screen.
+pub const PROVIDER_COUNT: usize = 5;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProviderQuota {
     pub id: ProviderId,

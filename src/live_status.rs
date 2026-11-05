@@ -1809,7 +1809,16 @@ impl LiveStatusApp {
             }
         }
         if let Some(sat_hwnd) = self.satellite_hwnd {
-            let sat_h = self.last_synced_sat_height.unwrap_or(SETTINGS_OPEN_DESIGN_HEIGHT);
+            // Startup fallback mirrors the live formula so a settings window
+            // recreated before the first height sync never gets the old
+            // four-row height.
+            let sat_h = self.last_synced_sat_height.unwrap_or_else(|| {
+                quota_satellite_design_height(
+                    &[],
+                    self.quota_settings_open,
+                    self.quota_minimize_depleted,
+                )
+            });
             window_chrome::sync_satellite_size(sat_hwnd, sat_h, self.main_hwnd, r, is_docked);
             window_chrome::ensure_window_chrome_synced(sat_hwnd, op, self.window_level);
             if !taskbar::is_satellite_exempt_synced(sat_hwnd) {
@@ -2888,7 +2897,12 @@ fn provider_card_height(quota: &ProviderQuota, minimize_depleted: bool) -> f32 {
 }
 
 /// Shared so the startup fallback cannot drift from the real layout.
+/// Historical value: calibrated for exactly four provider rows.
 const SETTINGS_OPEN_DESIGN_HEIGHT: f32 = 350.0;
+/// Fixed chrome above the provider rows (titlebar, tab bar, gap, min-toggle)
+/// plus bottom padding, and one provider row with its gap.
+const SETTINGS_ROWS_BASE_HEIGHT: f32 = 106.0;
+const SETTINGS_ROW_PITCH: f32 = 61.0;
 
 fn quota_satellite_design_height(
     visible_providers: &[ProviderQuota],
@@ -2896,7 +2910,10 @@ fn quota_satellite_design_height(
     minimize_depleted: bool,
 ) -> f32 {
     if settings_open {
-        return SETTINGS_OPEN_DESIGN_HEIGHT;
+        // The ⚡-Limits tab always lists every configured provider, hidden
+        // ones included; a fixed height clipped the fifth row's swatches.
+        let rows = crate::quota::PROVIDER_COUNT.max(4) as f32;
+        return (SETTINGS_ROWS_BASE_HEIGHT + rows * SETTINGS_ROW_PITCH).max(SETTINGS_OPEN_DESIGN_HEIGHT);
     }
     if visible_providers.is_empty() {
         return 38.0 + 42.0 + 8.0;
@@ -10414,9 +10431,11 @@ mod tests {
 
     #[test]
     fn test_quota_satellite_design_height() {
-        assert_eq!(quota_satellite_design_height(&[], true, false), 350.0);
+        // Settings tab grows with the configured provider count:
+        // 106 base + 5 rows * 61 (row 56 + gap 5) = 411.
+        assert_eq!(quota_satellite_design_height(&[], true, false), 411.0);
         assert_eq!(quota_satellite_design_height(&[], false, false), 88.0);
-        assert_eq!(quota_satellite_design_height(&[], true, true), 350.0);
+        assert_eq!(quota_satellite_design_height(&[], true, true), 411.0);
 
         let glm = ProviderQuota::new(ProviderId::Glm, "GLM", "Z.ai", None, None, Some(90), Some("01.10.".into()));
         assert_eq!(provider_card_height(&glm, false), 68.0);
