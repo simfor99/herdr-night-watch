@@ -194,9 +194,130 @@ class ClaudeQuotaOauthFallbackTests(unittest.TestCase):
             claude_quota.read_quota(now=self.now + claude_quota.OAUTH_MAX_AGE_SECONDS + 1)
             self.assertEqual(mocked.call_count, 2)
 
-        stored = json.loads(claude_quota.state_path().read_text(encoding="utf-8"))
-        self.assertEqual(stored.get("source"), "oauth")
+        stored = json.loads(claude_quota.oauth_state_path().read_text(encoding="utf-8"))
+        # Der letzte Refresh nach TTL-Ablauf hat den Zeitstempel erneuert.
+        self.assertEqual(
+            stored.get("captured_at"),
+            self.now + claude_quota.OAUTH_MAX_AGE_SECONDS + 1,
+        )
         self.assertNotIn("fresh-token", json.dumps(stored))
+
+    def test_drained_week_from_oauth_overrides_fresh_statusline_capture(self) -> None:
+        # Regressionsfall 2026-11-09: Die Karte zeigte stundenlang "2% übrig"
+        # aus einem frischen Status-Line-Capture (98% verbraucht), obwohl das
+        # Wochenlimit bereits aufgebraucht war und der offizielle Endpoint
+        # 100% utilization meldete - aufgebrauchte Limits stoppen genau die
+        # Sessions, die neue Captures liefern würden.
+        claude_quota.capture_statusline_payload(
+            {
+                "rate_limits": {
+                    "seven_day": {"used_percentage": 98, "resets_at": self.now + 86400}
+                }
+            },
+            now=self.now,
+        )
+        drained = patch.object(
+            claude_quota,
+            "fetch_oauth_windows",
+            return_value={"week": {"used_percentage": 100.0, "resets_at": self.now + 86400}},
+        )
+        with drained:
+            self.assertEqual(
+                claude_quota.read_quota(now=self.now + 60),
+                {"week": {"used_percentage": 100.0, "resets_at": self.now + 86400}},
+            )
+
+    def test_oauth_failure_falls_back_to_fresh_statusline_capture(self) -> None:
+        claude_quota.capture_statusline_payload(
+            {
+                "rate_limits": {
+                    "seven_day": {"used_percentage": 98, "resets_at": self.now + 86400}
+                }
+            },
+            now=self.now,
+        )
+        with patch.object(claude_quota, "fetch_oauth_windows", return_value=None):
+            self.assertEqual(
+                claude_quota.read_quota(now=self.now + 60),
+                {"week": {"used_percentage": 98, "resets_at": self.now + 86400}},
+            )
+
+    def test_oauth_failure_prefers_newer_expired_ttl_oauth_over_older_statusline(self) -> None:
+        # CodeRabbit-Befund 2026-11-09: Im Fehlerpfad (Netz/Ausfall) darf ein
+        # aelterer Statuszeilen-Capture nicht den neueren OAuth-Stand ueberdecken,
+        # sonst zeigt die Karte nach einem aufgebrauchten Limit wieder den alten
+        # Vorabbefund (z.B. 98% statt 100%).
+        with patch.object(
+            claude_quota,
+            "fetch_oauth_windows",
+            return_value={"week": {"used_percentage": 100.0, "resets_at": self.now + 86400}},
+        ):
+            claude_quota.read_quota(now=self.now)  # fuellt den OAuth-Cache
+        claude_quota.capture_statusline_payload(
+            {
+                "rate_limits": {
+                    "seven_day": {"used_percentage": 98, "resets_at": self.now + 86400}
+                }
+            },
+            now=self.now - 3 * 60 * 60,  # deutlich aelter als der OAuth-Stand
+        )
+
+        beyond_ttl = self.now + claude_quota.OAUTH_MAX_AGE_SECONDS + 60
+        with patch.object(claude_quota, "fetch_oauth_windows", return_value=None):
+            self.assertEqual(
+                claude_quota.read_quota(now=beyond_ttl),
+                {"week": {"used_percentage": 100.0, "resets_at": self.now + 86400}},
+            )
+
+    def test_expired_oauth_windows_let_a_fresh_statusline_capture_win(self) -> None:
+        with patch.object(
+            claude_quota,
+            "fetch_oauth_windows",
+            return_value={"week": {"used_percentage": 100.0, "resets_at": self.now + 600}},
+        ):
+            claude_quota.read_quota(now=self.now)
+        claude_quota.capture_statusline_payload(
+            {
+                "rate_limits": {
+                    "seven_day": {"used_percentage": 42, "resets_at": self.now + 86400}
+                }
+            },
+            now=self.now + 30,
+        )
+
+        after_reset = self.now + 700  # OAuth-Fenster (reset +600) ist zu
+        with patch.object(claude_quota, "fetch_oauth_windows", return_value=None):
+            self.assertEqual(
+                claude_quota.read_quota(now=after_reset),
+                {"week": {"used_percentage": 42, "resets_at": self.now + 86400}},
+            )
+
+    def test_statusline_capture_does_not_touch_the_oauth_cache(self) -> None:
+        with patch.object(
+            claude_quota,
+            "fetch_oauth_windows",
+            return_value={"week": {"used_percentage": 100.0, "resets_at": self.now + 86400}},
+        ):
+            claude_quota.read_quota(now=self.now)
+        before = claude_quota.oauth_state_path().read_text(encoding="utf-8")
+
+        claude_quota.capture_statusline_payload(
+            {
+                "rate_limits": {
+                    "seven_day": {"used_percentage": 55, "resets_at": self.now + 86400}
+                }
+            },
+            now=self.now + 30,
+        )
+
+        self.assertEqual(
+            claude_quota.oauth_state_path().read_text(encoding="utf-8"), before
+        )
+        stored = json.loads(claude_quota.state_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            stored.get("rate_limits"),
+            {"week": {"used_percentage": 55, "resets_at": self.now + 86400}},
+        )
 
 
 if __name__ == "__main__":

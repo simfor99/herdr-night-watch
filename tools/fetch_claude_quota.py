@@ -18,19 +18,29 @@ import urllib.request
 
 MAX_AGE_SECONDS = 24 * 60 * 60
 WINDOWS = {"five_hour": "five_hour", "seven_day": "week"}
-# OAuth fallback: active status-line captures only arrive from first-party
-# Claude sessions. When every session runs through a proxy profile (ccqwen,
-# ccglm), the widget would show nothing although the local Claude Code
-# credentials can answer the official usage endpoint directly.
+# OAuth usage is the primary source: a drained weekly limit stops the very
+# Claude sessions whose status lines would refresh the capture, so a pure
+# status-line cache freezes at the last pre-drain value (observed 2026-11-09:
+# the card kept showing 2% left for hours while the official endpoint already
+# reported 100% utilization). Status-line captures remain the 24h fallback for
+# environments without stored Claude Code credentials.
 OAUTH_MAX_AGE_SECONDS = 10 * 60
 OAUTH_WINDOWS = {"five_hour": "five_hour", "seven_day": "week"}
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
 
-def state_path() -> Path:
+def state_dir() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
     base = Path(state_home) if state_home else Path.home() / ".local" / "state"
-    return base / "herdr-night-watch" / "claude-quota.json"
+    return base / "herdr-night-watch"
+
+
+def state_path() -> Path:
+    return state_dir() / "claude-quota.json"
+
+
+def oauth_state_path() -> Path:
+    return state_dir() / "claude-quota-oauth.json"
 
 
 def valid_number(value: Any) -> bool:
@@ -66,24 +76,15 @@ def clean_rate_limits(rate_limits: Any, now: float) -> dict[str, dict[str, int |
     return cleaned
 
 
-def capture_statusline_payload(
-    payload: Any, now: float | None = None, source: str | None = None
-) -> bool:
-    if not isinstance(payload, dict) or "rate_limits" not in payload:
-        return False
-    observed_at = dt.datetime.now(dt.timezone.utc).timestamp() if now is None else now
-    windows = clean_rate_limits(payload.get("rate_limits"), observed_at)
-    if not windows:
-        return False
-
-    destination = state_path()
+def _store_windows(
+    destination: Path, windows: dict[str, dict[str, int | float]], observed_at: float
+) -> None:
+    """Persist one capture atomically with private permissions."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     file_descriptor, temporary_name = tempfile.mkstemp(
         prefix=".claude-quota-", dir=destination.parent
     )
     record: dict[str, Any] = {"captured_at": observed_at, "rate_limits": windows}
-    if source:
-        record["source"] = source
     try:
         os.fchmod(file_descriptor, 0o600)
         with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
@@ -102,6 +103,43 @@ def capture_statusline_payload(
         except OSError:
             pass
         raise
+
+
+def _read_cached_entry(
+    path: Path, now: float, max_age: float
+) -> tuple[float, dict[str, dict[str, int | float]]] | None:
+    """Return (captured_at, windows) for a cache with still-open windows."""
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(cached, dict):
+        return None
+    captured_at = cached.get("captured_at")
+    if not valid_number(captured_at) or not 0 <= now - captured_at <= max_age:
+        return None
+    windows = clean_rate_limits(cached.get("rate_limits"), now)
+    if not windows:
+        return None
+    return captured_at, windows
+
+
+def _read_cached_windows(
+    path: Path, now: float, max_age: float
+) -> dict[str, dict[str, int | float]] | None:
+    """Return only the windows of a fresh-enough cache capture."""
+    entry = _read_cached_entry(path, now, max_age)
+    return entry[1] if entry else None
+
+
+def capture_statusline_payload(payload: Any, now: float | None = None) -> bool:
+    if not isinstance(payload, dict) or "rate_limits" not in payload:
+        return False
+    observed_at = dt.datetime.now(dt.timezone.utc).timestamp() if now is None else now
+    windows = clean_rate_limits(payload.get("rate_limits"), observed_at)
+    if not windows:
+        return False
+    _store_windows(state_path(), windows, observed_at)
     return True
 
 
@@ -178,35 +216,44 @@ def fetch_oauth_windows(now: float) -> dict[str, dict[str, int | float]] | None:
 
 
 def read_quota(now: float | None = None) -> dict[str, dict[str, int | float]] | None:
+    """Return the freshest trustworthy windows.
+
+    The official usage endpoint answers first (rate-limited by its own
+    10-minute cache); a fresh-enough status-line capture is only consulted
+    when OAuth cannot deliver (no stored credentials, network down).
+    """
     current_time = dt.datetime.now(dt.timezone.utc).timestamp() if now is None else now
-    try:
-        with state_path().open(encoding="utf-8") as handle:
-            cached = json.load(handle)
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        cached = None
 
-    if isinstance(cached, dict):
-        captured_at = cached.get("captured_at")
-        oauth_sourced = cached.get("source") == "oauth"
-        max_age = OAUTH_MAX_AGE_SECONDS if oauth_sourced else MAX_AGE_SECONDS
-        if valid_number(captured_at) and 0 <= current_time - captured_at <= max_age:
-            windows = clean_rate_limits(cached.get("rate_limits"), current_time)
-            # An OAuth capture refreshes itself; only its windows expire.
-            if windows or not oauth_sourced:
-                return windows or None
+    cached_oauth = _read_cached_windows(
+        oauth_state_path(), current_time, OAUTH_MAX_AGE_SECONDS
+    )
+    if cached_oauth:
+        return cached_oauth
 
-    # No usable status-line cache: ask the official usage endpoint with the
-    # local Claude Code OAuth credentials and persist the answer briefly.
     windows = fetch_oauth_windows(current_time)
-    if windows is None:
-        return None
-    try:
-        capture_statusline_payload(
-            {"rate_limits": windows}, now=current_time, source="oauth"
+    if windows is not None:
+        try:
+            _store_windows(oauth_state_path(), windows, current_time)
+        except OSError:
+            pass
+        return windows
+
+    # OAuth unavailable (network down, rate limit, expired token): fall back
+    # to the freshest honest capture. An expired-TTL OAuth answer with
+    # still-open windows can be hours newer than any status-line capture and
+    # must not be shadowed by it, or a drained week would resurface as the
+    # old pre-drain percentage (CodeRabbit finding, 2026-11-09).
+    candidates = [
+        entry
+        for entry in (
+            _read_cached_entry(oauth_state_path(), current_time, MAX_AGE_SECONDS),
+            _read_cached_entry(state_path(), current_time, MAX_AGE_SECONDS),
         )
-    except OSError:
-        pass
-    return windows
+        if entry is not None
+    ]
+    if candidates:
+        return max(candidates, key=lambda entry: entry[0])[1]
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
