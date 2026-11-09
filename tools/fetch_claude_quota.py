@@ -79,6 +79,7 @@ def clean_rate_limits(rate_limits: Any, now: float) -> dict[str, dict[str, int |
 def _store_windows(
     destination: Path, windows: dict[str, dict[str, int | float]], observed_at: float
 ) -> None:
+    """Persist one capture atomically with private permissions."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     file_descriptor, temporary_name = tempfile.mkstemp(
         prefix=".claude-quota-", dir=destination.parent
@@ -104,9 +105,10 @@ def _store_windows(
         raise
 
 
-def _read_cached_windows(
+def _read_cached_entry(
     path: Path, now: float, max_age: float
-) -> dict[str, dict[str, int | float]] | None:
+) -> tuple[float, dict[str, dict[str, int | float]]] | None:
+    """Return (captured_at, windows) for a cache with still-open windows."""
     try:
         cached = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -116,7 +118,18 @@ def _read_cached_windows(
     captured_at = cached.get("captured_at")
     if not valid_number(captured_at) or not 0 <= now - captured_at <= max_age:
         return None
-    return clean_rate_limits(cached.get("rate_limits"), now) or None
+    windows = clean_rate_limits(cached.get("rate_limits"), now)
+    if not windows:
+        return None
+    return captured_at, windows
+
+
+def _read_cached_windows(
+    path: Path, now: float, max_age: float
+) -> dict[str, dict[str, int | float]] | None:
+    """Return only the windows of a fresh-enough cache capture."""
+    entry = _read_cached_entry(path, now, max_age)
+    return entry[1] if entry else None
 
 
 def capture_statusline_payload(payload: Any, now: float | None = None) -> bool:
@@ -225,7 +238,22 @@ def read_quota(now: float | None = None) -> dict[str, dict[str, int | float]] | 
             pass
         return windows
 
-    return _read_cached_windows(state_path(), current_time, MAX_AGE_SECONDS)
+    # OAuth unavailable (network down, rate limit, expired token): fall back
+    # to the freshest honest capture. An expired-TTL OAuth answer with
+    # still-open windows can be hours newer than any status-line capture and
+    # must not be shadowed by it, or a drained week would resurface as the
+    # old pre-drain percentage (CodeRabbit finding, 2026-11-09).
+    candidates = [
+        entry
+        for entry in (
+            _read_cached_entry(oauth_state_path(), current_time, MAX_AGE_SECONDS),
+            _read_cached_entry(state_path(), current_time, MAX_AGE_SECONDS),
+        )
+        if entry is not None
+    ]
+    if candidates:
+        return max(candidates, key=lambda entry: entry[0])[1]
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
