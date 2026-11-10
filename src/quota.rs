@@ -1106,6 +1106,120 @@ pub fn pacing_forecast_for(
     )
 }
 
+/// Traffic-light decision for one limit line, extracted from the satellite
+/// renderer so it is unit-testable with the exact inputs the app sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunwayLight {
+    pub color: RunwayColor,
+    pub red: bool,
+    pub yellow: bool,
+}
+
+/// The four traffic-light states a limit line can render, gray for an
+/// unusable (throttled) provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunwayColor {
+    Gray,
+    Red,
+    Yellow,
+    Green,
+}
+
+impl RunwayColor {
+    /// RGB triple matching the satellite's pastel traffic-light palette.
+    pub fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            RunwayColor::Gray => (148, 163, 184),
+            RunwayColor::Red => (252, 165, 165),
+            RunwayColor::Yellow => (253, 224, 71),
+            RunwayColor::Green => (120, 184, 134),
+        }
+    }
+}
+
+pub fn runway_light(
+    is_throttled: bool,
+    pct: u8,
+    is_five_hour: bool,
+    forecast: &PacingForecast,
+) -> RunwayLight {
+    let light = |color: RunwayColor, red: bool, yellow: bool| RunwayLight { color, red, yellow };
+    if is_throttled {
+        return light(RunwayColor::Gray, false, false);
+    }
+    if pct == 0 {
+        return light(RunwayColor::Red, true, false);
+    }
+    if is_five_hour {
+        if let Some(fh) = &forecast.five_hour_forecast {
+            if fh.is_exhausted_before_reset {
+                let def = fh.delta_minutes.unwrap_or(0);
+                return if def < -45 {
+                    light(RunwayColor::Red, true, false)
+                } else {
+                    light(RunwayColor::Yellow, false, true)
+                };
+            }
+            return if pct < 20 || (pct < 30 && fh.pace_ratio > 1.15) {
+                light(RunwayColor::Yellow, false, true)
+            } else {
+                light(RunwayColor::Green, false, false)
+            };
+        }
+        return if pct < 20 {
+            light(RunwayColor::Yellow, false, true)
+        } else {
+            light(RunwayColor::Green, false, false)
+        };
+    }
+    let diff_days = forecast.runway_days.map(|rw| rw - forecast.remaining_days);
+    let shielded = forecast.week_deficit_shielded(pct);
+    if pct < 10 {
+        return light(RunwayColor::Red, true, false);
+    }
+    if let Some(diff) = diff_days {
+        if diff < -0.85 && !shielded {
+            return light(RunwayColor::Red, true, false);
+        }
+        if diff < -0.04 {
+            return light(RunwayColor::Yellow, false, true);
+        }
+        if pct < 15 || (pct < 25 && forecast.pace_ratio.map_or(false, |r| r > 1.15)) {
+            return light(RunwayColor::Yellow, false, true);
+        }
+        return light(RunwayColor::Green, false, false);
+    }
+    if pct < 20 {
+        return light(RunwayColor::Yellow, false, true);
+    }
+    light(RunwayColor::Green, false, false)
+}
+
+/// Pace-line color: it inherits the runway alert, and otherwise follows the
+/// pace ratio itself (green under 1.0, yellow to 1.25, red above).
+pub fn pace_light(
+    is_throttled: bool,
+    pct: u8,
+    runway: &RunwayLight,
+    pace_ratio: Option<f32>,
+) -> RunwayColor {
+    if is_throttled {
+        return RunwayColor::Gray;
+    }
+    if pct == 0 || runway.red {
+        return RunwayColor::Red;
+    }
+    if runway.yellow {
+        return RunwayColor::Yellow;
+    }
+    match pace_ratio {
+        Some(ratio) if ratio < 1.0 => RunwayColor::Green,
+        Some(ratio) if ratio <= 1.25 => RunwayColor::Yellow,
+        Some(_) => RunwayColor::Red,
+        None => RunwayColor::Gray,
+    }
+}
+
 pub fn pacing_forecast_with_cycle_days(
     is_throttled: bool,
     week_percent: Option<u8>,
@@ -2495,6 +2609,142 @@ mod tests {
 
         let (year, month, day, _, _, _) = current_local_datetime();
         assert_eq!(current_forecast_today(), (year as i32, month, day));
+    }
+
+    #[test]
+    fn glm_satellite_lines_light_correctly_2026_11_10() {
+        // Live satellite 10.11.2026 12:06: run the real snapshot update, then
+        // the real extracted lights for both rendered lines.
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_glm_json(
+            &mut snapshot,
+            r#"{"code":200,"data":{"limits":[
+                {"type":"TIME_LIMIT","unit":5,"number":1,"usage":4000,"currentValue":21,"remaining":3979,"percentage":1,"nextResetTime":1796139274996},
+                {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":89,"nextResetTime":1794310620069}
+            ]},"success":true}"#,
+        );
+        let glm = snapshot.get(ProviderId::Glm).expect("GLM present");
+        let mut fc = pacing_forecast_with_cycle_days(
+            glm.is_throttled,
+            glm.week_percent,
+            glm.week_reset.as_deref(),
+            glm.five_hour_percent,
+            glm.five_hour_reset.as_deref(),
+            glm.cycle_days,
+            glm.week_consumed_pct,
+            Some((2026, 11, 10)),
+            Some((12, 6)),
+        );
+        // The five-hour forecast is time-of-day based; pin it to the capture
+        // (11 % remaining, reset 12:37 at 12:06) regardless of host timezone.
+        fc.five_hour_forecast = calculate_five_hour_forecast(Some(11), Some("12:37"), (12, 6));
+        let month = runway_light(glm.is_throttled, glm.week_percent.unwrap_or(100), false, &fc);
+        let five = runway_light(glm.is_throttled, glm.five_hour_percent.unwrap_or(100), true, &fc);
+        assert_eq!(
+            month.color,
+            RunwayColor::Green,
+            "month line at 99 % with >30 d reserve must be green, diff={:?}",
+            fc.runway_days.map(|rw| rw - fc.remaining_days)
+        );
+        assert_eq!(
+            five.color,
+            RunwayColor::Yellow,
+            "five-hour line at 11 % remaining stays a low-balance warning"
+        );
+    }
+
+    #[test]
+    fn runway_light_keeps_week_and_five_hour_scenarios() {
+        let mut fc = PacingForecast {
+            pace_ratio: Some(1.19),
+            runway_days: Some(2.4),
+            delta_days: Some(-1),
+            remaining_days: 3.5,
+            health: PacingHealth::Tight,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast: None,
+            week_exhaustion_date: Some((12, 11)),
+            reset_str: None,
+            today: (2026, 11, 10),
+        };
+        // AGY weekly: severe deficit, 41 % remaining is under the 50 % shield.
+        assert_eq!(runway_light(false, 41, false, &fc).color, RunwayColor::Red);
+        // Codex weekly: 17 % remaining with a positive buffer renders green.
+        fc.pace_ratio = Some(0.96);
+        fc.runway_days = Some(1.3);
+        fc.remaining_days = 1.0;
+        assert_eq!(runway_light(false, 17, false, &fc).color, RunwayColor::Green);
+        // AGY five-hour: 98 % remaining, runway outlives the reset.
+        fc.five_hour_forecast = Some(FiveHourForecast {
+            burn_rate: 0.1,
+            pace_ratio: 0.6,
+            runway_minutes: Some(1200),
+            delta_minutes: Some(191),
+            exhaustion_time: Some((20, 40)),
+            reset_time: (17, 29),
+            is_exhausted_before_reset: false,
+        });
+        assert_eq!(runway_light(false, 98, true, &fc).color, RunwayColor::Green);
+        // Throttled provider: gray everywhere.
+        assert_eq!(runway_light(true, 0, false, &fc).color, RunwayColor::Gray);
+        assert_eq!(pace_light(true, 0, &runway_light(true, 0, false, &fc), Some(0.5)), RunwayColor::Gray);
+    }
+
+    #[test]
+    fn runway_light_boundary_flags_match_thresholds() {
+        // CodeRabbit inline 4524790892: pct >= 50 with a diff between -0.85
+        // and -0.04 must be yellow with ONLY the yellow flag set; pct < 10
+        // with diff == -0.85 must be red with ONLY the red flag set.
+        let mut fc = PacingForecast {
+            pace_ratio: None,
+            runway_days: Some(4.5),
+            delta_days: Some(0),
+            remaining_days: 5.0,
+            health: PacingHealth::Tight,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast: None,
+            week_exhaustion_date: None,
+            reset_str: None,
+            today: (2026, 11, 10),
+        };
+        let moderate = runway_light(false, 80, false, &fc); // diff = -0.5
+        assert_eq!(moderate.color, RunwayColor::Yellow);
+        assert!(!moderate.red && moderate.yellow);
+
+        fc.runway_days = Some(4.15); // diff = -0.85
+        fc.pace_ratio = Some(2.0); // defeats the shield at pct < 50 anyway
+        let edge = runway_light(false, 9, false, &fc);
+        assert_eq!(edge.color, RunwayColor::Red);
+        assert!(edge.red && !edge.yellow);
+    }
+
+    #[test]
+    fn pace_light_boundary_matches_ratio_thresholds() {
+        // CodeRabbit inline 4524790907: with a clean (green) runway and
+        // pct 100, pace None is gray, 1.0 and 1.25 are yellow; the
+        // implementation stays untouched.
+        let mut fc = PacingForecast {
+            pace_ratio: None,
+            runway_days: Some(900.0),
+            delta_days: Some(0),
+            remaining_days: 21.0,
+            health: PacingHealth::Surplus,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast: None,
+            week_exhaustion_date: None,
+            reset_str: None,
+            today: (2026, 11, 10),
+        };
+        let green = runway_light(false, 100, false, &fc);
+        assert_eq!(green.color, RunwayColor::Green);
+        assert_eq!(pace_light(false, 100, &green, None), RunwayColor::Gray);
+        assert_eq!(pace_light(false, 100, &green, Some(1.0)), RunwayColor::Yellow);
+        fc.pace_ratio = Some(1.25);
+        let green2 = runway_light(false, 100, false, &fc);
+        assert_eq!(pace_light(false, 100, &green2, Some(1.25)), RunwayColor::Yellow);
     }
 
     #[test]
