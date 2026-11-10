@@ -24,7 +24,8 @@ profile held a dead ticket that would have clobbered a live manual export
 under the old 6-hour age gate).
 
 Output on stdout: {"five_hour"|"month"|"week": {"remaining_percent": int,
-"reset_epoch": int}, ...}. The live Token Plan payload is polled for
+"consumed_percent": float, "reset_epoch": int}, ...}; the month window
+additionally carries cycle_days. The live Token Plan payload is polled for
 per5Hour*, per1Month* and per1Week* fields; only windows the account really
 reports are emitted. Fail-closed: missing, expired or rejected credentials
 exit non-zero without stdout, so the card shows no stale values.

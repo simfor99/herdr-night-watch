@@ -188,7 +188,14 @@ class QwenUsagePipelineTests(unittest.TestCase):
         def forbidden_cdp_refresh() -> None:
             raise AssertionError("CDP must not run while the stored cookie authenticates")
 
+        # In-process main() would otherwise arm the real process-wide kill
+        # watchdog (os._exit timer, ~20 s after import) and can terminate the
+        # whole pytest run on slow hosts. Neutralise the budget here; the
+        # watchdog itself keeps its subprocess coverage in
+        # test_watchdog_hard_stops_a_blocking_run.
         with patch.dict(os.environ, {"QWEN_CLOUD_COOKIE": ""}), patch.object(
+            qwen_quota, "budget_left", lambda: 3600.0
+        ), patch.object(
             qwen_quota, "usage_with_cookie", side_effect=fake_usage
         ), patch.object(qwen_quota, "cookies_via_cdp", forbidden_cdp_refresh):
             self.assertEqual(qwen_quota.main(), 0)
@@ -211,7 +218,14 @@ class QwenUsagePipelineTests(unittest.TestCase):
                 }
             return None
 
+        # In-process main() would otherwise arm the real process-wide kill
+        # watchdog (os._exit timer, ~20 s after import) and can terminate the
+        # whole pytest run on slow hosts. Neutralise the budget here; the
+        # watchdog itself keeps its subprocess coverage in
+        # test_watchdog_hard_stops_a_blocking_run.
         with patch.dict(os.environ, {"QWEN_CLOUD_COOKIE": ""}), patch.object(
+            qwen_quota, "budget_left", lambda: 3600.0
+        ), patch.object(
             qwen_quota, "usage_with_cookie", side_effect=fake_usage
         ), patch.object(
             qwen_quota, "cookies_via_cdp", lambda: "login_qwencloud_ticket=fresh"
@@ -229,7 +243,14 @@ class QwenUsagePipelineTests(unittest.TestCase):
         # debug-profile ticket may be tried once but must never replace the
         # live manual export in the file.
         qwen_quota.write_cookie_file("login_qwencloud_ticket=manual-live")
+        # In-process main() would otherwise arm the real process-wide kill
+        # watchdog (os._exit timer, ~20 s after import) and can terminate the
+        # whole pytest run on slow hosts. Neutralise the budget here; the
+        # watchdog itself keeps its subprocess coverage in
+        # test_watchdog_hard_stops_a_blocking_run.
         with patch.dict(os.environ, {"QWEN_CLOUD_COOKIE": ""}), patch.object(
+            qwen_quota, "budget_left", lambda: 3600.0
+        ), patch.object(
             qwen_quota, "usage_with_cookie", lambda cookie: None
         ), patch.object(
             qwen_quota, "cookies_via_cdp",
