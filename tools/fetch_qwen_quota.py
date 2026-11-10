@@ -15,8 +15,17 @@ Cookie sources, tried in order (values are never printed or logged):
      --remote-debugging-port=9222): Storage.getCookies pulls the HttpOnly
      session cookies and persists them for the pure-HTTP path afterwards.
 
+The cookie file is tried first regardless of its age; the CDP refresh and
+its rewrite of the file only run when authentication fails, and a CDP cookie
+is written back only after it provably returned usage data. A manually
+exported session therefore stays usable until it genuinely stops working
+(verified 2026-11-06: during the QwenCloud maintenance outage the debug
+profile held a dead ticket that would have clobbered a live manual export
+under the old 6-hour age gate).
+
 Output on stdout: {"five_hour"|"month"|"week": {"remaining_percent": int,
-"reset_epoch": int}, ...}. The live Token Plan payload is polled for
+"consumed_percent": float, "reset_epoch": int}, ...}; the month window
+additionally carries cycle_days. The live Token Plan payload is polled for
 per5Hour*, per1Month* and per1Week* fields; only windows the account really
 reports are emitted. Fail-closed: missing, expired or rejected credentials
 exit non-zero without stdout, so the card shows no stale values.
@@ -60,7 +69,6 @@ def out_of_budget() -> bool:
     return budget_left() <= 1.0
 
 
-COOKIE_FILE_AGE_SECONDS = 6 * 60 * 60
 CDP_PORT = 9222
 # Cookie names the console session needs (per CodexBar#2328 findings plus the
 # region/risk hints this gateway returns alongside them).
@@ -79,11 +87,9 @@ def cookie_file_path() -> str:
     return os.path.expanduser("~/.config/herdr-night-watch/qwen-cookies.txt")
 
 
-def read_cookie_file(max_age: bool = True) -> str | None:
+def read_cookie_file() -> str | None:
     path = cookie_file_path()
     try:
-        if max_age and time.time() - os.path.getmtime(path) > COOKIE_FILE_AGE_SECONDS:
-            return None
         with open(path, encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -429,12 +435,16 @@ def main() -> int:
     cookie = os.environ.get("QWEN_CLOUD_COOKIE", "").strip() or read_cookie_file()
     result = usage_with_cookie(cookie) if cookie else None
     if result is None:
-        # The cached or supplied cookie did not authenticate: refresh it from
-        # the agent browser session once and retry immediately.
+        # The cached or supplied cookie did not authenticate (or the request
+        # failed): refresh it from the agent browser session once and retry
+        # immediately. Only a CDP cookie that demonstrably produced usage is
+        # persisted; otherwise a dead debug-profile ticket would clobber a
+        # still-live manual export during a provider outage (2026-11-06).
         fresh = cookies_via_cdp()
         if fresh:
-            write_cookie_file(fresh)
             result = usage_with_cookie(fresh)
+            if result:
+                write_cookie_file(fresh)
     if not result:
         return 1
     json.dump(result, sys.stdout)
