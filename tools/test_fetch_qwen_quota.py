@@ -154,20 +154,73 @@ class QwenUsagePipelineTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 client._read(16)
 
-    def test_cookie_file_round_trip_is_private_and_bounded(self) -> None:
+    def test_cookie_file_round_trip_is_private_and_ageless(self) -> None:
         qwen_quota.write_cookie_file("cna=x; login_qwencloud_ticket=y")
         path = Path(qwen_quota.cookie_file_path())
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(qwen_quota.read_cookie_file(), "cna=x; login_qwencloud_ticket=y")
 
-        # A seven-hour-old cache is past the six-hour freshness bound and is
-        # refused, while explicit readers still see the stored value.
+        # A manually exported session stays readable after seven hours. The
+        # old six-hour age gate discarded live manual cookies and let the CDP
+        # refresh overwrite them with the debug profile's dead ticket during
+        # the 2026-11-06 QwenCloud outage.
         os.utime(path, (time.time() - 7 * 3600, time.time() - 7 * 3600))
-        self.assertIsNone(qwen_quota.read_cookie_file())
-        self.assertEqual(
-            qwen_quota.read_cookie_file(max_age=False),
-            "cna=x; login_qwencloud_ticket=y",
+        self.assertEqual(qwen_quota.read_cookie_file(), "cna=x; login_qwencloud_ticket=y")
+
+    def test_main_tries_cookie_file_of_any_age_before_cdp(self) -> None:
+        qwen_quota.write_cookie_file("login_qwencloud_ticket=manual")
+        os.utime(
+            Path(qwen_quota.cookie_file_path()),
+            (time.time() - 7 * 3600, time.time() - 7 * 3600),
         )
+        seen: list[str] = []
+
+        def fake_usage(cookie: str) -> dict | None:
+            seen.append(cookie)
+            return {
+                "week": {
+                    "remaining_percent": 42,
+                    "reset_epoch": int(time.time()) + 3600,
+                    "consumed_percent": 58.0,
+                }
+            }
+
+        def forbidden_cdp_refresh() -> None:
+            raise AssertionError("CDP must not run while the stored cookie authenticates")
+
+        with patch.dict(os.environ, {"QWEN_CLOUD_COOKIE": ""}), patch.object(
+            qwen_quota, "usage_with_cookie", side_effect=fake_usage
+        ), patch.object(qwen_quota, "cookies_via_cdp", forbidden_cdp_refresh):
+            self.assertEqual(qwen_quota.main(), 0)
+        self.assertEqual(seen, ["login_qwencloud_ticket=manual"])
+        self.assertEqual(qwen_quota.read_cookie_file(), "login_qwencloud_ticket=manual")
+
+    def test_main_refreshes_via_cdp_only_after_file_auth_fails(self) -> None:
+        qwen_quota.write_cookie_file("login_qwencloud_ticket=stale")
+        attempts: list[str] = []
+
+        def fake_usage(cookie: str) -> dict | None:
+            attempts.append(cookie)
+            if cookie == "login_qwencloud_ticket=fresh":
+                return {
+                    "week": {
+                        "remaining_percent": 42,
+                        "reset_epoch": int(time.time()) + 3600,
+                        "consumed_percent": 58.0,
+                    }
+                }
+            return None
+
+        with patch.dict(os.environ, {"QWEN_CLOUD_COOKIE": ""}), patch.object(
+            qwen_quota, "usage_with_cookie", side_effect=fake_usage
+        ), patch.object(
+            qwen_quota, "cookies_via_cdp", lambda: "login_qwencloud_ticket=fresh"
+        ):
+            self.assertEqual(qwen_quota.main(), 0)
+        self.assertEqual(
+            attempts, ["login_qwencloud_ticket=stale", "login_qwencloud_ticket=fresh"]
+        )
+        self.assertEqual(qwen_quota.read_cookie_file(), "login_qwencloud_ticket=fresh")
 
 
 if __name__ == "__main__":

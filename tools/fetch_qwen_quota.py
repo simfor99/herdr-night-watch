@@ -15,6 +15,13 @@ Cookie sources, tried in order (values are never printed or logged):
      --remote-debugging-port=9222): Storage.getCookies pulls the HttpOnly
      session cookies and persists them for the pure-HTTP path afterwards.
 
+The cookie file is tried first regardless of its age; the CDP refresh and
+its rewrite of the file only run when authentication fails. A manually
+exported session therefore stays usable until it genuinely stops working
+(verified 2026-11-06: during the QwenCloud maintenance outage the debug
+profile held a dead ticket that would have clobbered a live manual export
+under the old 6-hour age gate).
+
 Output on stdout: {"five_hour"|"month"|"week": {"remaining_percent": int,
 "reset_epoch": int}, ...}. The live Token Plan payload is polled for
 per5Hour*, per1Month* and per1Week* fields; only windows the account really
@@ -60,7 +67,6 @@ def out_of_budget() -> bool:
     return budget_left() <= 1.0
 
 
-COOKIE_FILE_AGE_SECONDS = 6 * 60 * 60
 CDP_PORT = 9222
 # Cookie names the console session needs (per CodexBar#2328 findings plus the
 # region/risk hints this gateway returns alongside them).
@@ -79,11 +85,9 @@ def cookie_file_path() -> str:
     return os.path.expanduser("~/.config/herdr-night-watch/qwen-cookies.txt")
 
 
-def read_cookie_file(max_age: bool = True) -> str | None:
+def read_cookie_file() -> str | None:
     path = cookie_file_path()
     try:
-        if max_age and time.time() - os.path.getmtime(path) > COOKIE_FILE_AGE_SECONDS:
-            return None
         with open(path, encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
