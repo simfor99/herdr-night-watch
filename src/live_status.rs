@@ -8066,54 +8066,11 @@ fn draw_smooth_limit_block(
     // Yellow (#fde047): Tight (<3.0d, high pace, moderate deficit). Vorwarn-Zone!
     // Red (#fca5a5): Critical (<1.0d, severe deficit >45m before reset, throttled, 0%). Problem!
     // Throttled overrides the light: no budget means unusable, not critical.
-    let (runway_color, is_red_alert, is_yellow_alert) = if is_throttled {
-        (GRAY, false, false)
-    } else if pct == 0 {
-        (egui::Color32::from_rgb(252, 165, 165), true, false)
-    } else if is_five_hour {
-        if let Some(fh) = &forecast.five_hour_forecast {
-            if fh.is_exhausted_before_reset {
-                let def = fh.delta_minutes.unwrap_or(0);
-                if def < -45 {
-                    (egui::Color32::from_rgb(252, 165, 165), true, false)
-                } else {
-                    (egui::Color32::from_rgb(253, 224, 71), false, true)
-                }
-            } else if pct < 20 || (pct < 30 && fh.pace_ratio > 1.15) {
-                (egui::Color32::from_rgb(253, 224, 71), false, true)
-            } else {
-                (egui::Color32::from_rgb(120, 184, 134), false, false)
-            }
-        } else if pct < 20 {
-            (egui::Color32::from_rgb(253, 224, 71), false, true)
-        } else {
-            (egui::Color32::from_rgb(120, 184, 134), false, false)
-        }
-    } else {
-        let diff_days = forecast.runway_days.map(|rw| rw - forecast.remaining_days);
-        let shielded = forecast.week_deficit_shielded(pct);
-        if pct < 10 {
-            (egui::Color32::from_rgb(252, 165, 165), true, false)
-        } else if let Some(diff) = diff_days {
-            if diff < -0.85 && !shielded {
-                // Severe deficit: exhausted nearly a day or more before reset
-                (egui::Color32::from_rgb(252, 165, 165), true, false)
-            } else if diff < -0.04 {
-                // Moderate deficit: exhausted hours before reset
-                (egui::Color32::from_rgb(253, 224, 71), false, true)
-            } else if pct < 15 || (pct < 25 && forecast.pace_ratio.map_or(false, |r| r > 1.15)) {
-                // Low reserve or high pace
-                (egui::Color32::from_rgb(253, 224, 71), false, true)
-            } else {
-                // Healthy reserve (> 0 buffer until reset)
-                (egui::Color32::from_rgb(120, 184, 134), false, false)
-            }
-        } else if pct < 20 {
-            (egui::Color32::from_rgb(253, 224, 71), false, true)
-        } else {
-            (egui::Color32::from_rgb(120, 184, 134), false, false)
-        }
-    };
+    let light = crate::quota::runway_light(is_throttled, pct, is_five_hour, forecast);
+    let (lr, lg, lb) = light.color.rgb();
+    let runway_color = egui::Color32::from_rgb(lr, lg, lb);
+    let (is_red_alert, is_yellow_alert) = (light.red, light.yellow);
+    // Backward-compat alias: the pace line below keeps using the same alerts.
 
     let runway_galley = painter.layout_no_wrap(
         runway_text.into(),
@@ -8194,22 +8151,10 @@ fn draw_smooth_limit_block(
         )
     };
     if !pace_text.is_empty() {
-        let pace_color = if is_throttled {
-            GRAY // Unusable: disabled gray instead of red
-        } else if pct == 0 || is_red_alert {
-            egui::Color32::from_rgb(252, 165, 165) // Red: depleted / red alert
-        } else if is_yellow_alert {
-            egui::Color32::from_rgb(253, 224, 71) // Yellow: yellow warning / tight buffer
-        } else if let Some(ratio) = pace_ratio_opt {
-            if ratio < 1.0 {
-                egui::Color32::from_rgb(120, 184, 134) // Green: healthy pace / good reserve
-            } else if ratio <= 1.25 {
-                egui::Color32::from_rgb(253, 224, 71) // Yellow: slightly above 1.0
-            } else {
-                egui::Color32::from_rgb(252, 165, 165) // Red: far above 1.0
-            }
-        } else {
-            egui::Color32::from_rgb(148, 163, 184)
+        let pace_color = {
+            let pc = crate::quota::pace_light(is_throttled, pct, &light, pace_ratio_opt);
+            let (pr, pg, pb) = pc.rgb();
+            egui::Color32::from_rgb(pr, pg, pb)
         };
 
         let footer_right_galley = painter.layout_no_wrap(
