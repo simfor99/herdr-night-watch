@@ -1115,6 +1115,8 @@ pub struct RunwayLight {
     pub yellow: bool,
 }
 
+/// The four traffic-light states a limit line can render, gray for an
+/// unusable (throttled) provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunwayColor {
     Gray,
@@ -1124,6 +1126,7 @@ pub enum RunwayColor {
 }
 
 impl RunwayColor {
+    /// RGB triple matching the satellite's pastel traffic-light palette.
     pub fn rgb(self) -> (u8, u8, u8) {
         match self {
             RunwayColor::Gray => (148, 163, 184),
@@ -2686,6 +2689,62 @@ mod tests {
         // Throttled provider: gray everywhere.
         assert_eq!(runway_light(true, 0, false, &fc).color, RunwayColor::Gray);
         assert_eq!(pace_light(true, 0, &runway_light(true, 0, false, &fc), Some(0.5)), RunwayColor::Gray);
+    }
+
+    #[test]
+    fn runway_light_boundary_flags_match_thresholds() {
+        // CodeRabbit inline 4524790892: pct >= 50 with a diff between -0.85
+        // and -0.04 must be yellow with ONLY the yellow flag set; pct < 10
+        // with diff == -0.85 must be red with ONLY the red flag set.
+        let mut fc = PacingForecast {
+            pace_ratio: None,
+            runway_days: Some(4.5),
+            delta_days: Some(0),
+            remaining_days: 5.0,
+            health: PacingHealth::Tight,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast: None,
+            week_exhaustion_date: None,
+            reset_str: None,
+            today: (2026, 11, 10),
+        };
+        let moderate = runway_light(false, 80, false, &fc); // diff = -0.5
+        assert_eq!(moderate.color, RunwayColor::Yellow);
+        assert!(!moderate.red && moderate.yellow);
+
+        fc.runway_days = Some(4.15); // diff = -0.85
+        fc.pace_ratio = Some(2.0); // defeats the shield at pct < 50 anyway
+        let edge = runway_light(false, 9, false, &fc);
+        assert_eq!(edge.color, RunwayColor::Red);
+        assert!(edge.red && !edge.yellow);
+    }
+
+    #[test]
+    fn pace_light_boundary_matches_ratio_thresholds() {
+        // CodeRabbit inline 4524790907: with a clean (green) runway and
+        // pct 100, pace None is gray, 1.0 and 1.25 are yellow; the
+        // implementation stays untouched.
+        let mut fc = PacingForecast {
+            pace_ratio: None,
+            runway_days: Some(900.0),
+            delta_days: Some(0),
+            remaining_days: 21.0,
+            health: PacingHealth::Surplus,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast: None,
+            week_exhaustion_date: None,
+            reset_str: None,
+            today: (2026, 11, 10),
+        };
+        let green = runway_light(false, 100, false, &fc);
+        assert_eq!(green.color, RunwayColor::Green);
+        assert_eq!(pace_light(false, 100, &green, None), RunwayColor::Gray);
+        assert_eq!(pace_light(false, 100, &green, Some(1.0)), RunwayColor::Yellow);
+        fc.pace_ratio = Some(1.25);
+        let green2 = runway_light(false, 100, false, &fc);
+        assert_eq!(pace_light(false, 100, &green2, Some(1.25)), RunwayColor::Yellow);
     }
 
     #[test]
