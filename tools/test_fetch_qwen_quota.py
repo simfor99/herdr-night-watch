@@ -222,6 +222,24 @@ class QwenUsagePipelineTests(unittest.TestCase):
         )
         self.assertEqual(qwen_quota.read_cookie_file(), "login_qwencloud_ticket=fresh")
 
+    def test_outage_keeps_manual_cookie_when_cdp_ticket_is_also_dead(self) -> None:
+        # 2026-11-06 regression: during the QwenCloud maintenance outage every
+        # request fails the same way (None), so a failing first read must not
+        # be read as "auth broken, persist whatever CDP hands back". The dead
+        # debug-profile ticket may be tried once but must never replace the
+        # live manual export in the file.
+        qwen_quota.write_cookie_file("login_qwencloud_ticket=manual-live")
+        with patch.dict(os.environ, {"QWEN_CLOUD_COOKIE": ""}), patch.object(
+            qwen_quota, "usage_with_cookie", lambda cookie: None
+        ), patch.object(
+            qwen_quota, "cookies_via_cdp",
+            lambda: "login_qwencloud_ticket=dead-debug-profile",
+        ):
+            self.assertEqual(qwen_quota.main(), 1)
+        self.assertEqual(
+            qwen_quota.read_cookie_file(), "login_qwencloud_ticket=manual-live"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

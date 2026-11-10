@@ -16,7 +16,8 @@ Cookie sources, tried in order (values are never printed or logged):
      session cookies and persists them for the pure-HTTP path afterwards.
 
 The cookie file is tried first regardless of its age; the CDP refresh and
-its rewrite of the file only run when authentication fails. A manually
+its rewrite of the file only run when authentication fails, and a CDP cookie
+is written back only after it provably returned usage data. A manually
 exported session therefore stays usable until it genuinely stops working
 (verified 2026-11-06: during the QwenCloud maintenance outage the debug
 profile held a dead ticket that would have clobbered a live manual export
@@ -433,12 +434,16 @@ def main() -> int:
     cookie = os.environ.get("QWEN_CLOUD_COOKIE", "").strip() or read_cookie_file()
     result = usage_with_cookie(cookie) if cookie else None
     if result is None:
-        # The cached or supplied cookie did not authenticate: refresh it from
-        # the agent browser session once and retry immediately.
+        # The cached or supplied cookie did not authenticate (or the request
+        # failed): refresh it from the agent browser session once and retry
+        # immediately. Only a CDP cookie that demonstrably produced usage is
+        # persisted; otherwise a dead debug-profile ticket would clobber a
+        # still-live manual export during a provider outage (2026-11-06).
         fresh = cookies_via_cdp()
         if fresh:
-            write_cookie_file(fresh)
             result = usage_with_cookie(fresh)
+            if result:
+                write_cookie_file(fresh)
     if not result:
         return 1
     json.dump(result, sys.stdout)
