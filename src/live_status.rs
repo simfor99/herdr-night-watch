@@ -2290,7 +2290,10 @@ impl eframe::App for LiveStatusApp {
             // monitor boundary, Windows re-evaluates its DPI by itself. The
             // heal exists for the stationary stale case only, so relocation
             // resets the budget instead of letting the nudge fight the move.
-            if main_moved {
+            // The drag flag matters even on still frames: a pause mid-drag
+            // shows no relocation, and without this guard the reset budget
+            // would fire a fresh nudge in exactly that frame.
+            if main_moved || self.window_drag_started {
                 self.main_dpi_heal = None;
             } else if window_chrome::scale_mismatch(native_ppp, monitor_ppp) {
                 if dpi_heal_due(&mut self.main_dpi_heal, Instant::now())
@@ -6475,7 +6478,11 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
         let sat_moved =
             sat_pos.is_some_and(|pos| window_chrome::position_moved(app.satellite_dpi_heal_rect, pos));
         app.satellite_dpi_heal_rect = sat_pos;
+        // The main drag holds the docked satellite in place between frames,
+        // so a still satellite frame during a main drag must not spend the
+        // budget either; quota_drag_active alone only covers satellite drags.
         if !app.quota_drag_active
+            && !app.window_drag_started
             && !sat_moved
             && window_chrome::scale_mismatch(sat_native_ppp, sat_monitor_ppp)
         {
