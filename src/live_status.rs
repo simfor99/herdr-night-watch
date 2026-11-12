@@ -1659,6 +1659,8 @@ struct LiveStatusApp {
     last_synced_sat_height: Option<f32>,
     main_dpi_heal: Option<(Instant, u8)>,
     satellite_dpi_heal: Option<(Instant, u8)>,
+    main_dpi_heal_rect: Option<(i32, i32)>,
+    satellite_dpi_heal_rect: Option<(i32, i32)>,
     satellite_dpi_recreate_at: Option<Instant>,
     satellite_dpi_recreations: u8,
 }
@@ -1790,6 +1792,8 @@ impl LiveStatusApp {
             last_synced_sat_height: None,
             main_dpi_heal: None,
             satellite_dpi_heal: None,
+            main_dpi_heal_rect: None,
+            satellite_dpi_heal_rect: None,
             satellite_dpi_recreate_at: None,
             satellite_dpi_recreations: 0,
         }
@@ -2259,6 +2263,7 @@ impl eframe::App for LiveStatusApp {
             // burn a recreation slot or skip frames on the next open.
             self.satellite_dpi_recreate_at = None;
             self.satellite_dpi_heal = None;
+            self.satellite_dpi_heal_rect = None;
         }
 
         if hwnds_changed {
@@ -2275,9 +2280,22 @@ impl eframe::App for LiveStatusApp {
         // across viewports and only applies on the next pass, so it cannot
         // fix one window without breaking another.
         if let Some(main_hwnd) = self.main_hwnd {
+            let main_pos = window_chrome::window_position(main_hwnd);
+            let main_moved =
+                main_pos.is_some_and(|pos| window_chrome::position_moved(self.main_dpi_heal_rect, pos));
+            self.main_dpi_heal_rect = main_pos;
             let native_ppp = ui.ctx().input(|i| i.viewport().native_pixels_per_point);
             let monitor_ppp = window_chrome::monitor_scale_factor_for_window(main_hwnd);
-            if window_chrome::scale_mismatch(native_ppp, monitor_ppp) {
+            // While the window is in motion, by a user drag or a crossing
+            // monitor boundary, Windows re-evaluates its DPI by itself. The
+            // heal exists for the stationary stale case only, so relocation
+            // resets the budget instead of letting the nudge fight the move.
+            // The drag flag matters even on still frames: a pause mid-drag
+            // shows no relocation, and without this guard the reset budget
+            // would fire a fresh nudge in exactly that frame.
+            if main_moved || self.window_drag_started {
+                self.main_dpi_heal = None;
+            } else if window_chrome::scale_mismatch(native_ppp, monitor_ppp) {
                 if dpi_heal_due(&mut self.main_dpi_heal, Instant::now())
                     && window_chrome::heal_stale_window_scale(main_hwnd)
                 {
@@ -2293,6 +2311,7 @@ impl eframe::App for LiveStatusApp {
             }
         } else {
             self.main_dpi_heal = None;
+            self.main_dpi_heal_rect = None;
         }
 
         let now = Instant::now();
@@ -6452,7 +6471,19 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
         let sat_monitor_ppp = app
             .satellite_hwnd
             .and_then(|hwnd| window_chrome::monitor_scale_factor_for_window(hwnd));
+        // Relocation guard as on the main window: a dragged or docking
+        // satellite must not spend its nudge budget, and Windows re-checks
+        // the DPI on its own while the window moves.
+        let sat_pos = app.satellite_hwnd.and_then(window_chrome::window_position);
+        let sat_moved =
+            sat_pos.is_some_and(|pos| window_chrome::position_moved(app.satellite_dpi_heal_rect, pos));
+        app.satellite_dpi_heal_rect = sat_pos;
+        // The main drag holds the docked satellite in place between frames,
+        // so a still satellite frame during a main drag must not spend the
+        // budget either; quota_drag_active alone only covers satellite drags.
         if !app.quota_drag_active
+            && !app.window_drag_started
+            && !sat_moved
             && window_chrome::scale_mismatch(sat_native_ppp, sat_monitor_ppp)
         {
             let attempts_used = app.satellite_dpi_heal.map(|(_, count)| count).unwrap_or(0);
@@ -8070,7 +8101,8 @@ fn draw_smooth_limit_block(
     let (lr, lg, lb) = light.color.rgb();
     let runway_color = egui::Color32::from_rgb(lr, lg, lb);
     let (is_red_alert, is_yellow_alert) = (light.red, light.yellow);
-    // Backward-compat alias: the pace line below keeps using the same alerts.
+    // Alert aliases: the micro dots below consume them; the pace line uses
+    // `light` directly through pace_light.
 
     let runway_galley = painter.layout_no_wrap(
         runway_text.into(),

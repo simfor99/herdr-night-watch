@@ -568,6 +568,37 @@ pub fn scale_mismatch(native: Option<f32>, monitor: Option<f32>) -> bool {
     }
 }
 
+/// Current top-left corner of a window in screen coordinates, or `None`
+/// when the window cannot be queried.
+#[cfg(windows)]
+pub fn window_position(hwnd: HWND) -> Option<(i32, i32)> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return None;
+    }
+    Some((rect.left, rect.top))
+}
+
+#[cfg(not(windows))]
+pub fn window_position(_hwnd: HWND) -> Option<(i32, i32)> {
+    None
+}
+
+/// True when a window visibly relocated between two observations.
+///
+/// The DPI heal loop exists for windows that sit still with a stale cached
+/// scale factor (the cold-boot case). While a window is in motion, Windows
+/// re-evaluates its DPI by itself, so any relocation, by a user drag or by a
+/// crossing monitor boundary, must suppress the heal instead of letting it
+/// fight the move. The first observation reports "not moved" so a genuinely
+/// stationary stale window is healed without delay.
+pub fn position_moved(previous: Option<(i32, i32)>, current: (i32, i32)) -> bool {
+    previous.is_some_and(|previous| previous != current)
+}
+
 /// Ask Windows to re-evaluate the DPI of a window with a stale cached scale
 /// factor.
 ///
@@ -577,7 +608,8 @@ pub fn scale_mismatch(native: Option<f32>, monitor: Option<f32>) -> bool {
 /// size reconciliation settles the window. This is the programmatic
 /// equivalent of the manual fix of briefly dragging the window, which is
 /// why it is tried first and bounded by a small retry budget in the
-/// caller. Returns `false` when the window cannot be queried.
+/// caller. Returns `false` when the window cannot be queried or the
+/// forward move itself fails.
 #[cfg(windows)]
 pub fn heal_stale_window_scale(hwnd: HWND) -> bool {
     use windows_sys::Win32::Foundation::RECT;
@@ -590,21 +622,40 @@ pub fn heal_stale_window_scale(hwnd: HWND) -> bool {
         return false;
     }
     // A move by one pixel is a real move; moving back keeps the docked and
-    // persisted positions intact. WM_DPICHANGED is delivered synchronously
-    // on the calling (window) thread.
-    for dx in [1, 0] {
-        let _ = unsafe {
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                rect.left + dx,
-                rect.top,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        };
+    // persisted positions intact. The return move re-reads the rectangle:
+    // if a drag relocated the window between the two calls, it follows the
+    // window instead of snapping it back to the stale coordinates. If the
+    // forward move fails there is nothing to undo, so abort before the
+    // relative return could shift the window a pixel with each attempt.
+    if unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            rect.left + 1,
+            rect.top,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    } == 0
+    {
+        return false;
     }
+    let mut after: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(hwnd, &mut after) } == 0 {
+        return false;
+    }
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            after.left - 1,
+            after.top,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    };
     true
 }
 
@@ -616,7 +667,18 @@ pub fn heal_stale_window_scale(_hwnd: HWND) -> bool {
 #[cfg(test)]
 mod tests {
     use super::layered_window_alpha;
+    use super::position_moved;
     use super::scale_mismatch;
+
+    #[test]
+    fn position_moved_reports_only_real_relocation() {
+        // First observation never counts as motion, so a stationary stale
+        // window is healed without delay.
+        assert!(!position_moved(None, (10, 20)));
+        assert!(!position_moved(Some((10, 20)), (10, 20)));
+        assert!(position_moved(Some((10, 20)), (11, 20)));
+        assert!(position_moved(Some((10, 20)), (10, 19)));
+    }
 
     #[test]
     fn full_opacity_does_not_use_layered_style() {
