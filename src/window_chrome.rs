@@ -608,7 +608,8 @@ pub fn position_moved(previous: Option<(i32, i32)>, current: (i32, i32)) -> bool
 /// size reconciliation settles the window. This is the programmatic
 /// equivalent of the manual fix of briefly dragging the window, which is
 /// why it is tried first and bounded by a small retry budget in the
-/// caller. Returns `false` when the window cannot be queried.
+/// caller. Returns `false` when the window cannot be queried or the
+/// forward move itself fails.
 #[cfg(windows)]
 pub fn heal_stale_window_scale(hwnd: HWND) -> bool {
     use windows_sys::Win32::Foundation::RECT;
@@ -623,8 +624,10 @@ pub fn heal_stale_window_scale(hwnd: HWND) -> bool {
     // A move by one pixel is a real move; moving back keeps the docked and
     // persisted positions intact. The return move re-reads the rectangle:
     // if a drag relocated the window between the two calls, it follows the
-    // window instead of snapping it back to the stale coordinates.
-    let _ = unsafe {
+    // window instead of snapping it back to the stale coordinates. If the
+    // forward move fails there is nothing to undo, so abort before the
+    // relative return could shift the window a pixel with each attempt.
+    if unsafe {
         SetWindowPos(
             hwnd,
             std::ptr::null_mut(),
@@ -634,7 +637,10 @@ pub fn heal_stale_window_scale(hwnd: HWND) -> bool {
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         )
-    };
+    } == 0
+    {
+        return false;
+    }
     let mut after: RECT = unsafe { std::mem::zeroed() };
     if unsafe { GetWindowRect(hwnd, &mut after) } == 0 {
         return false;
