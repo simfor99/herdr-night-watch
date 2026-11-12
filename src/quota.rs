@@ -568,6 +568,8 @@ pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
+// Used only by the non-Windows fallback path of the date helpers.
+#[cfg(not(windows))]
 pub fn current_ymd() -> (i32, u32, u32) {
     let now = std::time::SystemTime::now();
     let secs = now
@@ -1084,6 +1086,9 @@ fn fallback_raw_format(raw: &str, language: Language) -> String {
     }
 }
 
+// Deterministic forecast entry point for the test matrix; production paths
+// go through the live calculate_* helpers.
+#[cfg(test)]
 pub fn pacing_forecast_for(
     is_throttled: bool,
     week_percent: Option<u8>,

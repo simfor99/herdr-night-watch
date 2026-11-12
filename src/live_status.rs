@@ -8865,6 +8865,9 @@ enum MetricIcon {
 
 #[derive(Clone, Copy)]
 struct SystemMetricBadgeLayout {
+    // Only the badge-boundary tests read this; production callers use
+    // text_right, so the release build would report a false dead-code hit.
+    #[allow(dead_code)]
     rect: egui::Rect,
     text_right: f32,
 }
