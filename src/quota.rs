@@ -1132,6 +1132,9 @@ pub enum RunwayColor {
 
 impl RunwayColor {
     /// RGB triple matching the satellite's pastel traffic-light palette.
+    /// Only the Windows satellite renderer consumes this method, so the
+    /// band keeps non-Windows builds free of a false dead-code warning.
+    #[cfg(windows)]
     pub fn rgb(self) -> (u8, u8, u8) {
         match self {
             RunwayColor::Gray => (148, 163, 184),
