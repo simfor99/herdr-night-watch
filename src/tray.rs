@@ -61,6 +61,9 @@ struct Wake;
 struct App {
     language: Language,
     tray: Option<TrayIcon>,
+    power_guard: power_guard::TrayPowerGuard,
+    power_refresh_at: Instant,
+    last_tick_at: Instant,
     status: backend::WatchStatus,
     status_available: bool,
     message: Option<String>,
@@ -91,7 +94,7 @@ pub fn run() -> Result<()> {
         warning_seconds: 300,
     };
     let initial_message = Some("Status unbekannt – erste Abfrage läuft".to_string());
-    let _power_guard = match power_guard::TrayPowerGuard::acquire() {
+    let power_guard = match power_guard::TrayPowerGuard::acquire() {
         Ok(guard) => guard,
         Err(error) if stop_on_guard_failure => {
             return match backend::stop("power_guard_failed") {
@@ -147,16 +150,20 @@ pub fn run() -> Result<()> {
             let _ = live_status::open();
         }
     }
+    let now = Instant::now();
     let mut app = App {
         language,
         tray: Some(tray),
+        power_guard,
+        power_refresh_at: now,
+        last_tick_at: now,
         status: initial,
         status_available: false,
         message: initial_message,
         last_view: String::new(),
-        refresh_at: Instant::now()
+        refresh_at: now
             .checked_sub(Duration::from_secs(10))
-            .unwrap_or_else(Instant::now),
+            .unwrap_or(now),
         checking: false,
         result_rx,
         result_tx,
@@ -569,7 +576,18 @@ impl App {
             .unwrap_or_else(Instant::now);
     }
 
+    fn refresh_power_guard(&mut self) {
+        let now = Instant::now();
+        let resumed_from_sleep = now.saturating_duration_since(self.last_tick_at) >= Duration::from_secs(15);
+        self.last_tick_at = now;
+        if resumed_from_sleep || self.power_refresh_at.elapsed() >= Duration::from_secs(30) {
+            let _ = self.power_guard.refresh();
+            self.power_refresh_at = now;
+        }
+    }
+
     fn tick(&mut self, event_loop: &ActiveEventLoop) {
+        self.refresh_power_guard();
         self.apply_results();
         self.refresh_status();
         self.render();
