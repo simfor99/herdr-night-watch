@@ -202,6 +202,18 @@ impl ProviderQuota {
         self.is_throttled
     }
 
+    fn five_hour_window_at(&self, now_epoch: i64) -> (Option<u8>, Option<&str>) {
+        if self.id == ProviderId::Codex && self.five_hour_reset_epoch.is_some_and(|reset| now_epoch >= reset) {
+            return (None, None);
+        }
+        (self.five_hour_percent, self.five_hour_reset.as_deref())
+    }
+
+    #[cfg(windows)]
+    pub fn current_five_hour_window(&self) -> (Option<u8>, Option<&str>) {
+        self.five_hour_window_at(current_utc_epoch())
+    }
+
     pub fn pacing_forecast(&self) -> PacingForecast {
         if self.id == ProviderId::Codex {
             return self.codex_pacing_forecast_at(
@@ -229,6 +241,7 @@ impl ProviderQuota {
         today: (i32, u32, u32),
         now_hm: (u32, u32),
     ) -> PacingForecast {
+        let (five_hour_percent, five_hour_reset) = self.five_hour_window_at(now_epoch);
         let mut fc = codex_week_pacing_forecast(
             self.week_percent,
             self.week_reset.as_deref(),
@@ -238,8 +251,8 @@ impl ProviderQuota {
             self.week_consumed_range,
             self.week_source,
             self.week_confirmed_exhausted,
-            self.five_hour_percent,
-            self.five_hour_reset.as_deref(),
+            five_hour_percent,
+            five_hour_reset,
             now_epoch,
             today,
             now_hm,
@@ -285,6 +298,7 @@ pub struct PacingForecast {
     pub today: (i32, u32, u32),
     pub week_state: WeekForecastState,
     pub week_is_estimate: bool,
+    projected_week_reserve: Option<f32>,
 }
 
 impl PacingForecast {
@@ -659,7 +673,7 @@ impl PacingForecast {
         }
         if let Some(ratio) = self.pace_ratio {
             let qualifier = if let Some(runway) = self.runway_days {
-                let diff = runway - self.remaining_days;
+                let diff = self.projected_week_reserve.unwrap_or(runway - self.remaining_days);
                 let is_proven_deficit = self.week_state == WeekForecastState::ProvenDeficit
                     || (self.week_state == WeekForecastState::Active && diff < -1e-6);
                 if diff < -0.04 || is_proven_deficit {
@@ -1487,6 +1501,7 @@ pub fn pacing_forecast_with_cycle_days(
             today,
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
+            projected_week_reserve: None,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1514,6 +1529,7 @@ pub fn pacing_forecast_with_cycle_days(
             today,
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
+            projected_week_reserve: None,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1541,6 +1557,7 @@ pub fn pacing_forecast_with_cycle_days(
                 today,
                 week_state: WeekForecastState::Active,
                 week_is_estimate: false,
+                projected_week_reserve: None,
             };
             fc.badge_text = fc.localized_upper_line(Language::German);
             fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1574,6 +1591,7 @@ pub fn pacing_forecast_with_cycle_days(
             today,
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
+            projected_week_reserve: None,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1603,6 +1621,7 @@ pub fn pacing_forecast_with_cycle_days(
             today,
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
+            projected_week_reserve: None,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1663,6 +1682,7 @@ pub fn pacing_forecast_with_cycle_days(
             today,
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
+            projected_week_reserve: None,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1704,6 +1724,7 @@ pub fn pacing_forecast_with_cycle_days(
         today,
         week_state: WeekForecastState::Active,
         week_is_estimate: false,
+        projected_week_reserve: None,
     };
     fc.badge_text = fc.localized_upper_line(Language::German);
     fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1771,6 +1792,7 @@ pub fn codex_week_pacing_forecast(
             today,
             week_state,
             week_is_estimate,
+            projected_week_reserve: None,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1958,7 +1980,7 @@ pub fn codex_week_pacing_forecast(
         PacingHealth::OnTrack
     };
 
-    make_forecast(
+    let mut forecast = make_forecast(
         Some(pace_ratio),
         Some(runway_days),
         delta_days,
@@ -1967,7 +1989,9 @@ pub fn codex_week_pacing_forecast(
         week_exhaustion_date,
         week_state,
         week_is_estimate,
-    )
+    );
+    forecast.projected_week_reserve = Some(reserve_days_f64 as f32);
+    forecast
 }
 
 #[derive(Clone, Debug)]
@@ -2459,7 +2483,7 @@ pub fn update_snapshot_with_codex_json(snapshot: &mut QuotaSnapshot, json_str: &
         .and_then(|b| b.as_bool())
         .unwrap_or(false);
     codex.explicit_provider_throttle =
-        explicit_provider_throttle && !codex.week_confirmed_exhausted && !codex.five_hour_confirmed_exhausted;
+        explicit_provider_throttle && !explicit_week_throttled && !explicit_five_hour_throttled;
     codex.is_throttled = codex.week_confirmed_exhausted
         || codex.five_hour_confirmed_exhausted
         || codex.explicit_provider_throttle;
@@ -2939,6 +2963,7 @@ mod tests {
             today: (2026, 11, 5),
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
+            projected_week_reserve: None,
         };
         assert!(fc.week_is_deficit());
         assert!(fc.week_deficit_shielded(98));
@@ -3158,7 +3183,7 @@ mod tests {
             Some(codex_reset_epoch_to_local(1790190000, "five_hour"))
         );
         assert!(snapshot.has_throttle);
-        assert!(codex.pacing_forecast().five_hour_forecast.is_some());
+        assert!(codex.codex_pacing_forecast_at(1790189999, (2026, 9, 23), (18, 0)).five_hour_forecast.is_some());
 
         update_snapshot_with_codex_json(&mut snapshot, "null");
         let codex = snapshot.get(ProviderId::Codex).unwrap();
@@ -3290,6 +3315,7 @@ mod tests {
             today: (2026, 11, 10),
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
+            projected_week_reserve: None,
         };
         // AGY weekly: severe deficit, 41 % remaining is under the 50 % shield.
         assert_eq!(runway_light(false, 41, false, &fc).color, RunwayColor::Red);
@@ -3333,6 +3359,7 @@ mod tests {
             today: (2026, 11, 10),
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
+            projected_week_reserve: None,
         };
         let moderate = runway_light(false, 80, false, &fc); // diff = -0.5
         assert_eq!(moderate.color, RunwayColor::Yellow);
@@ -3364,6 +3391,7 @@ mod tests {
             today: (2026, 11, 10),
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
+            projected_week_reserve: None,
         };
         let green = runway_light(false, 100, false, &fc);
         assert_eq!(green.color, RunwayColor::Green);
@@ -3931,6 +3959,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_expired_session_data_does_not_clear_an_unassigned_account_throttle() {
+        let reset = 1_800_604_800;
+        let codex = codex_from_json(&format!(
+            r#"{{"is_throttled":true,"five_hour":{{"remaining_percent":0,"consumed_percent":100,"reset_epoch":{reset},"source":"app_server"}}}}"#
+        ));
+        assert_eq!(codex.five_hour_window_at(reset - 1).0, Some(0));
+        assert!(codex.codex_pacing_forecast_at(reset - 1, (2027, 1, 20), (11, 59)).five_hour_forecast.is_some());
+        assert_eq!(codex.five_hour_window_at(reset), (None, None));
+        assert!(codex.codex_pacing_forecast_at(reset, (2027, 1, 20), (12, 0)).five_hour_forecast.is_none());
+        assert!(codex.provider_is_throttled_at(reset));
+    }
+
+    #[test]
+    fn codex_deficit_keeps_its_size_when_the_projected_runway_has_elapsed() {
+        let reset = 1_800_604_800;
+        let observed = reset - 7_200;
+        let codex = codex_from_json(&format!(
+            r#"{{"week":{{"remaining_percent":0,"consumed_percent":99.9,"reset_epoch":{reset},"observed_epoch":{observed},"source":"session_log"}}}}"#
+        ));
+        let before = codex.codex_pacing_forecast_at(observed, (2027, 1, 20), (10, 0));
+        let after = codex.codex_pacing_forecast_at(reset - 1_800, (2027, 1, 20), (11, 30));
+        assert_eq!(after.runway_days, Some(0.0));
+        assert_eq!(before.week_pace_text(Language::German), after.week_pace_text(Language::German));
+        assert!(after.week_pace_text(Language::German).contains("~-2h Defizit"));
+    }
+
+    #[test]
     fn codex_a1_21_minutes_1_percent_stays_pending_with_reason() {
         let reset_epoch: i64 = 1_800_604_800;
         let window_start = reset_epoch - 7 * 86_400;
@@ -4057,10 +4112,12 @@ mod tests {
         fc_30.week_is_estimate = false;
         fc_30.remaining_days = 5.0;
         fc_30.runway_days = Some(35.0);
+        fc_30.projected_week_reserve = Some(30.0);
         assert_eq!(fc_30.week_pace_text(Language::German), "Pace: 0.28x · +30d Reserve");
         assert_eq!(fc_30.week_pace_text(Language::English), "Pace: 0.28x · +30d reserve");
 
         fc_30.runway_days = Some(35.01);
+        fc_30.projected_week_reserve = Some(30.01);
         assert_eq!(fc_30.week_pace_text(Language::German), "Pace: 0.28x · +>30 Tage Reserve");
         assert_eq!(fc_30.week_pace_text(Language::English), "Pace: 0.28x · +>30 days reserve");
     }

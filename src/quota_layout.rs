@@ -56,23 +56,26 @@ pub(crate) fn reorder_quota_order(
 
 /// The reset that ends a provider's depletion, for the minimized card row:
 /// a drained weekly budget is the real blocker, otherwise the session reset.
-pub(crate) fn minimized_reset_raw(quota: &ProviderQuota) -> Option<String> {
+pub(crate) fn minimized_reset(quota: &ProviderQuota) -> Option<(&str, bool)> {
     if !quota.provider_is_throttled() {
         return None;
     }
     if quota.id == ProviderId::Codex {
+        if quota.explicit_provider_throttle {
+            return None;
+        }
         if quota.week_is_throttled() {
-            return quota.week_reset.clone();
+            return quota.week_reset.as_deref().map(|reset| (reset, false));
         }
         if quota.five_hour_is_throttled() {
-            return quota.five_hour_reset.clone();
+            return quota.five_hour_reset.as_deref().map(|reset| (reset, true));
         }
         return None;
     }
     if quota.week_percent == Some(0) {
-        quota.week_reset.clone()
+        quota.week_reset.as_deref().map(|reset| (reset, false))
     } else {
-        quota.five_hour_reset.clone()
+        quota.five_hour_reset.as_deref().map(|reset| (reset, true))
     }
 }
 
@@ -154,8 +157,8 @@ mod tests {
             Some("31.10. (02:08)".into()),
         );
         assert_eq!(
-            minimized_reset_raw(&week_depleted).as_deref(),
-            Some("31.10. (02:08)")
+            minimized_reset(&week_depleted),
+            Some(("31.10. (02:08)", false))
         );
 
         let session_depleted = ProviderQuota::new(
@@ -167,7 +170,7 @@ mod tests {
             Some(73),
             Some("137h".into()),
         );
-        assert_eq!(minimized_reset_raw(&session_depleted).as_deref(), Some("16:34"));
+        assert_eq!(minimized_reset(&session_depleted), Some(("16:34", true)));
 
         let healthy = ProviderQuota::new(
             ProviderId::Glm,
@@ -178,7 +181,7 @@ mod tests {
             Some(85),
             Some("01.10.".into()),
         );
-        assert_eq!(minimized_reset_raw(&healthy), None);
+        assert_eq!(minimized_reset(&healthy), None);
     }
 
     #[test]
@@ -196,7 +199,11 @@ mod tests {
         codex.five_hour_confirmed_exhausted = false;
         codex.explicit_provider_throttle = true;
         codex.is_throttled = true;
-        assert_eq!(minimized_reset_raw(&codex), None);
+        assert_eq!(minimized_reset(&codex), None);
+
+        codex.explicit_provider_throttle = false;
+        codex.five_hour_confirmed_exhausted = true;
+        assert_eq!(minimized_reset(&codex), Some(("16:34", true)));
     }
 
     #[test]

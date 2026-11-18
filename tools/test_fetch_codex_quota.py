@@ -289,16 +289,15 @@ class CodexQuotaTest(unittest.TestCase):
         self.assertEqual(res_no_reason["five_hour"]["remaining_percent"], 20)
         self.assertEqual(res_no_reason["week"]["remaining_percent"], 0)
 
-        # Case 2: real snake_case rateLimitReachedType at RPC result level through app_server_quota
+        # The bucket supplies a reason even when the envelope has no permission flag.
         responses = [
             {"id": 1, "result": {}},
             {
                 "id": 2,
                 "result": {
-                    "ordinaryUsageAllowed": False,
-                    "rateLimitReachedType": "rate_limit_reached",
                     "rateLimits": {
                         "limitId": "codex",
+                        "rateLimitReachedType": "rate_limit_reached",
                         "primary": {"usedPercent": 35, "windowDurationMins": 300, "resetsAt": 1790190000},
                         "secondary": {"usedPercent": 20, "windowDurationMins": 10080, "resetsAt": 1790790254},
                     },
@@ -333,7 +332,7 @@ class CodexQuotaTest(unittest.TestCase):
             "fetch_codex_quota.asyncio.create_subprocess_exec",
             new_callable=AsyncMock,
             return_value=FakeProcess(),
-        ):
+        ), patch("fetch_codex_quota.monotonic", side_effect=[20.0, 24.0]):
             rpc_result = asyncio.run(app_server_quota(now))
 
         self.assertTrue(rpc_result["is_throttled"])
@@ -341,6 +340,7 @@ class CodexQuotaTest(unittest.TestCase):
         self.assertNotIn("week_throttled", rpc_result)
         self.assertNotIn("five_hour_throttled", rpc_result)
         self.assertEqual(rpc_result["week"]["remaining_percent"], 80)
+        self.assertEqual(rpc_result["week"]["observed_epoch"], int(now.timestamp()) + 4)
 
         # Case 3: ordinaryUsageAllowed=True -> not throttled
         rpc_allowed = {
@@ -354,6 +354,15 @@ class CodexQuotaTest(unittest.TestCase):
         }
         res_allowed = normalize_app_server_response(rpc_allowed, now)
         self.assertNotIn("is_throttled", res_allowed)
+
+    def test_live_throttle_does_not_mix_in_logs_without_an_account_identity(self):
+        now = dt.datetime(2026, 9, 23, 18, 20, tzinfo=dt.timezone.utc)
+        with (
+            patch("fetch_codex_quota.app_server_quota", new_callable=AsyncMock, return_value={"is_throttled": True}),
+            patch("fetch_codex_quota.latest_quota") as logs,
+        ):
+            self.assertEqual(fetch_quota(Path("sessions"), now), {"is_throttled": True})
+        logs.assert_not_called()
 
 
 if __name__ == "__main__":

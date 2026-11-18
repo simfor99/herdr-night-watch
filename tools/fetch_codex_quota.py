@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+from time import monotonic
 
 
 def normalize_windows(
@@ -43,14 +44,14 @@ def normalize_windows(
 
 
 def normalize_app_server_response(response: dict, now: dt.datetime) -> dict | None:
-    """Normalize GetAccountRateLimitsResponse using envelope-level throttle fields."""
+    """Normalize the Codex rate limit bucket and account permission."""
     limits = response.get("rateLimits")
     if not isinstance(limits, dict) or limits.get("limitId") != "codex":
         return None
 
     result = normalize_windows(limits, now, app_server=True) or {}
     ordinary_allowed = response.get("ordinaryUsageAllowed")
-    reached_raw = response.get("rateLimitReachedType")
+    reached_raw = limits.get("rateLimitReachedType")
     reached_type = (
         reached_raw.strip()
         if isinstance(reached_raw, str) and reached_raw.strip()
@@ -95,6 +96,7 @@ def codex_executable() -> str:
 
 
 async def app_server_quota(now: dt.datetime) -> dict | None:
+    started = monotonic()
     codex_bin = codex_executable()
     process_env = os.environ.copy()
     executable_path = Path(codex_bin)
@@ -145,7 +147,8 @@ async def app_server_quota(now: dt.datetime) -> dict | None:
         if isinstance(response, dict) and "_jsonrpc_error" in response:
             return None
         if isinstance(response, dict):
-            return normalize_app_server_response(response, now)
+            observed_at = now + dt.timedelta(seconds=monotonic() - started)
+            return normalize_app_server_response(response, observed_at)
         return None
     except (OSError, TimeoutError, asyncio.TimeoutError, BrokenPipeError):
         return None
@@ -217,6 +220,8 @@ def fetch_quota(sessions: Path, now: dt.datetime) -> dict | None:
         live = asyncio.run(app_server_quota(now))
     except Exception:
         live = None
+    # Session logs lack an account ID. Do not attach a possibly different
+    # account's quota windows to a successful live account response.
     return live or latest_quota(sessions, now)
 
 

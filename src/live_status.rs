@@ -2903,7 +2903,8 @@ fn provider_card_height(quota: &ProviderQuota, minimize_depleted: bool) -> f32 {
         // Header row only: badge, subtitle, LED and the reset hint.
         return 30.0;
     }
-    let has_5h = quota.five_hour_percent.is_some() || quota.five_hour_reset.is_some();
+    let (five_hour_percent, five_hour_reset) = quota.current_five_hour_window();
+    let has_5h = five_hour_percent.is_some() || five_hour_reset.is_some();
     let has_wk = quota.week_percent.is_some() || quota.week_reset.is_some();
     let count = match (has_5h, has_wk) {
         (true, true) => 2,
@@ -8313,11 +8314,10 @@ fn draw_provider_card(
     if minimized {
         // Header-only row: name plus the reset that ends the depletion,
         // formatted like the reset footer of the full cards.
-        if let Some(raw) = crate::quota_layout::minimized_reset_raw(quota) {
-            let five_hour_reset = quota.week_percent != Some(0);
+        if let Some((raw, is_five_hour)) = crate::quota_layout::minimized_reset(quota) {
             let reset_text = format!(
                 "Reset {}",
-                format_reset_phrase(Some(&raw), five_hour_reset, language)
+                format_reset_phrase(Some(raw), is_five_hour, language)
             );
             let reset_galley = painter.layout_no_wrap(
                 reset_text,
@@ -8352,7 +8352,8 @@ fn draw_provider_card(
     let inner_left = card_rect.left() + 10.0;
     let inner_w = card_rect.width() - 20.0;
 
-    let has_5h = quota.five_hour_percent.is_some() || quota.five_hour_reset.is_some();
+    let (five_hour_percent, five_hour_reset) = quota.current_five_hour_window();
+    let has_5h = five_hour_percent.is_some() || five_hour_reset.is_some();
     let has_wk = quota.week_percent.is_some() || quota.week_reset.is_some();
 
     if has_5h && has_wk {
@@ -8370,8 +8371,8 @@ fn draw_provider_card(
             egui::pos2(inner_left, div_y + 5.0),
             inner_w,
             title_5h,
-            quota.five_hour_percent.unwrap_or(100),
-            quota.five_hour_reset.as_deref(),
+            five_hour_percent.unwrap_or(100),
+            five_hour_reset,
             true,
             five_h_throttled,
             forecast,
@@ -8408,8 +8409,8 @@ fn draw_provider_card(
             egui::pos2(inner_left, div_y + 5.0),
             inner_w,
             title_5h,
-            quota.five_hour_percent.unwrap_or(100),
-            quota.five_hour_reset.as_deref(),
+            five_hour_percent.unwrap_or(100),
+            five_hour_reset,
             true,
             five_h_throttled,
             forecast,
