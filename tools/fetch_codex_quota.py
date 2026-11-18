@@ -9,8 +9,16 @@ import shutil
 import sys
 
 
-def normalize_windows(limits: dict, now: dt.datetime, *, app_server: bool = False) -> dict | None:
+def normalize_windows(
+    limits: dict,
+    now: dt.datetime,
+    *,
+    app_server: bool = False,
+    observed_at: dt.datetime | None = None,
+) -> dict | None:
     result = {}
+    observed_epoch = int((observed_at or now).timestamp())
+    source = "app_server" if app_server else "session_log"
     for key in ("primary", "secondary"):
         window = limits.get(key)
         if not isinstance(window, dict):
@@ -25,8 +33,35 @@ def normalize_windows(limits: dict, now: dt.datetime, *, app_server: bool = Fals
             continue
         result[label] = {
             "remaining_percent": round(100 - used),
+            "consumed_percent": float(used),
             "reset_epoch": int(reset),
+            "observed_epoch": observed_epoch,
+            "source": source,
+            "window_minutes": duration,
         }
+    return result or None
+
+
+def normalize_app_server_response(response: dict, now: dt.datetime) -> dict | None:
+    """Normalize GetAccountRateLimitsResponse using envelope-level throttle fields."""
+    limits = response.get("rateLimits")
+    if not isinstance(limits, dict) or limits.get("limitId") != "codex":
+        return None
+
+    result = normalize_windows(limits, now, app_server=True) or {}
+    ordinary_allowed = response.get("ordinaryUsageAllowed")
+    reached_raw = response.get("rateLimitReachedType")
+    reached_type = (
+        reached_raw.strip()
+        if isinstance(reached_raw, str) and reached_raw.strip()
+        else None
+    )
+
+    if ordinary_allowed is False or reached_type is not None:
+        result["is_throttled"] = True
+        if reached_type is not None:
+            result["rate_limit_reached_type"] = reached_type
+
     return result or None
 
 
@@ -109,9 +144,8 @@ async def app_server_quota(now: dt.datetime) -> dict | None:
             )
         if isinstance(response, dict) and "_jsonrpc_error" in response:
             return None
-        limits = response.get("rateLimits") if isinstance(response, dict) else None
-        if isinstance(limits, dict) and limits.get("limitId") == "codex":
-            return normalize_windows(limits, now, app_server=True)
+        if isinstance(response, dict):
+            return normalize_app_server_response(response, now)
         return None
     except (OSError, TimeoutError, asyncio.TimeoutError, BrokenPipeError):
         return None
@@ -175,7 +209,7 @@ def latest_quota(sessions: Path, now: dt.datetime) -> dict | None:
     if newest is None:
         return None
 
-    return normalize_windows(newest[1], now)
+    return normalize_windows(newest[1], now, observed_at=newest[0])
 
 
 def fetch_quota(sessions: Path, now: dt.datetime) -> dict | None:

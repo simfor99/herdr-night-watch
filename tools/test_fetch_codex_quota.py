@@ -7,7 +7,13 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from fetch_codex_quota import app_server_quota, fetch_quota, latest_quota, normalize_windows
+from fetch_codex_quota import (
+    app_server_quota,
+    fetch_quota,
+    latest_quota,
+    normalize_app_server_response,
+    normalize_windows,
+)
 
 
 class CodexQuotaTest(unittest.TestCase):
@@ -216,6 +222,138 @@ class CodexQuotaTest(unittest.TestCase):
             with patch("fetch_codex_quota.app_server_quota", side_effect=RuntimeError("app-server failed")):
                 result = fetch_quota(sessions, now)
             self.assertEqual(result["five_hour"]["remaining_percent"], 90)
+
+    def test_preserves_unrounded_consumption_source_and_observation_time(self):
+        now = dt.datetime(2026, 9, 23, 18, 20, tzinfo=dt.timezone.utc)
+        app_limits = {
+            "primary": {"usedPercent": 2, "windowDurationMins": 10080, "resetsAt": 1790790254},
+            "secondary": None,
+        }
+        app_result = normalize_windows(app_limits, now, app_server=True)
+        self.assertEqual(app_result["week"]["remaining_percent"], 98)
+        self.assertEqual(app_result["week"]["consumed_percent"], 2.0)
+        self.assertEqual(app_result["week"]["source"], "app_server")
+        self.assertEqual(app_result["week"]["observed_epoch"], int(now.timestamp()))
+        self.assertEqual(app_result["week"]["window_minutes"], 10080)
+
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory)
+            day = sessions / "2026/09/23"
+            day.mkdir(parents=True)
+            observed = dt.datetime(2026, 9, 23, 17, 59, tzinfo=dt.timezone.utc)
+            event = {
+                "timestamp": "2026-09-23T17:59:00Z",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {"used_percent": 1.5, "window_minutes": 10080, "resets_at": 1790790254},
+                    },
+                },
+            }
+            (day / "rollout-test.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+            log_result = latest_quota(sessions, now)
+            self.assertEqual(log_result["week"]["remaining_percent"], 98)
+            self.assertEqual(log_result["week"]["consumed_percent"], 1.5)
+            self.assertEqual(log_result["week"]["source"], "session_log")
+            self.assertEqual(log_result["week"]["observed_epoch"], int(observed.timestamp()))
+
+    def test_rounded_zero_in_log_retains_unrounded_consumed_percent(self):
+        now = dt.datetime(2026, 9, 23, 18, 20, tzinfo=dt.timezone.utc)
+        limits = {
+            "primary": {"used_percent": 99.6, "window_minutes": 10080, "resets_at": 1790790254},
+        }
+        result = normalize_windows(limits, now, app_server=False)
+        self.assertEqual(result["week"]["remaining_percent"], 0)
+        self.assertEqual(result["week"]["consumed_percent"], 99.6)
+        self.assertEqual(result["week"]["source"], "session_log")
+
+    def test_app_server_envelope_ordinary_usage_allowed_and_snake_case_reached_type(self):
+        now = dt.datetime(2026, 9, 23, 18, 20, tzinfo=dt.timezone.utc)
+
+        # Case 1: ordinaryUsageAllowed=False alongside rateLimits (two windows, no rateLimitReachedType)
+        rpc_envelope_no_reason = {
+            "ordinaryUsageAllowed": False,
+            "rateLimitReachedType": None,
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 80, "windowDurationMins": 300, "resetsAt": 1790190000},
+                "secondary": {"usedPercent": 100, "windowDurationMins": 10080, "resetsAt": 1790790254},
+            },
+        }
+        res_no_reason = normalize_app_server_response(rpc_envelope_no_reason, now)
+        self.assertTrue(res_no_reason["is_throttled"])
+        self.assertNotIn("rate_limit_reached_type", res_no_reason)
+        self.assertNotIn("week_throttled", res_no_reason)
+        self.assertNotIn("five_hour_throttled", res_no_reason)
+        self.assertEqual(res_no_reason["five_hour"]["remaining_percent"], 20)
+        self.assertEqual(res_no_reason["week"]["remaining_percent"], 0)
+
+        # Case 2: real snake_case rateLimitReachedType at RPC result level through app_server_quota
+        responses = [
+            {"id": 1, "result": {}},
+            {
+                "id": 2,
+                "result": {
+                    "ordinaryUsageAllowed": False,
+                    "rateLimitReachedType": "rate_limit_reached",
+                    "rateLimits": {
+                        "limitId": "codex",
+                        "primary": {"usedPercent": 35, "windowDurationMins": 300, "resetsAt": 1790190000},
+                        "secondary": {"usedPercent": 20, "windowDurationMins": 10080, "resetsAt": 1790790254},
+                    },
+                },
+            },
+        ]
+
+        class FakeStdin:
+            def write(self, _line):
+                pass
+
+            async def drain(self):
+                pass
+
+        class FakeStdout:
+            async def readline(self):
+                return (json.dumps(responses.pop(0)) + "\n").encode()
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeStdin()
+                self.stdout = FakeStdout()
+                self.returncode = None
+
+            def terminate(self):
+                self.returncode = 0
+
+            async def wait(self):
+                return self.returncode
+
+        with patch.dict(os.environ, {"CODEX_BIN": "/custom/bin/codex"}), patch(
+            "fetch_codex_quota.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=FakeProcess(),
+        ):
+            rpc_result = asyncio.run(app_server_quota(now))
+
+        self.assertTrue(rpc_result["is_throttled"])
+        self.assertEqual(rpc_result["rate_limit_reached_type"], "rate_limit_reached")
+        self.assertNotIn("week_throttled", rpc_result)
+        self.assertNotIn("five_hour_throttled", rpc_result)
+        self.assertEqual(rpc_result["week"]["remaining_percent"], 80)
+
+        # Case 3: ordinaryUsageAllowed=True -> not throttled
+        rpc_allowed = {
+            "ordinaryUsageAllowed": True,
+            "rateLimitReachedType": None,
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": 1790190000},
+                "secondary": {"usedPercent": 10, "windowDurationMins": 10080, "resetsAt": 1790790254},
+            },
+        }
+        res_allowed = normalize_app_server_response(rpc_allowed, now)
+        self.assertNotIn("is_throttled", res_allowed)
 
 
 if __name__ == "__main__":

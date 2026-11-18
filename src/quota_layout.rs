@@ -57,7 +57,16 @@ pub(crate) fn reorder_quota_order(
 /// The reset that ends a provider's depletion, for the minimized card row:
 /// a drained weekly budget is the real blocker, otherwise the session reset.
 pub(crate) fn minimized_reset_raw(quota: &ProviderQuota) -> Option<String> {
-    if !quota.is_throttled {
+    if !quota.provider_is_throttled() {
+        return None;
+    }
+    if quota.id == ProviderId::Codex {
+        if quota.week_is_throttled() {
+            return quota.week_reset.clone();
+        }
+        if quota.five_hour_is_throttled() {
+            return quota.five_hour_reset.clone();
+        }
         return None;
     }
     if quota.week_percent == Some(0) {
@@ -170,6 +179,24 @@ mod tests {
             Some("01.10.".into()),
         );
         assert_eq!(minimized_reset_raw(&healthy), None);
+    }
+
+    #[test]
+    fn minimized_codex_with_rounded_zero_week_without_confirmed_lock_hides_week_reset() {
+        let mut codex = ProviderQuota::new(
+            ProviderId::Codex,
+            "Codex",
+            "OpenAI",
+            Some(40),
+            Some("16:34".into()),
+            Some(0),
+            Some("25.11. (12:00)".into()),
+        );
+        codex.week_confirmed_exhausted = false;
+        codex.five_hour_confirmed_exhausted = false;
+        codex.explicit_provider_throttle = true;
+        codex.is_throttled = true;
+        assert_eq!(minimized_reset_raw(&codex), None);
     }
 
     #[test]

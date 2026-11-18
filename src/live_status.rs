@@ -2899,7 +2899,7 @@ fn persist_window_position(app: &mut LiveStatusApp, ctx: &egui::Context) {
 }
 
 fn provider_card_height(quota: &ProviderQuota, minimize_depleted: bool) -> f32 {
-    if minimize_depleted && quota.is_throttled {
+    if minimize_depleted && quota.provider_is_throttled() {
         // Header row only: badge, subtitle, LED and the reset hint.
         return 30.0;
     }
@@ -6129,7 +6129,7 @@ fn media_info_row(
                 ProviderId::Claude => show_claude,
                 ProviderId::Qwen => show_qwen,
             };
-            visible && p.is_throttled
+            visible && p.provider_is_throttled()
         })
         .map(|p| p.title)
         .collect();
@@ -7627,7 +7627,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     let pointer = ui.input(|i| i.pointer.latest_pos());
                     for quota in &visible_providers {
                         let card_minimized =
-                            app.quota_minimize_depleted && quota.is_throttled;
+                            app.quota_minimize_depleted && quota.provider_is_throttled();
                         let card_h = provider_card_height(quota, app.quota_minimize_depleted);
                         let row_rect = egui::Rect::from_min_size(
                             egui::pos2(rect.left() + 8.0, current_y),
@@ -7716,7 +7716,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             let forecast = quota.pacing_forecast();
                             let card_color = app.provider_color(drag.provider);
                             let ghost_minimized =
-                                app.quota_minimize_depleted && quota.is_throttled;
+                                app.quota_minimize_depleted && quota.provider_is_throttled();
                             draw_provider_card(
                                 painter, ghost_rect, quota, &forecast, language, card_color,
                                 ghost_minimized,
@@ -8184,7 +8184,11 @@ fn draw_smooth_limit_block(
     };
     if !pace_text.is_empty() {
         let pace_color = {
-            let pc = crate::quota::pace_light(is_throttled, pct, &light, pace_ratio_opt);
+            let pc = if is_five_hour {
+                crate::quota::pace_light(is_throttled, pct, &light, pace_ratio_opt)
+            } else {
+                crate::quota::week_pace_light(is_throttled, pct, &light, forecast)
+            };
             let (pr, pg, pb) = pc.rgb();
             egui::Color32::from_rgb(pr, pg, pb)
         };
@@ -8278,7 +8282,12 @@ fn draw_provider_card(
     );
 
     // Right: Pure status LED light without text clutter (per Simon's request)
-    let (led_color, halo_color) = match forecast.health {
+    let led_health = if quota.provider_is_throttled() {
+        PacingHealth::Throttled
+    } else {
+        forecast.health
+    };
+    let (led_color, halo_color) = match led_health {
         PacingHealth::Surplus | PacingHealth::OnTrack => (
             egui::Color32::from_rgb(34, 197, 94),
             egui::Color32::from_rgba_unmultiplied(34, 197, 94, 70),
@@ -8355,7 +8364,7 @@ fn draw_provider_card(
         // A provider without any spendable budget (week or session at zero)
         // renders both blocks disabled: a full session window is worthless
         // when the weekly budget is exhausted.
-        let five_h_throttled = quota.is_throttled;
+        let five_h_throttled = quota.five_hour_is_throttled();
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 5.0),
@@ -8374,7 +8383,7 @@ fn draw_provider_card(
         } else {
             language.text("Wochen-Limit", "Weekly Limit")
         };
-        let week_throttled = quota.is_throttled;
+        let week_throttled = quota.week_is_throttled();
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 41.0),
@@ -8393,7 +8402,7 @@ fn draw_provider_card(
         } else {
             language.text("5h-Limit", "5-Hour Limit")
         };
-        let five_h_throttled = quota.is_throttled;
+        let five_h_throttled = quota.five_hour_is_throttled();
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 5.0),
@@ -8412,7 +8421,7 @@ fn draw_provider_card(
         } else {
             language.text("Wochen-Limit", "Weekly Limit")
         };
-        let week_throttled = quota.is_throttled;
+        let week_throttled = quota.week_is_throttled();
         draw_smooth_limit_block(
             painter,
             egui::pos2(inner_left, div_y + 5.0),
