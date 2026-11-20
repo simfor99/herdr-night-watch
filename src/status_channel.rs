@@ -349,7 +349,10 @@ pub fn attention_tooltip_lines(
         suppressed_done,
         language.text("Zuarbeiter fertig", "helpers finished"),
     );
-    let unclear = fleet.blocked + fleet.unknown;
+    // `fleet.blocked` enthält auch Agenten, die schon in „für dich“ (attention_blocked) oder in der ⚠-Zeile
+    // (suppressed_blocked) stehen. Nur der Rest ist wirklich unklar; sonst erscheint ein Agent zweimal.
+    let already_listed_blocked = attention.attention_blocked.unwrap_or(0) + suppressed_blocked;
+    let unclear = fleet.blocked.saturating_sub(already_listed_blocked) + fleet.unknown;
     if unclear > 0 {
         summary.push_str(&format!(
             ", +{unclear} {}",
@@ -469,6 +472,20 @@ mod attention_tests {
         );
         assert_eq!(lines.len(), 1 + ATTENTION_TOOLTIP_ITEM_LIMIT);
         assert_eq!(lines[1], "ws0 › architekt · blocked");
+    }
+
+    #[test]
+    fn blocked_attention_agents_are_not_counted_again_as_unclear() {
+        let mut attention: AttentionPayload = serde_json::from_str(NEW_PAYLOAD).expect("new payload");
+        attention.attention_blocked = Some(1);
+        attention.suppressed_blocked = Some(0);
+        // Zwei blockierte Agenten insgesamt, davon einer bereits als „für dich“ gezählt.
+        let fleet = FleetCounts { total: 35, working: 12, idle: 6, blocked: 2, unknown: 0 };
+        let lines = attention_tooltip_lines(fleet, &attention, Language::English);
+        assert_eq!(
+            lines[0],
+            "35 detected: 12 working, 6 ready, 1 for you, 16 helpers finished, +1 blocked/unclear"
+        );
     }
 }
 

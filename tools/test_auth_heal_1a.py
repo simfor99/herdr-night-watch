@@ -168,9 +168,16 @@ def test_unreadable_bounce_state_fails_closed(world, env):
 # ---- Bedingung 1: Token- und quotas.json-Vortest (rein lesend) ----
 
 def _quota(env, *, updated, auth="ok", active="a"):
+    """Snapshot gehört zum aktiven Konto der Registry; sonst gilt er nicht als Nachweis (quotas_anderes_konto)."""
     env.state.mkdir(parents=True, exist_ok=True)
+    reg_path = env.state / "accounts.json"
+    reg = json.loads(reg_path.read_text(encoding="utf-8"))
+    block = reg["providers"].setdefault("agy", {"active_account": None, "switch_epoch": None, "slots": []})
+    block["active_account"], block["switch_epoch"] = active, SWITCH_EPOCH
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
     snap = {"version": 1, "updated_epoch": updated, "providers": {"agy": {
-        "active_account": active, "accounts": [{"id": active, "auth_state": auth}]}}}
+        "active_account": active, "switch_epoch": SWITCH_EPOCH,
+        "accounts": [{"id": active, "auth_state": auth}]}}}
     (env.state / "quotas.json").write_text(json.dumps(snap), encoding="utf-8")
 
 
@@ -258,11 +265,11 @@ def test_auth_401_blocks_unhealthy_disk_state(world, env, setup, expected):
     add_agy(world.proc, 4242, "w1:p1", cwd=world.cwd, start_epoch=SWITCH_EPOCH + 100)
     if setup != "no_token":
         _healthy_token_and_slot(env)
-    if setup == "no_active":
-        (env.state / "accounts.json").write_text(json.dumps({"version": 1, "providers": {"agy": {
-            "active_account": None, "switch_epoch": SWITCH_EPOCH, "slots": []}}}), encoding="utf-8")
     if setup != "no_quota":
         _quota(env, updated=time.time(), auth="ok")
+    if setup == "no_active":  # nach _quota, sonst überschreibt der Helfer den Registry-Zustand
+        (env.state / "accounts.json").write_text(json.dumps({"version": 1, "providers": {"agy": {
+            "active_account": None, "switch_epoch": SWITCH_EPOCH, "slots": []}}}), encoding="utf-8")
     plan = plan_for(world, herdr=FakeHerdr([pane()], tab="architekt", screen=ARCH_SCREEN),
                     reason="auth_401", source="msg-1")
     assert expected in plan["blockers"], plan["blockers"]
@@ -406,10 +413,62 @@ def _powershell_calls(name):
     return sites
 
 
+def _unsafe_powershell_reasons(node):
+    """Gründe, warum ein powershell-Aufruf nicht sicher gebunden ist. Leer heißt: stdin=DEVNULL und endliche Frist."""
+    reasons = []
+    values = {k.arg: k.value for k in node.keywords}
+    stdin = values.get("stdin")
+    if not (isinstance(stdin, ast.Attribute) and stdin.attr == "DEVNULL"):
+        reasons.append("stdin ist nicht subprocess.DEVNULL")
+    timeout = values.get("timeout")
+    if timeout is None:
+        reasons.append("timeout fehlt")
+    elif isinstance(timeout, ast.Constant) and not (isinstance(timeout.value, (int, float))
+                                                    and not isinstance(timeout.value, bool)
+                                                    and 0 < timeout.value < float("inf")):
+        reasons.append(f"timeout ist keine positive endliche Frist: {timeout.value!r}")
+    return reasons
+
+
 @pytest.mark.parametrize("name", sorted(PS_SITES))
 def test_every_powershell_call_sets_stdin_and_timeout(name):
     sites = _powershell_calls(name)
     assert sites, f"{name}: kein powershell-Aufruf gefunden (Prüfung wäre leer)"
     for fn_name, node in sites:
-        keywords = {k.arg for k in node.keywords}
-        assert {"stdin", "timeout"} <= keywords, f"{name}:{fn_name} ohne stdin/timeout: {sorted(keywords)}"
+        assert _unsafe_powershell_reasons(node) == [], f"{name}:{fn_name}: {_unsafe_powershell_reasons(node)}"
+
+
+def test_the_powershell_check_rejects_none_values_and_a_missing_timeout():
+    """Gegenprobe: stdin=None und timeout=None dürfen nicht als gebunden gelten."""
+    unsafe = ast.parse("subprocess.run(['powershell'], stdin=None, timeout=None)").body[0].value
+    assert _unsafe_powershell_reasons(unsafe) == [
+        "stdin ist nicht subprocess.DEVNULL", "timeout ist keine positive endliche Frist: None"]
+    no_timeout = ast.parse("subprocess.run(['powershell'], stdin=subprocess.DEVNULL)").body[0].value
+    assert _unsafe_powershell_reasons(no_timeout) == ["timeout fehlt"]
+    zero = ast.parse("subprocess.run(['powershell'], stdin=subprocess.DEVNULL, timeout=0)").body[0].value
+    assert len(_unsafe_powershell_reasons(zero)) == 1
+
+
+def test_a_stop_timeout_is_reported_as_a_structured_result_without_a_second_stop(monkeypatch, capsys):
+    """Regression: subprocess.run(..., timeout=15) warf TimeoutExpired, das Skript endete ohne JSON-Ergebnis."""
+    import subprocess as sp
+
+    import verify_tray_quit as vtq
+
+    calls = []
+    payload = {"windows": [{"title": "Herdr-Nachtwächter - Live-Status"}],
+               "processes": [{"ProcessId": 111, "CommandLine": "herdr-nachtwaechter.exe"}]}
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == "python.exe":
+            return sp.CompletedProcess(argv, 0, "", "")
+        raise sp.TimeoutExpired(argv, kwargs.get("timeout", 15))  # powershell.exe Stop-Process hängt
+
+    monkeypatch.setattr(vtq.subprocess, "run", fake_run)
+    monkeypatch.setattr(vtq, "dump", lambda: payload)
+    assert vtq.main() == 3
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["reason"] == "stop_timeout" and out["stop_pids"] == [111]
+    assert out["remaining_tray_pids"] == [111]
+    assert sum(1 for argv in calls if argv[0] == "powershell.exe") == 1  # kein blindes Wiederholen

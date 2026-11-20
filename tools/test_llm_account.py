@@ -421,7 +421,8 @@ def test_pure_token_clobber_keeps_origin_scope_and_restores_active_scope(env):
     assert scope_live.read_text() == "SCOPE-B"
 
 
-def test_origin_scope_is_created_only_when_missing(env):
+def test_origin_scope_is_not_filled_from_the_active_accounts_live_scope(env):
+    """Der Live-Scope gehört zum aktiven Konto (B). Ein Alt-Prozess-Token von A darf ihn nicht in Slot A kopieren."""
     two_accounts_saved(env)
     origin_scope = env.state / "profiles/agy/acc1" / la.AgyAdapter.scope_rel
     origin_scope.unlink()
@@ -431,8 +432,8 @@ def test_origin_scope_is_created_only_when_missing(env):
 
     assert la.main(["heal", "agy"]) == 0
 
-    assert origin_scope.exists()
-    assert origin_scope.read_text() == "scope-b@example.test"  # fehlender Scope kommt aus dem Live-Home
+    assert not origin_scope.exists()  # fehlender Scope bleibt fehlend
+    assert "b@example.test" in live_token(env).read_text()  # aktives Konto B unverändert
 
 
 def test_invalidate_caches_tolerates_files_vanishing_between_check_and_unlink(env, monkeypatch):
@@ -573,10 +574,74 @@ def test_opener_shim_falls_back_to_the_windows_profile_when_cdp_is_unreachable(t
     assert "Windows-Chrome-Debugprofil" in done.stderr
     recorded = log.read_text(encoding="utf-8").split("\n")
     assert "Start-Process" in recorded[0].replace("\0", " ")
-    assert f"--user-data-dir={CHROME_PROFILE_FIXTURE}" in recorded[0]
+    assert f'--user-data-dir="{CHROME_PROFILE_FIXTURE}"' in recorded[0]  # Start-Process braucht die Anführungszeichen
     assert "$env:LLM_LOGIN_URL" in recorded[0]
     assert recorded[1] == url
     assert "google-chrome" not in recorded[0]
+
+
+def _recording_powershell(fake_bin: Path, log: Path) -> None:
+    """Fake powershell.exe: schreibt Argumente (NUL-getrennt), LLM_LOGIN_URL und WSLENV in das Log."""
+    ps = fake_bin / "powershell.exe"
+    ps.write_text(
+        '#!/bin/sh\nfor a in "$@"; do printf \'%s\\0\' "$a"; done >> "$PS_LOG"\n'
+        'printf \'\\n%s\\n\' "$LLM_LOGIN_URL" >> "$PS_LOG"\n'
+        'printf \'%s\\n\' "$WSLENV" >> "$PS_LOG"\nexit 0\n',
+        encoding="utf-8",
+    )
+    ps.chmod(0o755)
+
+
+def test_opener_shim_resolves_the_windows_profile_through_cmd_exe_without_an_override(tmp_path):
+    """Regression: windows_local_app_data() nutzt re.match; fehlt der Import, bricht der Opener mit NameError ab."""
+    import subprocess as sp
+
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir()
+    log = tmp_path / "ps.log"
+    _recording_powershell(fake_bin, log)
+    cmd = tmp_path / "cmd.exe"
+    cmd.write_text("#!/bin/sh\nprintf '%s\\n' 'C:\\Users\\Alice\\AppData\\Local'\n", encoding="utf-8")
+    cmd.chmod(0o755)
+    shim = _shim_file(tmp_path)
+    env = dict(os.environ, PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+               LLM_ACCOUNTS_CMD_EXE=str(cmd), LLM_ACCOUNTS_CDP_HOST="127.0.0.1",
+               LLM_ACCOUNTS_CDP_PORT=str(_free_port()), LLM_ACCOUNTS_CLIP="", PS_LOG=str(log))
+    env.pop("LLM_ACCOUNT_CHROME_PROFILE", None)
+
+    done = sp.run([str(shim), "https://accounts.example.test/login"], env=env, capture_output=True,
+                  text=True, timeout=60)
+
+    assert "NameError" not in done.stderr
+    assert done.returncode == 0
+    assert "Windows-Chrome-Debugprofil" in done.stderr
+    recorded = log.read_text(encoding="utf-8")
+    assert r'--user-data-dir="C:\Users\Alice\AppData\Local\Google\Chrome-Debug-Profile"' in recorded
+
+
+def test_opener_shim_forwards_the_login_url_to_windows_and_keeps_existing_wslenv_entries(tmp_path):
+    import subprocess as sp
+
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir()
+    log = tmp_path / "ps.log"
+    _recording_powershell(fake_bin, log)
+    shim = _shim_file(tmp_path)
+    env = dict(os.environ, PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+               LLM_ACCOUNTS_CDP_HOST="127.0.0.1", LLM_ACCOUNTS_CDP_PORT=str(_free_port()),
+               LLM_ACCOUNTS_CLIP="", PS_LOG=str(log), WSLENV="FOO/u:BAR/p",
+               LLM_ACCOUNT_CHROME_PROFILE=CHROME_PROFILE_FIXTURE)
+
+    done = sp.run([str(shim), "https://accounts.example.test/login"], env=env, capture_output=True,
+                  text=True, timeout=60)
+
+    assert done.returncode == 0
+    recorded = log.read_text(encoding="utf-8").split("\n")
+    assert recorded[2] == "FOO/u:BAR/p:LLM_LOGIN_URL"
+    shim_ns: dict = {"__name__": "opener_shim"}
+    exec(la.OPENER_SHIM_TEMPLATE.replace("__PYTHON__", sys.executable), shim_ns)  # __main__-Guard verhindert Start
+    assert shim_ns["wslenv_with_login_url"](None) == "LLM_LOGIN_URL"
+    assert shim_ns["wslenv_with_login_url"]("LLM_LOGIN_URL/u:X") == "LLM_LOGIN_URL/u:X"
 
 
 def test_login_succeeds_when_agy_writes_only_the_oauth_token(env, monkeypatch):
@@ -631,3 +696,69 @@ def test_heal_on_the_same_account_restores_a_scope_that_reappeared_in_live_home(
     assert la.main(["heal", "agy"]) == 0
 
     assert profile_scope.read_text(encoding="utf-8") == "SCOPE-NEW"
+
+
+# ---- CodeRabbit-Befunde (Folgecommit): Cooldown-Lock, Dry-Run, Zeitauflösung, Token-Bytes, Snapshot, Quota-Bindung ----
+
+
+def test_a_second_bounce_inside_the_cooldown_is_refused_and_keeps_the_first_entry(env):
+    la.record_bounce_attempt("w1:p7", None, now=1000.0)
+    with pytest.raises(la.CliError):
+        la.record_bounce_attempt("w1:p7", None, now=1100.0)
+    data = json.loads((env.state / "bounce-state.json").read_text(encoding="utf-8"))
+    assert data["w1:p7"] == {"ts": 1000.0, "switch_epoch": None}
+
+
+def test_reading_the_cooldown_does_not_create_the_state_directory(env):
+    assert not env.state.exists()
+    assert la.anti_loop_cooldown("w1:p1", None) == 0.0
+    assert not env.state.exists()
+
+
+def test_mark_active_keeps_the_subsecond_switch_time(monkeypatch):
+    monkeypatch.setattr(la.time, "time", lambda: 1_795_000_000.8)
+    block = {"active_account": None, "switch_epoch": None, "slots": []}
+    la.mark_active(block, "acc1")
+    assert block["switch_epoch"] == 1_795_000_000.8
+
+
+def test_heal_copies_the_token_bytes_it_identified_not_a_later_write(env, monkeypatch):
+    two_accounts_saved(env)  # aktiv B
+    la.main(["use", "agy", "acc1"])  # aktiv A, Live-Home = A
+    past = time.time() - 3600
+    os.utime(profile_token(env, "acc1"), (past, past))  # Live-Token ist neuer, also wäre ein Sync fällig
+    original_copy = la.copy_files
+
+    def racing_copy(src_root, dst_root, rels, **kwargs):
+        write_account(env.live, "b@example.test", marker="-RACE")  # Alt-Prozess schreibt B in die Live-Datei
+        return original_copy(src_root, dst_root, rels, **kwargs)
+
+    monkeypatch.setattr(la, "copy_files", racing_copy)
+    assert la.main(["heal", "agy"]) == 0
+    assert "a@example.test" in profile_token(env, "acc1").read_text(encoding="utf-8")
+
+
+def test_snapshot_is_not_written_when_retire_overtakes_the_probes(env, monkeypatch):
+    two_accounts_saved(env)
+
+    def probes_then_retire(adapter, slots):
+        la.cmd_retire(adapter, "acc1", force=False)  # überholt die laufende Auswertung
+        return {s["id"]: {"auth_state": la.AUTH_OK, "lanes": {}} for s in slots}
+
+    monkeypatch.setattr(la, "probe_slots", probes_then_retire)
+    snapshot = la.fetch_provider_status(la.ADAPTERS["agy"], write_quotas=True)
+
+    assert snapshot.get("registry_changed") is True
+    assert not (env.state / "quotas.json").exists()
+
+
+def test_quota_snapshot_for_another_account_does_not_prove_the_live_account(env):
+    two_accounts_saved(env)  # aktiv acc2 (B)
+    switch_epoch = registry(env)["switch_epoch"]
+    snap = {"version": 1, "updated_epoch": time.time(), "providers": {"agy": {
+        "active_account": "acc1", "switch_epoch": switch_epoch,
+        "accounts": [{"id": "acc1", "auth_state": "ok"}]}}}
+    env.state.mkdir(parents=True, exist_ok=True)
+    (env.state / "quotas.json").write_text(json.dumps(snap), encoding="utf-8")
+
+    assert "disk_token_unhealthy:quotas_anderes_konto" in la.disk_token_blockers(la.ADAPTERS["agy"], reason="auth_401")

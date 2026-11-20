@@ -213,9 +213,9 @@ def install_profile_to_live(adapter: "AgyAdapter", pdir: Path) -> None:
         _unlink_if_present(live_home() / adapter.scope_rel)
 
 
-def mirror_live_to_profile(adapter: "AgyAdapter", pdir: Path) -> None:
-    """Live-Home -> Profil bei save: Token immer; Scope spiegeln, auch fehlende Datei im Profil entfernen."""
-    copy_files(live_home(), pdir, (adapter.token_rel,), owner_only=True)
+def mirror_live_to_profile(adapter: "AgyAdapter", pdir: Path, token_bytes: bytes) -> None:
+    """Live-Home -> Profil bei save: Token aus den bereits geprüften Bytes; Scope spiegeln, fehlende Datei entfernen."""
+    atomic_write(pdir / adapter.token_rel, token_bytes, owner_only=True)
     if (live_home() / adapter.scope_rel).exists():
         copy_files(live_home(), pdir, (adapter.scope_rel,), owner_only=True)
     else:
@@ -279,18 +279,28 @@ def slot_for_email(block: dict[str, Any], email: str) -> dict[str, Any] | None:
 
 
 def mark_active(block: dict[str, Any], slot_id: str) -> None:
+    # Sekundengenau abgeschnitten würde ein Prozess, der kurz vor dem Wechsel startete, als neuer gelten.
     if block.get("active_account") != slot_id:
         block["active_account"] = slot_id
-        block["switch_epoch"] = int(time.time())
+        block["switch_epoch"] = time.time()
+
+
+def identity_from_bytes(raw: bytes) -> str | None:
+    """E-Mail aus genau diesen Token-Bytes. Identität und Kopie müssen dieselben Bytes verwenden."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    email = data.get("id_token_email") if isinstance(data, dict) else None
+    return email if isinstance(email, str) and email else None
 
 
 def read_id_email(token_path: Path) -> str | None:
     try:
-        data = json.loads(token_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        raw = token_path.read_bytes()
+    except OSError:
         return None
-    email = data.get("id_token_email") if isinstance(data, dict) else None
-    return email if isinstance(email, str) and email else None
+    return identity_from_bytes(raw)
 
 
 def invalidate_caches() -> list[str]:
@@ -335,7 +345,13 @@ def heal_locked(adapter: AgyAdapter) -> str:
     active = find_slot(block, active_id)
     if active is None:
         raise CliError(f"active_account {active_id!r} fehlt in den Slots der Registry.", 3)
-    live_email = read_id_email(live_token)
+    # Die Live-Datei wird genau einmal gelesen. Identität und Kopie stammen aus denselben Bytes, sonst könnte
+    # ein Alt-Prozess zwischen Prüfung und Kopie ein fremdes Token in das Profil dieses Kontos schreiben.
+    try:
+        token_bytes = live_token.read_bytes()
+    except OSError:
+        return "unreadable"
+    live_email = identity_from_bytes(token_bytes)
     if live_email is None:
         return "unreadable"
 
@@ -349,7 +365,7 @@ def heal_locked(adapter: AgyAdapter) -> str:
             not (pdir / adapter.scope_rel).exists() or live_scope.read_bytes() != (pdir / adapter.scope_rel).read_bytes()
         )
         if token_newer:
-            copy_files(live_home(), pdir, (adapter.token_rel,), owner_only=True)
+            atomic_write(pdir / adapter.token_rel, token_bytes, owner_only=True)
         if scope_new:
             copy_files(live_home(), pdir, (adapter.scope_rel,), owner_only=True)
         return "synced" if (token_newer or scope_new) else "current"
@@ -361,16 +377,15 @@ def heal_locked(adapter: AgyAdapter) -> str:
     rescued_to: str | None = None
     quarantined = False
     if origin is not None:
-        # Nur das Token gehört zum Alt-Prozess. Der Scope wandert nur in den Ursprungs-Slot, wenn dort
-        # noch keiner liegt und das Live-Home überhaupt einen trägt.
+        # Nur das Token gehört zum Alt-Prozess. Der Scope im Live-Home gehört weiter zum aktiven Konto und
+        # wird deshalb nie in den Ursprungs-Slot kopiert; ein dort fehlender Scope bleibt fehlend.
         origin_dir = profile_root(adapter, origin["id"])
-        copy_files(live_home(), origin_dir, (adapter.token_rel,), owner_only=True)
-        if not (origin_dir / adapter.scope_rel).exists() and (live_home() / adapter.scope_rel).exists():
-            copy_files(live_home(), origin_dir, (adapter.scope_rel,), owner_only=True)
+        atomic_write(origin_dir / adapter.token_rel, token_bytes, owner_only=True)
         rescued_to = origin["id"]
     else:
         qdir = ensure_owner_only_dir(state_dir() / "quarantine" / f"{time.time_ns()}")
-        copy_present(live_home(), qdir, adapter.swap_rels, owner_only=True)
+        atomic_write(qdir / adapter.token_rel, token_bytes, owner_only=True)
+        copy_present(live_home(), qdir, tuple(r for r in adapter.swap_rels if r != adapter.token_rel), owner_only=True)
         quarantined = True
     install_profile_to_live(adapter, pdir)
     log_event(
@@ -391,7 +406,11 @@ def heal_locked(adapter: AgyAdapter) -> str:
 def cmd_save(adapter: AgyAdapter, slot: str, label: str | None) -> str:
     validate_slot(slot)
     with switch_lock():
-        live_email = read_id_email(live_home() / adapter.token_rel)
+        try:
+            token_bytes = (live_home() / adapter.token_rel).read_bytes()
+        except OSError:
+            token_bytes = None
+        live_email = identity_from_bytes(token_bytes) if token_bytes is not None else None
         if live_email is None:
             raise CliError("Kein lesbares Live-Token zum Sichern gefunden.", 3)
         reg = load_registry()
@@ -402,7 +421,7 @@ def cmd_save(adapter: AgyAdapter, slot: str, label: str | None) -> str:
         entry = find_slot(block, slot)
         if entry is not None and entry.get("email") != live_email:
             raise CliError(f"Slot {slot} gehört zu einer anderen E-Mail; bitte einen neuen Slot wählen.", 4)
-        mirror_live_to_profile(adapter, profile_root(adapter, slot))
+        mirror_live_to_profile(adapter, profile_root(adapter, slot), token_bytes)
         if entry is None:
             entry = {"id": slot, "label": label or slot, "email": live_email, "state": ACTIVE}
             block["slots"].append(entry)
@@ -422,6 +441,7 @@ Reihenfolge: (a) Zwischenablage, (b) CDP-Tab im laufenden Chrome, (c) Windows-Ch
 (d) Standardbrowser über PowerShell. Niemals /usr/bin/google-chrome.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -432,7 +452,7 @@ import urllib.request
 CLIP_DEFAULT = "/mnt/c/Windows/System32/clip.exe"
 PS_DEFAULT = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 CHROME_EXE = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-CMD_EXE = "/mnt/c/Windows/System32/cmd.exe"
+CMD_EXE = os.environ.get("LLM_ACCOUNTS_CMD_EXE") or "/mnt/c/Windows/System32/cmd.exe"
 CDP_TIMEOUT_S = 3
 CLIP_TIMEOUT_S = 2
 PS_TIMEOUT_S = 15
@@ -549,8 +569,19 @@ def powershell():
     return PS_DEFAULT if os.path.exists(PS_DEFAULT) else None
 
 
+def wslenv_with_login_url(existing):
+    """WSLENV mit LLM_LOGIN_URL, bestehende Einträge und deren Flags bleiben erhalten.
+
+    Ohne Flag wird die Variable von WSL an den Windows-Prozess weitergereicht; ein Pfad-Flag wäre falsch.
+    """
+    entries = [entry for entry in (existing or "").split(":") if entry]
+    if "LLM_LOGIN_URL" not in {entry.split("/", 1)[0] for entry in entries}:
+        entries.append("LLM_LOGIN_URL")
+    return ":".join(entries)
+
+
 def run_powershell(ps, command, url):
-    env = dict(os.environ, LLM_LOGIN_URL=url)
+    env = dict(os.environ, LLM_LOGIN_URL=url, WSLENV=wslenv_with_login_url(os.environ.get("WSLENV")))
     try:
         done = subprocess.run([ps, "-NoProfile", "-Command", command], env=env, capture_output=True,
                               timeout=PS_TIMEOUT_S, check=False, stdin=subprocess.DEVNULL)
@@ -579,8 +610,11 @@ def main(argv):
         info(f"[llm-account] Kein Browser-Start möglich. Login-URL manuell öffnen: {url}")
         return 1
     profile = chrome_profile_dir()
+    # Start-Process verkettet das Array ohne Quoting; der Profilpfad braucht deshalb eigene doppelte
+    # Anführungszeichen in der nativen Befehlszeile. Einfache Anführungszeichen im PowerShell-Literal verdoppeln.
+    profile_ps = (profile or "").replace("'", "''")
     chrome_cmd = (f"Start-Process '{CHROME_EXE}' -ArgumentList "
-                  f"@('--user-data-dir={profile}', $env:LLM_LOGIN_URL)") if profile else ""
+                  f"@('--user-data-dir=\"{profile_ps}\"', $env:LLM_LOGIN_URL)") if profile else ""
     if profile and run_powershell(ps, chrome_cmd, url):
         info("[llm-account] Axi-Chrome nicht erreichbar; Login-URL im Windows-Chrome-Debugprofil geöffnet.")
         return 0
@@ -884,11 +918,17 @@ def fetch_provider_status(adapter: AgyAdapter, *, write_quotas: bool = False, no
     probes = probe_slots(adapter, active_slots)
     snapshot = build_snapshot(adapter, block, probes, current, heal_result)
     if write_quotas:
-        atomic_write(
-            state_dir() / "quotas.json",
-            (json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
-            owner_only=True,
-        )
+        # Ein parallel laufendes retire oder use hat die Auswertung während der Probes überholt. Dann wird
+        # nichts geschrieben: ein überholter Snapshot könnte einen ausgemusterten Slot wieder als gesund melden.
+        with switch_lock():
+            if copy.deepcopy(provider_block(load_registry(), adapter)) != block:
+                snapshot["registry_changed"] = True
+                return snapshot
+            atomic_write(
+                state_dir() / "quotas.json",
+                (json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+                owner_only=True,
+            )
     return snapshot
 
 
@@ -965,7 +1005,8 @@ def scan_agy_processes(root: Path, clk_tck: int | None = None) -> list[dict[str,
         # comm kann Leerzeichen und Klammern enthalten: am letzten ')' splitten.
         fields = raw_stat[raw_stat.rfind(")") + 2:].split()
         try:
-            start_epoch = btime + int(fields[19]) // ticks
+            # Bruchteile der Sekunde bleiben erhalten: der Vergleich mit switch_epoch braucht die Reihenfolge.
+            start_epoch = btime + int(fields[19]) / ticks
         except (IndexError, ValueError):
             continue
         conversation = _cmd_option(argv, "--conversation")
@@ -1213,21 +1254,25 @@ def statusline_active(screen: str) -> bool:
 
 
 def _load_anti_loop_state() -> dict[str, Any]:
-    path = ensure_state() / ANTI_LOOP_STATE_FILE
-    if not path.exists():
-        return {}
+    """Liest den Cooldown-Zustand ohne Seiteneffekte; ein fehlendes State-Verzeichnis ist ein leerer Zustand."""
+    path = state_dir() / ANTI_LOOP_STATE_FILE
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise CliError(f"{ANTI_LOOP_STATE_FILE} nicht lesbar: {exc}", 3) from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
         raise CliError(f"{ANTI_LOOP_STATE_FILE} nicht lesbar: {exc}", 3) from exc
     if not isinstance(data, dict):
         raise CliError(f"{ANTI_LOOP_STATE_FILE} hat unerwartetes Format.", 3)
     return data
 
 
-def anti_loop_cooldown(pane_id: str, switch_epoch: float | None, now: float | None = None) -> float:
-    """Bedingung 6: Restzeit in Sekunden. 0 heißt erlaubt. Ohne bekannten switch_epoch-Stand gilt die Sperre."""
-    entry = _load_anti_loop_state().get(pane_id)
+def _cooldown_in(data: dict[str, Any], pane_id: str, switch_epoch: float | None, now: float) -> float:
+    entry = data.get(pane_id)
     if not isinstance(entry, dict):
         return 0.0
     try:
@@ -1237,18 +1282,30 @@ def anti_loop_cooldown(pane_id: str, switch_epoch: float | None, now: float | No
     last_epoch = entry.get("switch_epoch")
     if switch_epoch is not None and last_epoch is not None and switch_epoch > last_epoch:
         return 0.0
+    return max(0.0, ANTI_LOOP_COOLDOWN_S - (now - last_ts))
+
+
+def anti_loop_cooldown(pane_id: str, switch_epoch: float | None, now: float | None = None) -> float:
+    """Bedingung 6: Restzeit in Sekunden. 0 heißt erlaubt. Ohne bekannten switch_epoch-Stand gilt die Sperre."""
     current = time.time() if now is None else now
-    return max(0.0, ANTI_LOOP_COOLDOWN_S - (current - last_ts))
+    return _cooldown_in(_load_anti_loop_state(), pane_id, switch_epoch, current)
 
 
 def record_bounce_attempt(pane_id: str, switch_epoch: float | None, now: float | None = None) -> None:
-    """Persistiert den Versuch vor /exit, auch wenn er später scheitert (Anti-Loop-Cap)."""
+    """Prüft den Cooldown und bucht den Versuch in einem Schritt unter demselben Lock, bevor /exit läuft.
+
+    Zwei parallele Aufrufe können so nicht beide die Prüfung bestehen: der zweite sieht die Buchung des ersten.
+    Ein Versuch innerhalb des Cooldowns wird abgelehnt und überschreibt den bestehenden Eintrag nicht.
+    """
     root = ensure_state()
     current = time.time() if now is None else now
     fd = os.open(root / ANTI_LOOP_LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         data = _load_anti_loop_state()
+        remaining = _cooldown_in(data, pane_id, switch_epoch, current)
+        if remaining > 0:
+            raise CliError(f"Anti-Loop-Cap für {pane_id}: noch {round(remaining)} s Sperre, kein /exit.", 4)
         data[pane_id] = {"ts": current, "switch_epoch": switch_epoch}
         atomic_write(root / ANTI_LOOP_STATE_FILE,
                      (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"), owner_only=True)
@@ -1313,6 +1370,13 @@ def disk_token_blockers(adapter: AgyAdapter, now: float | None = None, reason: s
         return blockers + ["disk_token_unhealthy:quotas_unlesbar"]
     if current - updated > QUOTA_MAX_AGE_S:
         blockers.append("disk_token_unhealthy:quotas_veraltet")
+    # Der Nachweis gilt nur für das Konto, das die Registry jetzt als aktiv führt. Ein Snapshot für ein anderes
+    # Konto (oder eine ältere Wechselepoche) bestätigt den aktuellen Live-Stand nicht.
+    reg_block = provider_block(load_registry(), adapter)
+    if provider.get("active_account") != reg_block.get("active_account") or \
+            provider.get("switch_epoch") != reg_block.get("switch_epoch"):
+        blockers.append("disk_token_unhealthy:quotas_anderes_konto")
+        return blockers
     active = provider.get("active_account")
     account = next((a for a in provider.get("accounts", []) if a.get("id") == active), None)
     if account is None:
@@ -1360,6 +1424,9 @@ def guard_blockers(
 ) -> tuple[list[str], dict[str, Any]]:
     """Gemeinsame Sieben-Bedingungen-Prüfung für Dry-Run, --yes und die Frischprüfung vor /exit."""
     blockers: list[str] = []
+    # None heißt: Tab-Beschriftung nicht lesbar. Das ist kein Freibrief, sondern unbekannter Schutz (fail-closed).
+    if label is None:
+        blockers.append("tab_schutz_unbekannt")
     if human_protected_tab(label):
         blockers.append("protected_human_tab")
     elif architekt_tab(label) and reason != "auth_401":
@@ -1486,6 +1553,9 @@ def plan_bounce(
         blockers.append("Pane-Session und Konversation weichen voneinander ab")
     if not work_dir:
         blockers.append("cwd nicht ermittelbar")
+    elif not os.path.isdir(work_dir):
+        # Ein fehlendes Verzeichnis lässt den Neustart nach /exit scheitern, die alte Sitzung wäre dann beendet.
+        blockers.append("cwd_ungueltig")
     if not use_model:
         blockers.append("Modell nicht ermittelbar")
     elif not MODEL_RE.fullmatch(use_model):
@@ -1574,7 +1644,13 @@ def execute_bounce(adapter: AgyAdapter, plan: dict[str, Any], herdr: Any, *, pro
     if heal_result == "unreadable":
         raise CliError("Live-Token nicht lesbar; Bounce abgebrochen.", 3)
 
+    # Nach Ruhephase und Heal erneut prüfen: Fokus, Tab-Schutz und Prozessbindung können sich inzwischen geändert haben.
+    late = _fresh_blockers(adapter, plan, herdr, root)
+    if late:
+        raise CliError("Live-Vorbedingung nach der Ruhephase verletzt, fail-closed, kein /exit: " + "; ".join(late), 4)
+
     # Versuch vor /exit persistieren, damit auch ein gescheiterter Versuch den Anti-Loop-Cap auslöst.
+    # record_bounce_attempt prüft den Cooldown unter demselben Lock und lehnt einen zweiten Versuch ab.
     record_bounce_attempt(pane_id, plan["switch_epoch"])
     result = _bounce_steps(herdr, root, plan, heal_result, exit_timeout_s, start_timeout_s, shell_timeout_s, poll_s)
     result.update({"wakeup_sent": False, "wakeup_status": "not_attempted", "reason": plan["reason"],
@@ -1603,17 +1679,28 @@ def execute_bounce(adapter: AgyAdapter, plan: dict[str, Any], herdr: Any, *, pro
 
 
 def _fresh_blockers(adapter: AgyAdapter, plan: dict[str, Any], herdr: Any, root: Path) -> list[str]:
+    """Frischprüfung unmittelbar vor /exit: Pane, Tab-Schutz, Prozessbindung und Arbeitsverzeichnis neu lesen."""
     pane = next((p for p in herdr.pane_list() if p.get("pane_id") == plan["pane_id"]), None)
     if pane is None:
         return ["Pane verschwunden"]
     screen = herdr.screen_text(plan["pane_id"])
     blockers = live_blockers(pane.get("agent_status"), composer_draft(screen))
+    # Die Tab-Beschriftung wird erneut gelesen: ein im Plan ungeschützter Tab kann inzwischen umbenannt sein.
+    fresh_label = herdr.tab_label(plan["tab_id"]) if plan.get("tab_id") else None
     guard, _details = guard_blockers(
-        adapter, pane, root=root, pid=plan["pid"], conversation=plan["conversation_id"], label=plan["tab_label"],
+        adapter, pane, root=root, pid=plan["pid"], conversation=plan["conversation_id"], label=fresh_label,
         screen=screen, switch_epoch=plan["switch_epoch"], reason=plan["reason"],
         allow_focused=plan["allow_focused"], source=plan["source"],
     )
-    return blockers + guard
+    blockers += guard
+    # Derselbe Prozess mit derselben Startzeit und Konversation muss noch allein auf dieser Pane laufen.
+    on_pane = [r for r in scan_agy_processes(root) if r["pane_id"] == plan["pane_id"]]
+    if len(on_pane) != 1 or (on_pane[0]["pid"], on_pane[0]["start_epoch"], on_pane[0]["conversation_id"]) != (
+            plan["pid"], plan["start_epoch"], plan["conversation_id"]):
+        blockers.append("prozessbindung_geaendert")
+    if not plan.get("cwd") or not os.path.isdir(plan["cwd"]):
+        blockers.append("cwd_ungueltig")
+    return blockers
 
 
 def _quiet_snapshot(herdr: Any, pane_id: str, root: Path, pid: int) -> tuple[str, list[dict[str, Any]]]:
@@ -1627,36 +1714,43 @@ def _pane_status(herdr: Any, pane_id: str) -> str | None:
 def _wakeup(herdr: Any, pane_id: str, ready_timeout_s: float, work_timeout_s: float, poll_s: float,
             replay_msg_ids: list[str] | None = None) -> dict[str, Any]:
     """Weckruf nach dem Kontowechsel: erst auf idle warten, Banner wegdrücken, dann über herdr_chat senden."""
-    deadline = time.monotonic() + ready_timeout_s
-    while _pane_status(herdr, pane_id) not in READY_PANE_STATUSES:
-        if time.monotonic() > deadline:
-            return {"wakeup_sent": False, "wakeup_status": "pane_not_ready"}
-        time.sleep(poll_s)
-    if WAKEUP_BANNER in herdr.screen_text(pane_id):
-        herdr.send_keys(pane_id, "esc")
-        time.sleep(poll_s)
-
-    text = WAKEUP_TEXT
-    if replay_msg_ids:
-        text += " Abgebrochene Nachricht: " + ", ".join(replay_msg_ids) + "."
-    chat_bin = os.environ.get("HERDR_CHAT_BIN") or HERDR_CHAT_DEFAULT
-    argv = ([sys.executable] if chat_bin.endswith(".py") else []) + [
-        chat_bin, "send", "--durable", "--art", "nachricht", "--betreff", WAKEUP_BETREFF, pane_id, text,
-    ]
+    # Ein Fehler beim Beobachten ist getrennt vom Versand zu melden. Der Neustart ist zu diesem Zeitpunkt bereits
+    # abgeschlossen, deshalb darf eine herdr-Störung hier nicht als gescheiterter Bounce erscheinen.
+    sent_ok = False
     try:
-        sent = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"wakeup_sent": False, "wakeup_status": f"send_failed: {exc}"}
-    if sent.returncode != 0:
-        return {"wakeup_sent": False, "wakeup_status": f"send_failed: exit {sent.returncode}"}
+        deadline = time.monotonic() + ready_timeout_s
+        while _pane_status(herdr, pane_id) not in READY_PANE_STATUSES:
+            if time.monotonic() > deadline:
+                return {"wakeup_sent": False, "wakeup_status": "pane_not_ready"}
+            time.sleep(poll_s)
+        if WAKEUP_BANNER in herdr.screen_text(pane_id):
+            herdr.send_keys(pane_id, "esc")
+            time.sleep(poll_s)
 
-    deadline = time.monotonic() + work_timeout_s
-    while True:
-        if _pane_status(herdr, pane_id) == "working":
-            return {"wakeup_sent": True, "wakeup_status": "working_seen"}
-        if time.monotonic() > deadline:
-            return {"wakeup_sent": True, "wakeup_status": "no_working_seen"}
-        time.sleep(poll_s)
+        text = WAKEUP_TEXT
+        if replay_msg_ids:
+            text += " Abgebrochene Nachricht: " + ", ".join(replay_msg_ids) + "."
+        chat_bin = os.environ.get("HERDR_CHAT_BIN") or HERDR_CHAT_DEFAULT
+        argv = ([sys.executable] if chat_bin.endswith(".py") else []) + [
+            chat_bin, "send", "--durable", "--art", "nachricht", "--betreff", WAKEUP_BETREFF, pane_id, text,
+        ]
+        try:
+            sent = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"wakeup_sent": False, "wakeup_status": f"send_failed: {exc}"}
+        if sent.returncode != 0:
+            return {"wakeup_sent": False, "wakeup_status": f"send_failed: exit {sent.returncode}"}
+        sent_ok = True
+
+        deadline = time.monotonic() + work_timeout_s
+        while True:
+            if _pane_status(herdr, pane_id) == "working":
+                return {"wakeup_sent": True, "wakeup_status": "working_seen"}
+            if time.monotonic() > deadline:
+                return {"wakeup_sent": True, "wakeup_status": "no_working_seen"}
+            time.sleep(poll_s)
+    except CliError as exc:
+        return {"wakeup_sent": sent_ok, "wakeup_status": f"beobachtung_fehlgeschlagen: {exc}"}
 
 
 def _bounce_steps(herdr, root, plan, heal_result, exit_timeout_s, start_timeout_s, shell_timeout_s, poll_s):

@@ -824,7 +824,29 @@ def snapshot_inputs() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[
         if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
             raise RuntimeError(f"Herdr api snapshot field {key} is missing or malformed.")
         parts.append(value)
+    _validate_snapshot_field_types(parts[0], parts[1], parts[2])
     return parts[0], parts[1], parts[2]
+
+
+def _validate_snapshot_field_types(
+    agents: list[dict[str, Any]], tabs: list[dict[str, Any]], workspaces: list[dict[str, Any]]
+) -> None:
+    """Prüft nur die Felder, die die Aufmerksamkeitsauswertung nutzt. Ein Formfehler wird zum Legacy-Fallback.
+
+    Ein String als completion_seq bestünde die Listenprüfung, würde aber beim Sortieren mit TypeError
+    außerhalb des Fallbacks abbrechen und die Statusausgabe verhindern.
+    """
+    for agent in agents:
+        seq = agent.get("completion_seq")
+        if seq is not None and (not isinstance(seq, int) or isinstance(seq, bool)):
+            raise RuntimeError("Herdr api snapshot agent completion_seq is malformed.")
+        status = agent.get("agent_status")
+        if status is not None and not isinstance(status, str):
+            raise RuntimeError("Herdr api snapshot agent_status is malformed.")
+    for entry in (*tabs, *workspaces):
+        label = entry.get("label")
+        if label is not None and not isinstance(label, str):
+            raise RuntimeError("Herdr api snapshot label is malformed.")
 
 
 def build_attention_summary(

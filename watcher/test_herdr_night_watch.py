@@ -1708,6 +1708,12 @@ def snapshot_payload(agents, tabs=TABS, workspaces=WORKSPACES):
 
 
 class AttentionSummaryTests(unittest.TestCase):
+    def setUp(self):
+        # Die Tests füttern run_json direkt; die CLI-Auflösung darf keine installierte Herdr voraussetzen.
+        patcher = patch.object(WATCHER, "herdr_executable", return_value="/usr/bin/herdr")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_normalize_label_strips_leading_emoji_variation_zwj_nbsp_and_casefolds(self):
         self.assertEqual(WATCHER.normalize_label("⚡ C3 · haltebereich-hauptbaum"), "c3 · haltebereich-hauptbaum")
         self.assertEqual(WATCHER.normalize_label("🔥 eskalations-architekt"), "eskalations-architekt")
@@ -1749,8 +1755,19 @@ class AttentionSummaryTests(unittest.TestCase):
             summary = WATCHER.live_agent_summary()
 
         self.assertEqual(summary["attention_done"], 12)
-        self.assertEqual(len(summary["attention_items"]), WATCHER.ATTENTION_ITEM_LIMIT)
+        self.assertEqual(len(summary["attention_items"]), 8)  # fester Wert: die Grenze darf nicht mit dem Code mitwandern
         self.assertEqual(summary["attention_items"][0]["status"], "done")
+
+    def test_malformed_completion_seq_falls_back_instead_of_crashing_the_summary(self):
+        bad = [{"pane_id": "b1", "tab_id": "tA", "workspace_id": "wR", "agent_status": "done", "completion_seq": "12"}]
+        legacy = [{"pane_id": "p1", "agent_status": "done"}]
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload(bad)), \
+                patch.object(WATCHER, "list_agents", return_value=legacy):
+            summary = WATCHER.live_agent_summary()
+
+        self.assertFalse(summary["attention_available"])
+        self.assertEqual(summary["done"], 1)
+        self.assertNotIn("attention_items", summary)
 
     def test_failing_snapshot_falls_back_to_agent_list_with_attention_unavailable(self):
         legacy = [{"pane_id": "p1", "agent_status": "done"}, {"pane_id": "p2", "agent_status": "blocked"}]

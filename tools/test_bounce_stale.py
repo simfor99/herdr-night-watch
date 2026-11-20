@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -112,7 +113,10 @@ def world(env, tmp_path, monkeypatch):
     (brain / "transcript.jsonl").write_text("x" * 1000, encoding="utf-8")
     (env.live / ".gemini/antigravity-cli/conversations").mkdir(parents=True)
     (env.live / ".gemini/antigravity-cli/conversations" / f"{CONV_OLD}.pb").write_bytes(b"y" * 100)
-    return SimpleNamespace(proc=proc, env=env, cwd=str(tmp_path / "work"))
+    # Ein echtes Arbeitsverzeichnis: der Neustart nach /exit braucht es (cwd_ungueltig sonst).
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    return SimpleNamespace(proc=proc, env=env, cwd=str(work))
 
 
 def add_agy(proc, pid, pane, *, conv=CONV_OLD, model=MODEL, start_epoch=BTIME + 500, cwd=None):
@@ -142,7 +146,6 @@ def pane(status="idle", agent="agy", conv=CONV_OLD, pane_id="w1:p1"):
 
 
 def test_dry_run_reports_the_plan_and_touches_nothing(world):
-    os.makedirs(world.cwd)
     add_agy(world.proc, 4242, "w1:p1", cwd=world.cwd)
     herdr = FakeHerdr([pane()])
 
@@ -168,7 +171,6 @@ def test_dry_run_reports_the_plan_and_touches_nothing(world):
 
 
 def test_dry_run_writes_nothing_and_only_previews_heal(world):
-    os.makedirs(world.cwd)
     add_agy(world.proc, 4242, "w1:p1", cwd=world.cwd)
     before = sorted(p.name for p in world.env.state.iterdir())
 
@@ -309,7 +311,9 @@ def test_live_bounce_exits_restarts_same_conversation_in_same_cwd(world):
     assert result["status"] == "ok"
     assert result["new_pid"] == 5151
     assert result["heal"] in {"no_live_token", "no_active", "current", "synced", "clobber_recovered"}
-    assert [c[1] for c in herdr.calls] == ["/exit", f"cd {world.cwd} && agy --conversation {CONV_OLD} --model {MODEL}"]
+    assert [c[1] for c in herdr.calls][0] == "/exit"
+    # Der Neustartbefehl wird nach dem Shell-Parsing verglichen, nicht als Rohstring: der pytest-Temppfad kann Leerzeichen enthalten.
+    assert shlex.split(herdr.calls[1][1]) == ["cd", world.cwd, "&&", "agy", "--conversation", CONV_OLD, "--model", MODEL]
 
 
 def test_failing_exit_is_reported_without_starting_a_second_process(world):
@@ -361,7 +365,9 @@ def test_model_with_shell_metacharacters_is_rejected_before_any_command(world):
 
 def test_restart_command_quotes_cwd_and_model(world):
     add_agy(world.proc, 4242, "w1:p1", cwd=world.cwd)
-    odd_cwd = "/tmp/dir with space"
+    odd = Path(world.cwd).parent / "dir with space"  # existierendes Verzeichnis: ungültige cwd wird abgelehnt
+    odd.mkdir(exist_ok=True)
+    odd_cwd = str(odd)
 
     def on_run(fake, pane_id, text):
         if text == "/exit":
@@ -640,3 +646,79 @@ def test_dry_run_and_yes_agree_on_non_ready_panes(world, status):
     with pytest.raises(la.CliError):  # --yes verweigert denselben Zustand
         la.execute_bounce(la.ADAPTERS["agy"], plan, herdr, proc=world.proc)
     assert herdr.calls == []
+
+
+# ---- CodeRabbit-Befunde (Folgecommit): Fokus, Prozessbindung, cwd, Tab-Schutz, Weckruf ----
+
+
+def test_focus_taken_during_the_quiet_period_blocks_the_exit(world, monkeypatch):
+    add_agy(world.proc, 4242, "w1:p1", cwd=world.cwd)
+    herdr = FakeHerdr([pane()])
+    plan = la.plan_bounce(la.ADAPTERS["agy"], "w1:p1", herdr, proc=world.proc)
+    original = la._quiet_snapshot
+
+    def focus_during_quiet(h, pane_id, root, pid):
+        result = original(h, pane_id, root, pid)
+        h.panes[0]["focused"] = True  # der Nutzer fokussiert die Pane während der Ruhephase
+        return result
+
+    monkeypatch.setattr(la, "_quiet_snapshot", focus_during_quiet)
+    with pytest.raises(la.CliError, match="pane_focused"):
+        la.execute_bounce(la.ADAPTERS["agy"], plan, herdr, proc=world.proc, exit_timeout_s=0.1, poll_s=0.01)
+    assert herdr.calls == []
+
+
+def test_another_process_in_the_same_pane_before_exit_is_refused(world):
+    add_agy(world.proc, 4242, "w1:p1", cwd=world.cwd)
+    herdr = FakeHerdr([pane()])
+    plan = la.plan_bounce(la.ADAPTERS["agy"], "w1:p1", herdr, proc=world.proc)
+    shutil.rmtree(world.proc / "4242")
+    add_agy(world.proc, 4343, "w1:p1", conv=CONV_OTHER, cwd=world.cwd)  # anderer Prozess, andere Konversation
+
+    with pytest.raises(la.CliError, match="prozessbindung_geaendert"):
+        la.execute_bounce(la.ADAPTERS["agy"], plan, herdr, proc=world.proc, exit_timeout_s=0.1, poll_s=0.01)
+    assert herdr.calls == []
+
+
+def test_a_working_directory_that_does_not_exist_is_refused_before_exit(world):
+    add_agy(world.proc, 4242, "w1:p1", cwd=str(Path(world.cwd) / "gone"))
+    herdr = FakeHerdr([pane()])
+    plan = la.plan_bounce(la.ADAPTERS["agy"], "w1:p1", herdr, proc=world.proc)
+
+    assert "cwd_ungueltig" in plan["blockers"]
+    assert plan["action"] is None
+    result = la.execute_bounce(la.ADAPTERS["agy"], plan, herdr, proc=world.proc, exit_timeout_s=0.1, poll_s=0.01)
+    assert result["status"] == "refused"
+    assert herdr.calls == []
+
+
+def test_unreadable_tab_label_is_an_unknown_protection_and_blocks(world):
+    add_agy(world.proc, 4242, "w1:p1", cwd=world.cwd)
+    plan = la.plan_bounce(la.ADAPTERS["agy"], "w1:p1", FakeHerdr([pane()], tab=None), proc=world.proc)
+    assert "tab_schutz_unbekannt" in plan["blockers"]
+    assert plan["action"] is None
+
+
+def test_wakeup_observation_failure_keeps_the_new_pid_and_reports_it_separately(world):
+    add_agy(world.proc, 4242, "w1:p1", cwd=world.cwd)
+
+    def on_run(fake, pane_id, text):
+        if text == "/exit":
+            shutil.rmtree(world.proc / "4242")
+        elif text.startswith("cd "):
+            add_agy(world.proc, 5151, "w1:p1", cwd=world.cwd)
+
+    class ObservationLost(FakeHerdr):
+        def pane_list(self):
+            if self.marker is not None and self.marker.exists():  # nach dem Weckruf fällt herdr aus
+                raise la.CliError("herdr pane list nicht erreichbar", 5)
+            return super().pane_list()
+
+    herdr = ObservationLost([pane()], on_run=on_run)
+    plan = la.plan_bounce(la.ADAPTERS["agy"], "w1:p1", herdr, proc=world.proc)
+    result = la.execute_bounce(la.ADAPTERS["agy"], plan, herdr, proc=world.proc, exit_timeout_s=2,
+                               start_timeout_s=2, poll_s=0.01)
+
+    assert result["status"] == "ok" and result["new_pid"] == 5151
+    assert result["wakeup_sent"] is True
+    assert result["wakeup_status"].startswith("beobachtung_fehlgeschlagen")

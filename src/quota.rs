@@ -332,6 +332,8 @@ pub struct PacingForecast {
     pub week_state: WeekForecastState,
     pub week_is_estimate: bool,
     projected_week_reserve: Option<f32>,
+    /// Pool-Abdeckung: der Wochen-Refill eines gesunden Partner-Kontos liegt innerhalb der eigenen Reichweite.
+    pub pool_covered: bool,
 }
 
 impl PacingForecast {
@@ -684,6 +686,16 @@ impl PacingForecast {
     }
 
     pub fn week_pace_text(&self, language: Language) -> String {
+        let base = self.week_pace_base_text(language);
+        if self.pool_covered && !base.is_empty() {
+            // Die historische Burnrate bleibt im Text stehen; die Pool-Abdeckung wird ergänzt.
+            format!("{base} · {}", language.text("Pool deckt bis Refill", "pool covers until refill"))
+        } else {
+            base
+        }
+    }
+
+    fn week_pace_base_text(&self, language: Language) -> String {
         match self.week_state {
             WeekForecastState::ConfirmedExhausted => return String::new(),
             WeekForecastState::Pending(reason) => {
@@ -1396,6 +1408,10 @@ pub fn runway_light(
     if pct == 0 {
         return light(RunwayColor::Red, true, false);
     }
+    // Die Wochenzeile folgt der Pool-Abdeckung wie die Kopf-LED; die Reichweite selbst bleibt unverändert.
+    if !is_five_hour && forecast.pool_covered {
+        return light(RunwayColor::Green, false, false);
+    }
     if is_five_hour {
         if let Some(fh) = &forecast.five_hour_forecast {
             if fh.is_exhausted_before_reset {
@@ -1487,6 +1503,9 @@ pub fn week_pace_light(
     {
         return RunwayColor::Gray;
     }
+    if forecast.pool_covered && pct > 0 {
+        return RunwayColor::Green;
+    }
     pace_light(is_throttled, pct, runway, forecast.pace_ratio)
 }
 
@@ -1535,6 +1554,7 @@ pub fn pacing_forecast_with_cycle_days(
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
             projected_week_reserve: None,
+            pool_covered: false,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1563,6 +1583,7 @@ pub fn pacing_forecast_with_cycle_days(
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
             projected_week_reserve: None,
+            pool_covered: false,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1591,6 +1612,7 @@ pub fn pacing_forecast_with_cycle_days(
                 week_state: WeekForecastState::Active,
                 week_is_estimate: false,
                 projected_week_reserve: None,
+                pool_covered: false,
             };
             fc.badge_text = fc.localized_upper_line(Language::German);
             fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1625,6 +1647,7 @@ pub fn pacing_forecast_with_cycle_days(
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
             projected_week_reserve: None,
+            pool_covered: false,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1655,6 +1678,7 @@ pub fn pacing_forecast_with_cycle_days(
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
             projected_week_reserve: None,
+            pool_covered: false,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1716,6 +1740,7 @@ pub fn pacing_forecast_with_cycle_days(
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
             projected_week_reserve: None,
+            pool_covered: false,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1758,6 +1783,7 @@ pub fn pacing_forecast_with_cycle_days(
         week_state: WeekForecastState::Active,
         week_is_estimate: false,
         projected_week_reserve: None,
+        pool_covered: false,
     };
     fc.badge_text = fc.localized_upper_line(Language::German);
     fc.summary_text = fc.localized_lower_line(Language::German);
@@ -1826,6 +1852,7 @@ pub fn codex_week_pacing_forecast(
             week_state,
             week_is_estimate,
             projected_week_reserve: None,
+            pool_covered: false,
         };
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
@@ -2138,6 +2165,7 @@ fn apply_pool_refill_cap(fc: &mut PacingForecast, pool_next_refill_epoch: Option
     let days_to_refill = (refill_epoch - now_epoch) as f32 / 86_400.0;
     if days_to_refill > 0.0 && runway_days >= days_to_refill {
         fc.health = PacingHealth::OnTrack;
+        fc.pool_covered = true;
         fc.badge_text = fc.localized_upper_line(Language::German);
         fc.summary_text = fc.localized_lower_line(Language::German);
     }
@@ -3181,6 +3209,7 @@ mod tests {
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
             projected_week_reserve: None,
+            pool_covered: false,
         };
         assert!(fc.week_is_deficit());
         assert!(fc.week_deficit_shielded(98));
@@ -3533,6 +3562,7 @@ mod tests {
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
             projected_week_reserve: None,
+            pool_covered: false,
         };
         // AGY weekly: severe deficit, 41 % remaining is under the 50 % shield.
         assert_eq!(runway_light(false, 41, false, &fc).color, RunwayColor::Red);
@@ -3577,6 +3607,7 @@ mod tests {
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
             projected_week_reserve: None,
+            pool_covered: false,
         };
         let moderate = runway_light(false, 80, false, &fc); // diff = -0.5
         assert_eq!(moderate.color, RunwayColor::Yellow);
@@ -3609,6 +3640,7 @@ mod tests {
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
             projected_week_reserve: None,
+            pool_covered: false,
         };
         let green = runway_light(false, 100, false, &fc);
         assert_eq!(green.color, RunwayColor::Green);
@@ -3995,6 +4027,7 @@ mod tests {
             week_state: WeekForecastState::Active,
             week_is_estimate: false,
             projected_week_reserve: None,
+            pool_covered: false,
         }
     }
 
@@ -4026,6 +4059,44 @@ mod tests {
         let mut no_pool = tight_forecast(PacingHealth::Tight, Some(6.0), false);
         apply_pool_refill_cap(&mut no_pool, None, now);
         assert_eq!(no_pool.health, PacingHealth::Tight);
+    }
+
+    #[test]
+    fn pool_coverage_recolors_the_visible_week_row_and_keeps_the_burn_rate_text() {
+        let now = 1_795_000_000i64;
+        let in_days = |days: f32| now + (days * 86_400.0) as i64;
+
+        // Befund-Szenario: 6 Tage eigener Wochenrest, aber nur 1 Tag Reichweite (Defizit), Partner-Refill in 12 Stunden.
+        // Kopf-LED wird grün, die Wochenzeile muss denselben Befund zeigen und darf nicht rot bleiben.
+        let mut covered = tight_forecast(PacingHealth::Tight, Some(1.0), false);
+        apply_pool_refill_cap(&mut covered, Some(in_days(0.5)), now);
+        assert_eq!(covered.health, PacingHealth::OnTrack);
+        assert!(covered.pool_covered);
+        let covered_light = runway_light(false, 40, false, &covered);
+        assert_eq!(covered_light.color, RunwayColor::Green);
+        assert_eq!(week_pace_light(false, 40, &covered_light, &covered), RunwayColor::Green);
+
+        // Derselbe Einzelkonto-Forecast, aber Refill in 2 Tagen: keine Abdeckung, die Warnung bleibt rot.
+        let mut uncovered = tight_forecast(PacingHealth::Tight, Some(1.0), false);
+        apply_pool_refill_cap(&mut uncovered, Some(in_days(2.0)), now);
+        assert!(!uncovered.pool_covered);
+        let uncovered_light = runway_light(false, 40, false, &uncovered);
+        assert_eq!(uncovered_light.color, RunwayColor::Red);
+        assert!(!uncovered.week_pace_text(Language::German).contains("Pool"));
+
+        // Die historische Burnrate (Defizit im Text) bleibt; nur der Pool-Hinweis kommt dazu.
+        let base = covered.week_pace_base_text(Language::German);
+        assert!(base.contains("Defizit"), "Burnrate-Text fehlt: {base}");
+        assert_eq!(covered.week_pace_text(Language::German), format!("{base} · Pool deckt bis Refill"));
+        assert_eq!(
+            covered.week_pace_text(Language::English),
+            format!("{} · pool covers until refill", covered.week_pace_base_text(Language::English))
+        );
+
+        // Ein leergelaufenes Wochenkontingent bleibt rot, auch mit Refill in Reichweite.
+        let mut depleted = tight_forecast(PacingHealth::Tight, Some(1.0), false);
+        apply_pool_refill_cap(&mut depleted, Some(in_days(0.5)), now);
+        assert_eq!(runway_light(false, 0, false, &depleted).color, RunwayColor::Red);
     }
 
     #[test]
