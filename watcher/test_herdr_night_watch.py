@@ -1664,5 +1664,135 @@ class WithdrawnWarningRecoveryTests(unittest.TestCase):
             self.assertEqual(WATCHER.load_json(state_path)["outcome"], "refused")
 
 
+
+WORKSPACES = [
+    {"workspace_id": "wR", "label": "📐 Nightwatcher"},
+    {"workspace_id": "wT", "label": "├─ Bau"},
+    {"workspace_id": "wT2", "label": "╰─ Kinder"},
+    {"workspace_id": "wD", "label": "🎨 design studio"},
+    {"workspace_id": "wV", "label": "🏛️ vermarktung"},
+]
+TABS = [
+    {"tab_id": "tA", "workspace_id": "wR", "label": "📐 architekt"},
+    {"tab_id": "tE", "workspace_id": "wV", "label": "🔥 eskalations-architekt"},
+    {"tab_id": "tC1", "workspace_id": "wR", "label": "⚡ C1 · Bridge"},
+    {"tab_id": "tB", "workspace_id": "wT", "label": "🔨 bauer"},
+    {"tab_id": "tC2", "workspace_id": "wR", "label": "⚡ C2 · Übergabe Sonnet"},
+    {"tab_id": "tZ", "workspace_id": "wT2", "label": "zweitmeinung"},
+    {"tab_id": "tDS", "workspace_id": "wD", "label": "design studio"},
+    {"tab_id": "tArch2", "workspace_id": "wR", "label": "architekt-2"},
+    {"tab_id": "tBS", "workspace_id": "wR", "label": "bauer-2"},
+]
+
+
+def live_like_agents():
+    sub = {"subordinate_worker": "1", "supervisor_pane_id": "w1:p1"}
+    return [
+        {"pane_id": "a1", "tab_id": "tA", "workspace_id": "wR", "agent_status": "done", "completion_seq": 10},
+        {"pane_id": "a2", "tab_id": "tE", "workspace_id": "wV", "agent_status": "blocked", "completion_seq": 5},
+        {"pane_id": "a3", "tab_id": "tC1", "workspace_id": "wR", "agent_status": "done", "completion_seq": 7},
+        {"pane_id": "a4", "tab_id": "tB", "workspace_id": "wT", "agent_status": "done", "completion_seq": 9, "tokens": sub},
+        {"pane_id": "a5", "tab_id": "tC2", "workspace_id": "wR", "agent_status": "done", "completion_seq": 3},
+        {"pane_id": "a6", "tab_id": "tZ", "workspace_id": "wT2", "agent_status": "blocked", "completion_seq": 4},
+        {"pane_id": "a7", "tab_id": "tDS", "workspace_id": "wD", "agent_status": "done", "completion_seq": 12},
+        {"pane_id": "a8", "tab_id": "tArch2", "workspace_id": "wR", "agent_status": "done", "completion_seq": 11, "tokens": sub},
+        {"pane_id": "a9", "tab_id": "tBS", "workspace_id": "wR", "agent_status": "unknown", "completion_seq": 2, "tokens": sub},
+        {"pane_id": "a10", "tab_id": "tX", "workspace_id": "wGONE", "agent_status": "done", "completion_seq": 20},
+        {"pane_id": "a11", "tab_id": "tGONE", "workspace_id": "wR", "agent_status": "done", "completion_seq": 1},
+        {"pane_id": "a12", "tab_id": "tA", "workspace_id": "wR", "agent_status": "idle", "completion_seq": 0},
+    ]
+
+
+def snapshot_payload(agents, tabs=TABS, workspaces=WORKSPACES):
+    return {"id": "cli:api:snapshot", "result": {"snapshot": {"agents": agents, "tabs": tabs, "workspaces": workspaces}}}
+
+
+class AttentionSummaryTests(unittest.TestCase):
+    def test_normalize_label_strips_leading_emoji_variation_zwj_nbsp_and_casefolds(self):
+        self.assertEqual(WATCHER.normalize_label("⚡ C3 · haltebereich-hauptbaum"), "c3 · haltebereich-hauptbaum")
+        self.assertEqual(WATCHER.normalize_label("🔥 eskalations-architekt"), "eskalations-architekt")
+        self.assertEqual(WATCHER.normalize_label("\U0001F3DB\uFE0F\u200D\u00A0Architekt"), "architekt")
+        self.assertEqual(WATCHER.normalize_label("  bauer-2 "), "bauer-2")
+
+    def test_live_like_fixture_yields_the_expected_split(self):
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload(live_like_agents())), \
+                patch.object(WATCHER, "list_agents", side_effect=AssertionError("kein zweiter Aufruf")):
+            summary = WATCHER.live_agent_summary()
+
+        self.assertTrue(summary["attention_available"])
+        self.assertEqual((summary["total"], summary["done"], summary["blocked"], summary["unknown"], summary["idle"]),
+                         (12, 8, 2, 1, 1))
+        # Klasse A: Chef-Tabs, C1, Root-Chef mit Subordinate-Token (Vorrang), unbekannte IDs, design studio.
+        self.assertEqual(summary["attention_done"], 6)
+        self.assertEqual(summary["attention_blocked"], 1)
+        self.assertEqual(summary["attention_total"], 7)
+        # Klasse B: Baum-Präfix (bauer), Root-Worker-Tab (C2 / zweitmeinung im Baum), blockierter Zuarbeiter.
+        self.assertEqual(summary["suppressed_done"], 2)
+        self.assertEqual(summary["suppressed_blocked"], 1)
+        self.assertEqual(summary["suppressed_unknown"], 1)
+
+    def test_attention_items_list_blocked_first_then_done_by_completion_seq(self):
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload(live_like_agents())):
+            items = WATCHER.live_agent_summary()["attention_items"]
+
+        self.assertEqual([item["status"] for item in items], ["blocked", "done", "done", "done", "done", "done", "done"])
+        self.assertEqual(items[0]["tab"], "🔥 eskalations-architekt")
+        done_tabs = [item["tab"] for item in items[1:]]
+        self.assertEqual(done_tabs, ["", "design studio", "architekt-2", "📐 architekt", "⚡ C1 · Bridge", ""])
+
+    def test_attention_items_are_capped_at_eight(self):
+        many = [
+            {"pane_id": f"x{i}", "tab_id": "tA", "workspace_id": "wR", "agent_status": "done", "completion_seq": i}
+            for i in range(12)
+        ]
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload(many)):
+            summary = WATCHER.live_agent_summary()
+
+        self.assertEqual(summary["attention_done"], 12)
+        self.assertEqual(len(summary["attention_items"]), WATCHER.ATTENTION_ITEM_LIMIT)
+        self.assertEqual(summary["attention_items"][0]["status"], "done")
+
+    def test_failing_snapshot_falls_back_to_agent_list_with_attention_unavailable(self):
+        legacy = [{"pane_id": "p1", "agent_status": "done"}, {"pane_id": "p2", "agent_status": "blocked"}]
+        with patch.object(WATCHER, "run_json", side_effect=RuntimeError("snapshot kaputt")), \
+                patch.object(WATCHER, "list_agents", return_value=legacy):
+            summary = WATCHER.live_agent_summary()
+
+        self.assertFalse(summary["attention_available"])
+        self.assertEqual((summary["total"], summary["done"], summary["blocked"]), (2, 1, 1))
+        self.assertNotIn("attention_done", summary)
+        self.assertNotIn("attention_items", summary)
+
+    def test_partial_snapshot_without_tabs_never_treats_everything_as_attention(self):
+        broken = {"id": "x", "result": {"snapshot": {"agents": live_like_agents(), "workspaces": WORKSPACES}}}
+        legacy = [{"pane_id": "p1", "agent_status": "done"}]
+        with patch.object(WATCHER, "run_json", return_value=broken), \
+                patch.object(WATCHER, "list_agents", return_value=legacy):
+            summary = WATCHER.live_agent_summary()
+
+        self.assertFalse(summary["attention_available"])
+        self.assertEqual(summary["done"], 1)
+        self.assertNotIn("attention_done", summary)
+
+    def test_non_dict_payload_falls_back(self):
+        with patch.object(WATCHER, "run_json", return_value=["kein", "objekt"]), \
+                patch.object(WATCHER, "list_agents", return_value=[]):
+            summary = WATCHER.live_agent_summary()
+        self.assertFalse(summary["attention_available"])
+
+    def test_snapshot_is_one_read_only_call(self):
+        calls = []
+
+        def fake_run_json(arguments):
+            calls.append(arguments)
+            return snapshot_payload([])
+
+        with patch.object(WATCHER, "run_json", side_effect=fake_run_json):
+            WATCHER.live_agent_summary()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-2:], ["api", "snapshot"])
+
+
 if __name__ == "__main__":
     unittest.main()

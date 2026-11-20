@@ -1,4 +1,5 @@
 use crate::configuration;
+use crate::status_channel::AttentionPayload;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::io::Read;
@@ -77,6 +78,7 @@ pub struct AgentSummary {
     pub done: usize,
     pub blocked: usize,
     pub unknown: usize,
+    pub attention: AttentionPayload,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +109,10 @@ struct LiveAgentsPayload {
     blocked: usize,
     #[serde(default)]
     unknown: usize,
+    /// Attention fields sit next to the counts on the wire; an older watcher
+    /// omits them and the fourth tile falls back to the raw finished view.
+    #[serde(flatten, default)]
+    attention: AttentionPayload,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,6 +242,7 @@ pub fn status() -> Result<WatchStatus> {
         done: payload.live_agents.done,
         blocked: payload.live_agents.blocked,
         unknown: payload.live_agents.unknown,
+        attention: payload.live_agents.attention,
     };
     let preferred_completion_action =
         CompletionAction::from_wire(&payload.preferred_completion_action);

@@ -101,6 +101,18 @@ pub struct ProviderQuota {
     pub five_hour_reset_epoch: Option<i64>,
     /// True when the provider reported an explicit lock without window attribution.
     pub explicit_provider_throttle: bool,
+    /// Stable slot id of a multi-account provider card (`None` for single-account providers).
+    pub account_id: Option<String>,
+    /// Short account label such as "personal"; the card title shows it only when several account cards exist.
+    pub account_label: Option<String>,
+    /// Account e-mail, shown in the hover tooltip only.
+    pub account_email: Option<String>,
+    /// False for a registered account that the provider does not currently use.
+    pub is_active_account: bool,
+    /// Authentication problem reported by the fetcher (for example re-login required).
+    pub auth_error: Option<String>,
+    /// Earliest weekly refill of a healthy partner account, set only on the active account when it precedes that account's own weekly reset.
+    pub pool_next_refill_epoch: Option<i64>,
 }
 
 impl ProviderQuota {
@@ -138,6 +150,12 @@ impl ProviderQuota {
             five_hour_confirmed_exhausted,
             five_hour_reset_epoch: None,
             explicit_provider_throttle: false,
+            account_id: None,
+            account_label: None,
+            account_email: None,
+            is_active_account: true,
+            auth_error: None,
+            pool_next_refill_epoch: None,
         }
     }
 
@@ -222,7 +240,7 @@ impl ProviderQuota {
                 current_hm(),
             );
         }
-        pacing_forecast_with_cycle_days(
+        let mut fc = pacing_forecast_with_cycle_days(
             self.is_throttled,
             self.week_percent,
             self.week_reset.as_deref(),
@@ -232,7 +250,22 @@ impl ProviderQuota {
             self.week_consumed_pct,
             None,
             None,
-        )
+        );
+        apply_pool_refill_cap(&mut fc, self.pool_next_refill_epoch, current_utc_epoch());
+        fc
+    }
+
+    /// Whether this card may raise the global throttle alarm. An inactive
+    /// reserve account only does so when every account of its provider is
+    /// throttled, so an exhausted spare never flags a healthy active account.
+    pub fn multi_account_alarm_allowed(&self, providers: &[ProviderQuota]) -> bool {
+        if self.account_id.is_none() || self.is_active_account {
+            return true;
+        }
+        providers
+            .iter()
+            .filter(|p| p.id == self.id && p.account_id.is_some())
+            .all(|p| p.provider_is_throttled())
     }
 
     pub fn codex_pacing_forecast_at(
@@ -2062,6 +2095,52 @@ impl QuotaSnapshot {
     pub fn get(&self, id: ProviderId) -> Option<&ProviderQuota> {
         self.providers.iter().find(|p| p.id == id)
     }
+
+    /// Looks up one provider card by provider and account slot. Single-account
+    /// providers carry `None` as account id.
+    pub fn get_card(&self, id: ProviderId, account_id: Option<&str>) -> Option<&ProviderQuota> {
+        self.providers
+            .iter()
+            .find(|p| p.id == id && p.account_id.as_deref() == account_id)
+    }
+
+    /// Global alarm flag: a throttled card counts only when its account is
+    /// allowed to raise the alarm (see `multi_account_alarm_allowed`).
+    fn alarm_throttle(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|p| p.is_throttled && p.multi_account_alarm_allowed(&self.providers))
+    }
+}
+
+/// Sägezahn-Ampel für Mehrkonto-Pools: Reicht die Reichweite des aktiven
+/// Kontos bis zum frühesten Wochen-Refill eines gesunden Partner-Kontos, ist
+/// eine Tight-Warnung aus dem 7-Tage-Einzelhorizont ein Fehlalarm und wird
+/// auf OnTrack begrenzt. Throttled, eine 5-h-Erschöpfung und die historische
+/// Burnrate (`cycle_days`) bleiben unberührt.
+fn apply_pool_refill_cap(fc: &mut PacingForecast, pool_next_refill_epoch: Option<i64>, now_epoch: i64) {
+    let Some(refill_epoch) = pool_next_refill_epoch else {
+        return;
+    };
+    if fc.health != PacingHealth::Tight {
+        return;
+    }
+    if fc
+        .five_hour_forecast
+        .as_ref()
+        .is_some_and(|five_hour| five_hour.is_exhausted_before_reset)
+    {
+        return;
+    }
+    let Some(runway_days) = fc.runway_days else {
+        return;
+    };
+    let days_to_refill = (refill_epoch - now_epoch) as f32 / 86_400.0;
+    if days_to_refill > 0.0 && runway_days >= days_to_refill {
+        fc.health = PacingHealth::OnTrack;
+        fc.badge_text = fc.localized_upper_line(Language::German);
+        fc.summary_text = fc.localized_lower_line(Language::German);
+    }
 }
 
 /// Helper to parse GLM JSON limit objects where percentage is CONSUMPTION.
@@ -2136,6 +2215,140 @@ pub fn parse_codex_rate_limits(json_str: &str) -> Option<(Option<u8>, Option<u8>
     Some((five_hour, week))
 }
 
+/// Parses an ISO-8601 UTC timestamp of the form `YYYY-MM-DDTHH:MM[:SS]Z` into a Unix epoch.
+pub fn iso_utc_to_epoch(iso_str: &str) -> Option<i64> {
+    let raw = iso_str.trim().strip_suffix('Z')?;
+    let (date, time) = raw.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i32 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = match time_parts.next() {
+        Some(raw_second) => raw_second.split('.').next()?.parse().ok()?,
+        None => 0,
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(ymd_to_days(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Local `(month, day, hour, minute)` of a UTC epoch, shifted by the local offset.
+fn utc_epoch_to_local_month_day_hm(epoch: i64) -> (u32, u32, u32, u32) {
+    let local = epoch + local_timezone_offset_minutes() as i64 * 60;
+    let (_year, month, day) = days_to_ymd(local.div_euclid(86_400));
+    let day_seconds = local.rem_euclid(86_400);
+    (month, day, (day_seconds / 3_600) as u32, ((day_seconds % 3_600) / 60) as u32)
+}
+
+/// Builds one AGY account card from an entry of the `accounts` array of the
+/// `fetch_agy_quota.py` contract. Returns `None` for non-object entries.
+fn agy_account_card(item: &serde_json::Value) -> Option<ProviderQuota> {
+    if !item.is_object() {
+        return None;
+    }
+    let text = |key: &str| {
+        item.get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let percent = |key: &str| {
+        item.get(key)
+            .and_then(|value| value.as_f64())
+            .map(|value| value.clamp(0.0, 100.0).round() as u8)
+    };
+
+    let five_hour_percent = percent("five_hour_pct");
+    let week_percent = percent("week_pct");
+    let five_hour_reset = text("five_hour_reset")
+        .as_deref()
+        .and_then(iso_utc_to_local_hm)
+        .map(|(hour, minute)| format!("{hour:02}:{minute:02}"));
+    let week_reset_raw = text("week_reset");
+    let week_reset_epoch = week_reset_raw.as_deref().and_then(iso_utc_to_epoch);
+    let week_reset = week_reset_epoch.map(|epoch| {
+        let (month, day, hour, minute) = utc_epoch_to_local_month_day_hm(epoch);
+        format!("{day}.{month}. ({hour:02}:{minute:02})")
+    });
+
+    let mut card = ProviderQuota::new(
+        ProviderId::Agy,
+        "AGY",
+        "Antigravity",
+        five_hour_percent,
+        five_hour_reset,
+        week_percent,
+        week_reset,
+    );
+    card.account_id = text("id");
+    card.account_label = text("label");
+    card.account_email = text("email");
+    // A missing flag counts as active: an unknown account must not hide a throttle alarm.
+    card.is_active_account = item
+        .get("is_active")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    // Without an explicit auth_error, a non-ok auth_state still blocks the account
+    // (login pill, no switch click). Missing or "ok" states add no error.
+    card.auth_error = text("auth_error").or_else(|| match text("auth_state").as_deref() {
+        None | Some("ok") => None,
+        Some("relogin_required") => Some("Login erneuern".to_string()),
+        Some(other) => Some(other.to_string()),
+    });
+    card.week_reset_epoch = week_reset_epoch;
+    Some(card)
+}
+
+/// Applies the `fetch_agy_quota.py` JSON contract (`version`, `active_account`,
+/// `pooled_count`, `pool_next_refill_epoch`, `accounts`). The AGY cards are
+/// replaced as a whole, so a pool that shrinks from two accounts to one leaves
+/// no ghost card. `null`, invalid JSON or an empty account list change nothing.
+pub fn update_snapshot_with_agy_json(snapshot: &mut QuotaSnapshot, json_str: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return;
+    };
+    let Some(accounts) = value.get("accounts").and_then(|items| items.as_array()) else {
+        return;
+    };
+    let mut cards: Vec<ProviderQuota> = accounts.iter().filter_map(agy_account_card).collect();
+    if cards.is_empty() {
+        return;
+    }
+
+    let pooled_count = value
+        .get("pooled_count")
+        .and_then(|count| count.as_i64())
+        .unwrap_or(cards.len() as i64);
+    if pooled_count >= 2 {
+        let pool_refill = value.get("pool_next_refill_epoch").and_then(|epoch| epoch.as_i64());
+        if let (Some(refill), Some(active)) =
+            (pool_refill, cards.iter_mut().find(|card| card.is_active_account))
+        {
+            if active.week_reset_epoch.is_some_and(|own_reset| refill < own_reset) {
+                active.pool_next_refill_epoch = Some(refill);
+            }
+        }
+    }
+
+    // Everything before the first AGY entry is non-AGY, so its index stays valid after removal.
+    let insert_at = snapshot
+        .providers
+        .iter()
+        .position(|p| p.id == ProviderId::Agy)
+        .unwrap_or(snapshot.providers.len());
+    snapshot.providers.retain(|p| p.id != ProviderId::Agy);
+    let insert_at = insert_at.min(snapshot.providers.len());
+    drop(snapshot.providers.splice(insert_at..insert_at, cards.drain(..)));
+    snapshot.has_throttle = snapshot.alarm_throttle();
+    snapshot.last_updated = Some(Instant::now());
+}
+
+#[allow(dead_code)]
 pub fn update_snapshot_with_agy_tsv(snapshot: &mut QuotaSnapshot, tsv: &str) {
     if let Some(agy) = snapshot.providers.iter_mut().find(|p| p.id == ProviderId::Agy) {
         for line in tsv.lines() {
@@ -2176,7 +2389,7 @@ pub fn update_snapshot_with_agy_tsv(snapshot: &mut QuotaSnapshot, tsv: &str) {
         }
         agy.is_throttled = agy.week_percent.unwrap_or(100) == 0 || agy.five_hour_percent.unwrap_or(100) == 0;
     }
-    snapshot.has_throttle = snapshot.providers.iter().any(|p| p.is_throttled);
+    snapshot.has_throttle = snapshot.alarm_throttle();
     snapshot.last_updated = Some(Instant::now());
 }
 
@@ -2225,7 +2438,7 @@ pub fn update_snapshot_with_glm_json(snapshot: &mut QuotaSnapshot, json_str: &st
         }
         glm.is_throttled = glm.week_percent.unwrap_or(100) == 0 || glm.five_hour_percent.unwrap_or(100) == 0;
     }
-    snapshot.has_throttle = snapshot.providers.iter().any(|p| p.is_throttled);
+    snapshot.has_throttle = snapshot.alarm_throttle();
     snapshot.last_updated = Some(Instant::now());
 }
 
@@ -2487,7 +2700,7 @@ pub fn update_snapshot_with_codex_json(snapshot: &mut QuotaSnapshot, json_str: &
     codex.is_throttled = codex.week_confirmed_exhausted
         || codex.five_hour_confirmed_exhausted
         || codex.explicit_provider_throttle;
-    snapshot.has_throttle = snapshot.providers.iter().any(|p| p.is_throttled);
+    snapshot.has_throttle = snapshot.alarm_throttle();
     snapshot.last_updated = Some(Instant::now());
 }
 
@@ -2532,10 +2745,7 @@ pub fn update_snapshot_with_claude_json(snapshot: &mut QuotaSnapshot, json_str: 
             .map(|epoch| codex_reset_epoch_to_local(epoch, key));
     }
     claude.is_throttled = claude.week_percent == Some(0) || claude.five_hour_percent == Some(0);
-    snapshot.has_throttle = snapshot
-        .providers
-        .iter()
-        .any(|provider| provider.is_throttled);
+    snapshot.has_throttle = snapshot.alarm_throttle();
     snapshot.last_updated = Some(Instant::now());
 }
 
@@ -2630,10 +2840,7 @@ pub fn update_snapshot_with_qwen_json(snapshot: &mut QuotaSnapshot, json_str: &s
         qwen.week_consumed_pct = consumed;
     }
     qwen.is_throttled = qwen.week_percent == Some(0) || qwen.five_hour_percent == Some(0);
-    snapshot.has_throttle = snapshot
-        .providers
-        .iter()
-        .any(|provider| provider.is_throttled);
+    snapshot.has_throttle = snapshot.alarm_throttle();
     snapshot.last_updated = Some(Instant::now());
 }
 
@@ -2647,22 +2854,27 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot, show_qwen: bool) -> QuotaSna
 
     let distro = crate::configuration::load().distro;
 
-    // 1. Fetch AGY
-    let mut agy_cmd = Command::new("wsl.exe");
-    agy_cmd.creation_flags(CREATE_NO_WINDOW)
+    // 1. Fetch AGY accounts. The fetcher owns the llm-account contract and
+    // falls back to `agy -p /usage` itself when no account store exists.
+    let agy_json = Command::new("wsl.exe")
+        .creation_flags(CREATE_NO_WINDOW)
         .arg("-d")
         .arg(&distro)
         .arg("--exec")
-        .arg("/home/simon/.local/bin/agy")
-        .arg("-p")
-        .arg("/usage");
-
-    if let Ok(output) = agy_cmd.output() {
-        if output.status.success() {
-            let tsv = String::from_utf8_lossy(&output.stdout);
-            update_snapshot_with_agy_tsv(&mut updated, &tsv);
-        }
-    }
+        .arg("python3")
+        .arg("-c")
+        .arg(include_str!("../tools/fetch_agy_quota.py"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    update_snapshot_with_agy_json(
+        &mut updated,
+        agy_json
+            .as_ref()
+            .map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or("null"),
+    );
 
     // 2. Fetch GLM
     let mut glm_cmd = Command::new("wsl.exe");
@@ -2750,15 +2962,20 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot, show_qwen: bool) -> QuotaSna
 #[allow(dead_code)]
 pub fn fetch_live_snapshot(current: &QuotaSnapshot, show_qwen: bool) -> QuotaSnapshot {
     let mut updated = current.clone();
-    if let Ok(output) = std::process::Command::new("/home/simon/.local/bin/agy")
-        .args(["-p", "/usage"])
+    let agy_json = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(include_str!("../tools/fetch_agy_quota.py"))
         .output()
-    {
-        if output.status.success() {
-            let tsv = String::from_utf8_lossy(&output.stdout);
-            update_snapshot_with_agy_tsv(&mut updated, &tsv);
-        }
-    }
+        .ok()
+        .filter(|output| output.status.success());
+    update_snapshot_with_agy_json(
+        &mut updated,
+        agy_json
+            .as_ref()
+            .map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or("null"),
+    );
     if let Ok(output) = std::process::Command::new("/home/simon/projects/herdr-night-watch/tools/fetch_glm.sh")
         .output()
     {
@@ -3577,6 +3794,276 @@ mod tests {
         assert_eq!(fc.localized_upper_line(Language::English), "+>24h reserve");
         assert_eq!(fc.localized_upper_line(Language::German), "+>24h Reserve");
         assert_eq!(fc.localized_lower_line(Language::English), "+>30 days reserve");
+    }
+
+    fn agy_account_json(id: &str, label: &str, is_active: bool, five: u8, week: u8, week_reset: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","label":"{label}","email":"{label}@example.invalid","is_active":{is_active},"auth_state":"ok","five_hour_pct":{five},"five_hour_reset":null,"week_pct":{week},"week_reset":"{week_reset}"}}"#
+        )
+    }
+
+    fn agy_pool_json(accounts: &[String], pooled_count: usize, refill: Option<i64>) -> String {
+        let refill_json = refill.map_or("null".to_string(), |epoch| epoch.to_string());
+        format!(
+            r#"{{"version":1,"active_account":"acc2","pooled_count":{pooled_count},"pool_next_refill_epoch":{refill_json},"accounts":[{}]}}"#,
+            accounts.join(",")
+        )
+    }
+
+    fn agy_cards(snapshot: &QuotaSnapshot) -> Vec<&ProviderQuota> {
+        snapshot.providers.iter().filter(|p| p.id == ProviderId::Agy).collect()
+    }
+
+    #[test]
+    fn agy_json_builds_one_card_per_account_in_slot_order() {
+        let json = agy_pool_json(
+            &[
+                agy_account_json("acc1", "personal", false, 0, 0, "2026-11-23T23:29:00Z"),
+                agy_account_json("acc2", "work", true, 98, 99, "2026-11-27T08:08:12Z"),
+            ],
+            2,
+            None,
+        );
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_agy_json(&mut snapshot, &json);
+
+        let cards = agy_cards(&snapshot);
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].account_id.as_deref(), Some("acc1"));
+        assert_eq!(cards[1].account_id.as_deref(), Some("acc2"));
+        assert_eq!(cards[1].account_label.as_deref(), Some("work"));
+        assert_eq!(cards[1].account_email.as_deref(), Some("work@example.invalid"));
+        assert!(!cards[0].is_active_account);
+        assert!(cards[1].is_active_account);
+        assert_eq!(cards[1].week_percent, Some(99));
+        assert_eq!(cards[1].five_hour_percent, Some(98));
+        let card = snapshot.get_card(ProviderId::Agy, Some("acc2")).expect("acc2 card");
+        assert_eq!(card.week_percent, Some(99));
+        assert!(snapshot.get_card(ProviderId::Agy, None).is_none());
+        // The other providers keep their positions around the AGY block.
+        assert_eq!(snapshot.providers[0].id, ProviderId::Glm);
+        assert_eq!(snapshot.providers[4].id, ProviderId::Claude);
+    }
+
+    #[test]
+    fn agy_json_shrinking_pool_leaves_no_ghost_card() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        let two = agy_pool_json(
+            &[
+                agy_account_json("acc1", "personal", false, 0, 0, "2026-11-23T23:29:00Z"),
+                agy_account_json("acc2", "work", true, 98, 99, "2026-11-27T08:08:12Z"),
+            ],
+            2,
+            None,
+        );
+        update_snapshot_with_agy_json(&mut snapshot, &two);
+        assert_eq!(agy_cards(&snapshot).len(), 2);
+
+        let one = r#"{"version":1,"active_account":null,"pooled_count":1,"pool_next_refill_epoch":null,"accounts":[{"id":null,"label":null,"email":"simon@example.invalid","is_active":true,"auth_state":"ok","five_hour_pct":50,"five_hour_reset":null,"week_pct":60,"week_reset":"2026-11-27T08:08:12Z"}]}"#;
+        update_snapshot_with_agy_json(&mut snapshot, one);
+        let cards = agy_cards(&snapshot);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].account_id, None);
+        assert_eq!(cards[0].week_percent, Some(60));
+    }
+
+    #[test]
+    fn agy_json_null_or_invalid_keeps_the_previous_cards() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        let json = agy_pool_json(
+            &[agy_account_json("acc1", "personal", true, 40, 70, "2026-11-27T08:08:12Z")],
+            1,
+            None,
+        );
+        update_snapshot_with_agy_json(&mut snapshot, &json);
+        let before = snapshot.providers.clone();
+
+        update_snapshot_with_agy_json(&mut snapshot, "null");
+        update_snapshot_with_agy_json(&mut snapshot, "not json at all");
+        update_snapshot_with_agy_json(&mut snapshot, r#"{"accounts":[]}"#);
+        update_snapshot_with_agy_json(&mut snapshot, r#"{"version":1}"#);
+        assert_eq!(snapshot.providers, before);
+    }
+
+    #[test]
+    fn exhausted_inactive_reserve_does_not_raise_the_alarm() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        let json = agy_pool_json(
+            &[
+                agy_account_json("acc1", "personal", false, 0, 0, "2026-11-23T23:29:00Z"),
+                agy_account_json("acc2", "work", true, 98, 99, "2026-11-27T08:08:12Z"),
+            ],
+            2,
+            None,
+        );
+        update_snapshot_with_agy_json(&mut snapshot, &json);
+
+        assert!(!snapshot.has_throttle);
+        let reserve = snapshot.get_card(ProviderId::Agy, Some("acc1")).expect("acc1 card");
+        assert!(reserve.provider_is_throttled(), "the reserve card still shows its depletion");
+        assert!(!reserve.multi_account_alarm_allowed(&snapshot.providers));
+    }
+
+    #[test]
+    fn exhausted_active_account_raises_the_alarm() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        let json = agy_pool_json(
+            &[
+                agy_account_json("acc1", "personal", false, 80, 80, "2026-11-23T23:29:00Z"),
+                agy_account_json("acc2", "work", true, 98, 0, "2026-11-27T08:08:12Z"),
+            ],
+            2,
+            None,
+        );
+        update_snapshot_with_agy_json(&mut snapshot, &json);
+        assert!(snapshot.has_throttle);
+    }
+
+    #[test]
+    fn all_accounts_exhausted_raise_the_alarm() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        let json = agy_pool_json(
+            &[
+                agy_account_json("acc1", "personal", false, 0, 0, "2026-11-23T23:29:00Z"),
+                agy_account_json("acc2", "work", true, 0, 0, "2026-11-27T08:08:12Z"),
+            ],
+            2,
+            None,
+        );
+        update_snapshot_with_agy_json(&mut snapshot, &json);
+        assert!(snapshot.has_throttle);
+    }
+
+    #[test]
+    fn pool_refill_is_recorded_only_before_the_active_weekly_reset() {
+        let refill = 1_795_476_540; // 2026-11-23T23:29:00Z
+        let earlier = agy_pool_json(
+            &[
+                agy_account_json("acc1", "personal", false, 0, 0, "2026-11-23T23:29:00Z"),
+                agy_account_json("acc2", "work", true, 98, 40, "2026-11-27T08:08:12Z"),
+            ],
+            2,
+            Some(refill),
+        );
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_agy_json(&mut snapshot, &earlier);
+        let active = snapshot.get_card(ProviderId::Agy, Some("acc2")).expect("acc2 card");
+        assert_eq!(active.pool_next_refill_epoch, Some(refill));
+        assert_eq!(snapshot.get_card(ProviderId::Agy, Some("acc1")).expect("acc1").pool_next_refill_epoch, None);
+
+        let later = agy_pool_json(
+            &[agy_account_json("acc2", "work", true, 98, 40, "2026-11-20T08:08:12Z")],
+            2,
+            Some(refill),
+        );
+        update_snapshot_with_agy_json(&mut snapshot, &later);
+        assert_eq!(agy_cards(&snapshot)[0].pool_next_refill_epoch, None);
+    }
+
+    #[test]
+    fn iso_utc_timestamps_convert_to_epoch_seconds() {
+        assert_eq!(iso_utc_to_epoch("1970-01-02T00:00:00Z"), Some(86_400));
+        assert_eq!(iso_utc_to_epoch("2026-11-23T23:29:00Z"), Some(1_795_476_540));
+        assert_eq!(iso_utc_to_epoch("2026-11-23T23:29:07.123Z"), Some(1_795_476_547));
+        assert_eq!(iso_utc_to_epoch("2026-11-23T23:29:00"), None);
+        assert_eq!(iso_utc_to_epoch("2026-13-01T00:00:00Z"), None);
+        assert_eq!(iso_utc_to_epoch("garbage"), None);
+    }
+
+    fn tight_forecast(health: PacingHealth, runway_days: Option<f32>, five_hour_exhausted: bool) -> PacingForecast {
+        let five_hour_forecast = five_hour_exhausted.then(|| FiveHourForecast {
+            burn_rate: 1.0,
+            pace_ratio: 1.5,
+            runway_minutes: Some(10),
+            delta_minutes: Some(-200),
+            exhaustion_time: Some((14, 0)),
+            reset_time: (16, 0),
+            is_exhausted_before_reset: true,
+        });
+        PacingForecast {
+            pace_ratio: Some(1.2),
+            runway_days,
+            delta_days: None,
+            remaining_days: 6.0,
+            health,
+            badge_text: String::new(),
+            summary_text: String::new(),
+            five_hour_forecast,
+            week_exhaustion_date: None,
+            reset_str: None,
+            today: (2026, 11, 20),
+            week_state: WeekForecastState::Active,
+            week_is_estimate: false,
+            projected_week_reserve: None,
+        }
+    }
+
+    #[test]
+    fn pool_refill_caps_a_tight_warning_only_when_the_runway_reaches_the_refill() {
+        let now = 1_795_000_000i64;
+        let in_days = |days: f32| now + (days * 86_400.0) as i64;
+
+        let mut covered = tight_forecast(PacingHealth::Tight, Some(6.0), false);
+        apply_pool_refill_cap(&mut covered, Some(in_days(2.0)), now);
+        assert_eq!(covered.health, PacingHealth::OnTrack);
+
+        let mut not_covered = tight_forecast(PacingHealth::Tight, Some(1.0), false);
+        apply_pool_refill_cap(&mut not_covered, Some(in_days(2.0)), now);
+        assert_eq!(not_covered.health, PacingHealth::Tight);
+
+        let mut refill_too_far = tight_forecast(PacingHealth::Tight, Some(6.0), false);
+        apply_pool_refill_cap(&mut refill_too_far, Some(in_days(10.0)), now);
+        assert_eq!(refill_too_far.health, PacingHealth::Tight);
+
+        let mut five_hour_out = tight_forecast(PacingHealth::Tight, Some(6.0), true);
+        apply_pool_refill_cap(&mut five_hour_out, Some(in_days(2.0)), now);
+        assert_eq!(five_hour_out.health, PacingHealth::Tight);
+
+        let mut depleted = tight_forecast(PacingHealth::Throttled, Some(0.0), false);
+        apply_pool_refill_cap(&mut depleted, Some(in_days(2.0)), now);
+        assert_eq!(depleted.health, PacingHealth::Throttled);
+
+        let mut no_pool = tight_forecast(PacingHealth::Tight, Some(6.0), false);
+        apply_pool_refill_cap(&mut no_pool, None, now);
+        assert_eq!(no_pool.health, PacingHealth::Tight);
+    }
+
+    #[test]
+    fn relogin_state_without_auth_error_key_blocks_the_account() {
+        let json = agy_pool_json(
+            &[r#"{"id":"acc2","label":"work","is_active":true,"auth_state":"relogin_required","five_hour_pct":90,"week_pct":90,"week_reset":"2026-11-27T08:08:12Z"}"#.to_string()],
+            1,
+            None,
+        );
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_agy_json(&mut snapshot, &json);
+        let card = snapshot.get_card(ProviderId::Agy, Some("acc2")).expect("acc2 card");
+        assert_eq!(card.auth_error.as_deref(), Some("Login erneuern"));
+    }
+
+    #[test]
+    fn relogin_state_keeps_an_explicit_auth_error_text() {
+        let json = agy_pool_json(
+            &[r#"{"id":"acc2","label":"work","is_active":true,"auth_state":"relogin_required","auth_error":"Re-login required","five_hour_pct":90,"week_pct":90,"week_reset":"2026-11-27T08:08:12Z"}"#.to_string()],
+            1,
+            None,
+        );
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_agy_json(&mut snapshot, &json);
+        let card = snapshot.get_card(ProviderId::Agy, Some("acc2")).expect("acc2 card");
+        assert_eq!(card.auth_error.as_deref(), Some("Re-login required"));
+    }
+
+    #[test]
+    fn ok_auth_state_adds_no_error() {
+        let json = agy_pool_json(
+            &[agy_account_json("acc2", "work", true, 90, 90, "2026-11-27T08:08:12Z")],
+            1,
+            None,
+        );
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_agy_json(&mut snapshot, &json);
+        assert_eq!(snapshot.get_card(ProviderId::Agy, Some("acc2")).expect("acc2 card").auth_error, None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::{
     autostart,
     backend::{self, AgentSummary, CompletionAction, WatchStatus},
+    status_channel::{FleetCounts, FourthTile, attention_tooltip_lines, fourth_tile},
     language::Language,
     log_viewer,
     media::{self, MediaCommand, MediaSnapshot},
@@ -1562,13 +1563,22 @@ fn live_title(language: Language) -> &'static str {
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct QuotaCardDrag {
     provider: ProviderId,
+    /// Account of the grabbed card; `None` for single-account providers and the settings list.
+    account_id: Option<String>,
     grab_offset_y: f32,
 }
 
-use crate::quota_layout::{apply_quota_order, provider_slot, reorder_quota_order};
+/// A provider with several visible account cards names each card by its account.
+fn is_multi_account_card(visible: &[ProviderQuota], quota: &ProviderQuota) -> bool {
+    quota.account_label.is_some() && visible.iter().filter(|p| p.id == quota.id).count() >= 2
+}
+
+use crate::quota_layout::{
+    apply_quota_order, card_widget_id, fit_reset_text, provider_slot, reorder_quota_order,
+};
 
 struct LiveStatusApp {
     language: Language,
@@ -2620,6 +2630,7 @@ impl eframe::App for LiveStatusApp {
                                 if self.status_available && agents.available {
                                     let old_spacing = ui.spacing().item_spacing.x;
                                     ui.spacing_mut().item_spacing.x = 4.0;
+                                    let fourth = fourth_tile(&agents.attention, agents.done);
                                     ui.horizontal(|ui| {
                                         metric(ui, self.language.text("Erkannt", "Detected"), agents.total, TEXT, false);
                                         divider(ui);
@@ -2627,16 +2638,67 @@ impl eframe::App for LiveStatusApp {
                                         divider(ui);
                                         metric(ui, self.language.text("Bereit", "Ready"), agents.idle, ACCENT, false);
                                         divider(ui);
-                                        let finished = agents.done > 0;
-                                        metric(
-                                            ui,
-                                            self.language.text("Fertig", "Finished"),
-                                            agents.done,
-                                            if finished { GREEN } else { GRAY },
-                                            finished,
-                                        );
+                                        // Fourth tile: attention view when the watcher supports it,
+                                        // otherwise the raw finished count (never a fake "Für dich 0").
+                                        let (tile_rect, suppressed_blocked) = match fourth.clone() {
+                                            FourthTile::Attention { total, done, blocked, suppressed_blocked } => {
+                                                let (color, highlight) = if blocked > 0 {
+                                                    (YELLOW, false)
+                                                } else if done > 0 {
+                                                    (GREEN, true)
+                                                } else {
+                                                    (GRAY, false)
+                                                };
+                                                let rect = metric(
+                                                    ui,
+                                                    self.language.text("Für dich", "Attention"),
+                                                    total,
+                                                    color,
+                                                    highlight,
+                                                );
+                                                (rect, suppressed_blocked)
+                                            }
+                                            FourthTile::Finished { done } => {
+                                                let finished = done > 0;
+                                                let rect = metric(
+                                                    ui,
+                                                    self.language.text("Fertig", "Finished"),
+                                                    done,
+                                                    if finished { GREEN } else { GRAY },
+                                                    finished,
+                                                );
+                                                (rect, 0)
+                                            }
+                                        };
+                                        if suppressed_blocked > 0 {
+                                            // Blocked helpers stay visible even though they are not counted.
+                                            ui.painter().circle_filled(
+                                                egui::pos2(tile_rect.right() + 2.0, tile_rect.top() + 4.0),
+                                                3.5,
+                                                YELLOW,
+                                            );
+                                        }
                                     });
                                     ui.spacing_mut().item_spacing.x = old_spacing;
+                                    if matches!(fourth, FourthTile::Attention { .. }) {
+                                        let lines = attention_tooltip_lines(
+                                            FleetCounts {
+                                                total: agents.total,
+                                                working: agents.working,
+                                                idle: agents.idle,
+                                                blocked: agents.blocked,
+                                                unknown: agents.unknown,
+                                            },
+                                            &agents.attention,
+                                            self.language,
+                                        );
+                                        let kpi_hover = ui.interact(
+                                            ui.min_rect(),
+                                            ui.id().with("kpi_attention_tooltip"),
+                                            egui::Sense::hover(),
+                                        );
+                                        let _ = kpi_hover.on_hover_text(lines.join("\n"));
+                                    }
                                 } else if self.status_available {
                                     ui.colored_label(
                                         YELLOW,
@@ -5745,7 +5807,7 @@ fn gradient_color_at(rect: egui::Rect, point: egui::Pos2) -> egui::Color32 {
     )
 }
 
-fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32, highlight: bool) {
+fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32, highlight: bool) -> egui::Rect {
     ui.vertical(|ui| {
         let value_text = value.to_string();
         if highlight {
@@ -5763,7 +5825,9 @@ fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: egui::Color32, hi
                 .small()
                 .color(if highlight { GREEN } else { GRAY }),
         );
-    });
+    })
+    .response
+    .rect
 }
 
 fn paint_text_halo(
@@ -6119,7 +6183,7 @@ fn media_info_row(
 
     // Micro-LED beacon based only on visible providers:
     let beacon_center = egui::pos2(quota_btn_rect.left() + 8.0, quota_btn_rect.center().y);
-    let throttled_visible: Vec<&'static str> = quota_snapshot
+    let mut throttled_visible: Vec<&'static str> = quota_snapshot
         .providers
         .iter()
         .filter(|p| {
@@ -6130,10 +6194,12 @@ fn media_info_row(
                 ProviderId::Claude => show_claude,
                 ProviderId::Qwen => show_qwen,
             };
-            visible && p.provider_is_throttled()
+            // A depleted spare account of a multi-account provider is no alarm while the active account is healthy.
+            visible && p.provider_is_throttled() && p.multi_account_alarm_allowed(&quota_snapshot.providers)
         })
         .map(|p| p.title)
         .collect();
+    throttled_visible.dedup();
 
     let has_visible_throttle = !throttled_visible.is_empty();
     let beacon_color = if has_visible_throttle {
@@ -7036,6 +7102,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                     if let Some(pointer) = config_pointer {
                                         app.quota_drag = Some(QuotaCardDrag {
                                             provider: *pid,
+                                            account_id: None,
                                             grab_offset_y: pointer.y - row_rect.top(),
                                         });
                                     }
@@ -7173,6 +7240,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 }
                                 if app
                                     .quota_drag
+                                    .as_ref()
                                     .is_some_and(|drag| drag.provider == *pid)
                                 {
                                     // Dim the vacated settings row while it follows the pointer.
@@ -7188,7 +7256,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             {
                                 app.quota_drag = None;
                             }
-                            if let (Some(drag), Some(pointer)) = (app.quota_drag, config_pointer) {
+                            if let (Some(drag), Some(pointer)) = (app.quota_drag.clone(), config_pointer) {
                                 let others: Vec<(ProviderId, f32, f32)> = config_row_bounds
                                     .iter()
                                     .filter(|(provider, _, _)| *provider != drag.provider)
@@ -7637,12 +7705,14 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                         card_bounds.push((quota.id, current_y, card_h));
                         let forecast = quota.pacing_forecast();
                         let card_color = app.provider_color(quota.id);
+                        let multi_account = is_multi_account_card(&visible_providers, quota);
                         draw_provider_card(
                             painter, row_rect, quota, &forecast, language, card_color,
-                            card_minimized,
+                            card_minimized, multi_account,
                         );
                         if app
                             .quota_drag
+                            .as_ref()
                             .is_some_and(|drag| drag.provider == quota.id)
                         {
                             // Dim the vacated slot while the card follows the pointer.
@@ -7652,15 +7722,17 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 egui::Color32::from_black_alpha(130),
                             );
                         }
-                        let card_response = ui.interact(
-                            row_rect,
-                            egui::Id::new("quota_card").with(provider_slot(quota.id)),
-                            egui::Sense::drag(),
-                        );
+                        let card_id = card_widget_id(quota.id, quota.account_id.as_deref());
+                        let card_response = ui.interact(row_rect, card_id, egui::Sense::drag());
+                        let card_response = match (multi_account, quota.account_email.as_deref()) {
+                            (true, Some(email)) => card_response.on_hover_text(email),
+                            _ => card_response,
+                        };
                         if card_response.drag_started() {
                             if let Some(pointer) = pointer {
                                 app.quota_drag = Some(QuotaCardDrag {
                                     provider: quota.id,
+                                    account_id: quota.account_id.clone(),
                                     grab_offset_y: pointer.y - row_rect.top(),
                                 });
                             }
@@ -7678,7 +7750,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                         // ghost without a pressed pointer.
                         app.quota_drag = None;
                     }
-                    if let (Some(drag), Some(pointer)) = (app.quota_drag, pointer) {
+                    if let (Some(drag), Some(pointer)) = (app.quota_drag.clone(), pointer) {
                         let others: Vec<(ProviderId, f32, f32)> = card_bounds
                             .iter()
                             .filter(|(provider, _, _)| *provider != drag.provider)
@@ -7701,7 +7773,12 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             ],
                             egui::Stroke::new(2.0, marker_color),
                         );
-                        if let Some(quota) = app.quota_snapshot.get(drag.provider) {
+                        // The settings list drags a whole provider without an account; fall back to its first card.
+                        if let Some(quota) = app
+                            .quota_snapshot
+                            .get_card(drag.provider, drag.account_id.as_deref())
+                            .or_else(|| app.quota_snapshot.get(drag.provider))
+                        {
                             let card_h =
                                 provider_card_height(quota, app.quota_minimize_depleted);
                             let ghost_top = (pointer.y - drag.grab_offset_y).max(rows_top);
@@ -7718,9 +7795,10 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             let card_color = app.provider_color(drag.provider);
                             let ghost_minimized =
                                 app.quota_minimize_depleted && quota.provider_is_throttled();
+                            let ghost_multi = is_multi_account_card(&visible_providers, quota);
                             draw_provider_card(
                                 painter, ghost_rect, quota, &forecast, language, card_color,
-                                ghost_minimized,
+                                ghost_minimized, ghost_multi,
                             );
                         }
                     }
@@ -8220,6 +8298,7 @@ fn draw_provider_card(
     language: Language,
     provider_color: egui::Color32,
     minimized: bool,
+    multi_account: bool,
 ) {
     // Card background
     painter.rect_filled(
@@ -8263,15 +8342,20 @@ fn draw_provider_card(
 
     // Full Name
     // The badge already carries the model, so the subtitle is just the company.
-    let full_name = match quota.id {
+    let company = match quota.id {
         ProviderId::Glm => "Z.ai",
         ProviderId::Agy => "Google",
         ProviderId::Codex => "OpenAI",
         ProviderId::Claude => "Anthropic",
         ProviderId::Qwen => "Alibaba",
     };
+    // With several account cards the title names the account; the e-mail shows on hover.
+    let full_name = match (quota.account_label.as_deref(), multi_account) {
+        (Some(label), true) => format!("{company} · {label}"),
+        _ => company.to_string(),
+    };
     let name_galley = painter.layout_no_wrap(
-        full_name.into(),
+        full_name,
         egui::FontId::proportional(11.5),
         egui::Color32::from_rgb(226, 232, 240),
     );
@@ -8281,6 +8365,9 @@ fn draw_provider_card(
         name_galley,
         egui::Color32::from_rgb(226, 232, 240),
     );
+
+    // The reset hint of a minimized card starts right behind the name.
+    let text_left = badge_rect.right() + 8.0 + name_width + 8.0;
 
     // Right: Pure status LED light without text clutter (per Simon's request)
     let led_health = if quota.provider_is_throttled() {
@@ -8315,22 +8402,24 @@ fn draw_provider_card(
         // Header-only row: name plus the reset that ends the depletion,
         // formatted like the reset footer of the full cards.
         if let Some((raw, is_five_hour)) = crate::quota_layout::minimized_reset(quota) {
-            let reset_text = format!(
+            let font = egui::FontId::monospace(9.0);
+            let full_text = format!(
                 "Reset {}",
                 format_reset_phrase(Some(raw), is_five_hour, language)
             );
-            let reset_galley = painter.layout_no_wrap(
-                reset_text,
-                egui::FontId::monospace(9.0),
-                GRAY,
+            let avail_w = (led_pos.x - 10.0 - text_left).max(0.0);
+            let shown = fit_reset_text(&full_text, avail_w, |text| {
+                painter.layout_no_wrap(text.to_string(), font.clone(), GRAY).size().x
+            });
+            let reset_galley = painter.layout_no_wrap(shown, font, GRAY);
+            let reset_x = (led_pos.x - 10.0 - reset_galley.size().x).max(text_left);
+            // Clip to the free span so a long account label never reaches the LED.
+            let reset_clip = egui::Rect::from_min_max(
+                egui::pos2(text_left, card_rect.top()),
+                egui::pos2((led_pos.x - 10.0).max(text_left), card_rect.bottom()),
             );
-            painter.galley(
-                egui::pos2(
-                    (led_pos.x - 10.0 - reset_galley.size().x).max(
-                        badge_rect.right() + 8.0 + name_width + 8.0,
-                    ),
-                    header_y + 3.0,
-                ),
+            painter.with_clip_rect(reset_clip).galley(
+                egui::pos2(reset_x, header_y + 3.0),
                 reset_galley,
                 GRAY,
             );
@@ -8482,6 +8571,9 @@ fn render_quota_tooltip(
         };
         ui.colored_label(status_color, format!("· {status_text}"));
     });
+    if let Some(email) = quota.account_email.as_deref() {
+        ui.weak(email);
+    }
 
     ui.separator();
 

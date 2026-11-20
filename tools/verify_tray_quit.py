@@ -58,6 +58,8 @@ def main() -> int:
         check=False,
         text=True,
         capture_output=True,
+        stdin=subprocess.DEVNULL,
+        timeout=15,
     )
     if stop.returncode != 0:
         print(json.dumps({"ok": False, "reason": "stop_failed", "stderr": stop.stderr}))
