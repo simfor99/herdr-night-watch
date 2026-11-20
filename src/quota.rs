@@ -2573,9 +2573,10 @@ fn codex_reset_epoch_to_local(epoch: i64, key: &str) -> String {
 
 #[cfg(not(windows))]
 fn codex_reset_epoch_to_local(epoch: i64, key: &str) -> String {
-    // Non-Windows forecasts use UTC for both reset times and current time.
-    let days = epoch.div_euclid(86_400);
-    let day_seconds = epoch.rem_euclid(86_400);
+    // Dieselbe lokale Zeitbasis wie die Uhr des Forecasts (local_clock_epoch), sonst liegen Reset und Reichweite auseinander.
+    let local = epoch + local_timezone_offset_minutes() as i64 * 60;
+    let days = local.div_euclid(86_400);
+    let day_seconds = local.rem_euclid(86_400);
     let (year, month, day) = days_to_ymd(days);
     format_codex_reset_local(
         key,
@@ -4072,6 +4073,27 @@ mod tests {
         let mut no_pool = tight_forecast(PacingHealth::Tight, Some(6.0), false);
         apply_pool_refill_cap(&mut no_pool, None, now, false);
         assert_eq!(no_pool.health, PacingHealth::Tight);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_reset_display_uses_the_same_local_time_base_as_the_forecast_clock() {
+        // Regression: die Codex-Resetanzeige war UTC, die Forecast-Uhr lokal. Jetzt dieselbe Zeitbasis.
+        let epoch = 1_795_000_000i64;
+        let local = epoch + local_timezone_offset_minutes() as i64 * 60;
+        let (year, month, day) = days_to_ymd(local.div_euclid(86_400));
+        let day_seconds = local.rem_euclid(86_400);
+        let expected = format_codex_reset_local(
+            "week",
+            (
+                year as u32,
+                month,
+                day,
+                (day_seconds / 3_600) as u32,
+                ((day_seconds % 3_600) / 60) as u32,
+            ),
+        );
+        assert_eq!(codex_reset_epoch_to_local(epoch, "week"), expected);
     }
 
     #[cfg(not(windows))]

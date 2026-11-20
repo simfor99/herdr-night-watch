@@ -177,3 +177,52 @@ def test_without_the_llm_module_no_agy_process_is_started(env, capsys, monkeypat
     assert fetch.main() == 0
     assert capsys.readouterr().out.strip() == "null"
     assert started == []
+
+
+def test_an_invalid_agy_real_bin_yields_null_and_no_agy_is_started(env, capsys, monkeypatch):
+    """Regression: AGY_REAL_BIN ohne absoluten Pfad darf weder über $PATH noch über den Fetcher starten."""
+    helpers.two_accounts_saved(env)
+    monkeypatch.setenv("AGY_REAL_BIN", "agy")
+    import llm_account as la
+
+    started = []
+    original_run = la.subprocess.run
+
+    def recording_run(argv, *args, **kwargs):
+        started.append(argv)
+        return original_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(la.subprocess, "run", recording_run)
+    fetch = load_fetch_module()
+    capsys.readouterr()
+
+    assert fetch.main() == 0
+    assert capsys.readouterr().out.strip() == "null"
+    assert not [argv for argv in started if argv and argv[0] == "agy"]
+
+
+def test_a_corrupt_registry_yields_null_instead_of_a_single_account_fallback(env, capsys):
+    """Regression: kaputte accounts.json darf nicht still auf den Einkonto-Fallback fallen."""
+    helpers.write_account(env.live, "a@example.test")  # ein gültiges Live-Konto, das der Fallback lesen würde
+    helpers.set_usage(env, {"a@example.test": helpers.tsv(40, 60, 50, 70)})
+    env.state.mkdir(parents=True, exist_ok=True)
+    (env.state / "accounts.json").write_text("{kaputt", encoding="utf-8")
+    fetch = load_fetch_module()
+    capsys.readouterr()
+
+    assert fetch.main() == 0
+    assert capsys.readouterr().out.strip() == "null"
+
+
+def test_a_snapshot_marked_as_superseded_is_discarded(env, capsys, monkeypatch):
+    helpers.two_accounts_saved(env)
+    helpers.set_usage(env, {"a@example.test": helpers.tsv(40, 60, 50, 70), "b@example.test": helpers.tsv(30, 50, 20, 40)})
+    import llm_account as la
+
+    real = la.fetch_provider_status(la.ADAPTERS["agy"], write_quotas=False)
+    monkeypatch.setattr(la, "fetch_provider_status", lambda *a, **k: {**real, "registry_changed": True})
+    fetch = load_fetch_module()
+    capsys.readouterr()
+
+    assert fetch.main() == 0
+    assert capsys.readouterr().out.strip() == "null"

@@ -562,3 +562,16 @@ def test_a_dump_failure_after_the_stop_reports_unknown_state_without_repeating_t
     assert out["reason"] == "dump_failed" and out["stage"] == "after_stop"
     assert out["stop_pids"] == [111] and out["remaining_state"] == "unknown"
     assert len(stops) == 1
+
+
+@pytest.mark.parametrize("line,matches", [
+    ("401 tests passed", False),
+    ("collected 401 items, 0 failed", False),
+    ("HTTP 401", True),
+    ("status code: 401", True),
+    ("error: 401", True),
+    ("401 Unauthorized", True),
+    ("UNAUTHENTICATED: token expired", True),
+])
+def test_auth_401_evidence_needs_an_http_or_auth_context_not_a_bare_number(line, matches):
+    assert la.auth_401_evidence(line) is matches

@@ -798,3 +798,66 @@ def test_a_switch_records_the_subsecond_switch_time(env, monkeypatch):
     monkeypatch.setattr(la.time, "time", lambda: 1_795_000_000.75)
     la.main(["use", "agy", "acc1"])
     assert registry(env)["switch_epoch"] == 1_795_000_000.75
+
+
+# ---- Abschluss-Fixes (kontrolleur): Rollback-Pfade, Auth-401-Regex, Limit-Zeilen ----
+
+
+def _failing_install_after_writing_token(message):
+    """Ersetzt install_profile_to_live: schreibt das neue Token ins Live-Home und scheitert danach."""
+
+    def install(adapter, pdir):
+        la.atomic_write(la.live_home() / adapter.token_rel, b'{"id_token_email": "neu@example.test"}')
+        raise RuntimeError(message)
+
+    return install
+
+
+def test_rollback_after_a_failed_install_restores_the_old_token_when_live_home_is_outside_the_state_dir(env, monkeypatch):
+    """Regression: owner_only im Rollback scheiterte mit ValueError, weil das Live-Home außerhalb des State-Verzeichnisses liegt."""
+    two_accounts_saved(env)  # aktiv B, Live-Home und State-Verzeichnis sind getrennt
+    before = live_token(env).read_text(encoding="utf-8")
+    monkeypatch.setattr(la, "install_profile_to_live", _failing_install_after_writing_token("Platte voll"))
+
+    with pytest.raises(RuntimeError, match="Platte voll"):
+        la.cmd_use(la.ADAPTERS["agy"], "acc1")
+
+    assert live_token(env).read_text(encoding="utf-8") == before
+
+
+def test_rollback_removes_a_token_that_did_not_exist_before_the_switch(env, monkeypatch):
+    two_accounts_saved(env)
+    live_token(env).unlink()  # vor dem Wechsel gab es kein Live-Token
+    monkeypatch.setattr(la, "install_profile_to_live", _failing_install_after_writing_token("Platte voll"))
+
+    with pytest.raises(RuntimeError):
+        la.cmd_use(la.ADAPTERS["agy"], "acc1")
+
+    assert not live_token(env).exists()
+
+
+def test_a_registry_commit_failure_rolls_the_live_files_back(env, monkeypatch):
+    two_accounts_saved(env)  # aktiv B
+    before = live_token(env).read_text(encoding="utf-8")
+
+    def failing_save(reg):
+        raise OSError("Registry nicht schreibbar")
+
+    monkeypatch.setattr(la, "save_registry", failing_save)
+    with pytest.raises(OSError, match="Registry nicht schreibbar"):
+        la.cmd_use(la.ADAPTERS["agy"], "acc1")
+
+    assert live_token(env).read_text(encoding="utf-8") == before
+
+
+def test_unknown_limit_rows_do_not_create_a_healthy_lane(env):
+    text = "Claude and GPT models\tDaily Limit Remaining\t90%\t2026-11-27T08:08:12Z"
+    assert la.parse_usage_tsv(text) == {}
+
+
+def test_only_real_limit_rows_are_read_for_a_lane(env):
+    text = ("Gemini Models\tFive Hour Limit Remaining\t40%\t2026-11-20T13:08:12Z\n"
+            "Gemini Models\tDaily Limit Remaining\t90%\t2026-11-27T08:08:12Z")
+    lanes = la.parse_usage_tsv(text)
+    assert list(lanes) == ["gemini"]
+    assert lanes["gemini"]["five_hour_pct"] == 40 and lanes["gemini"]["weekly_pct"] is None

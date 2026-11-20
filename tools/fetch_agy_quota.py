@@ -108,6 +108,8 @@ def _has_active_slots(llm):
 def _registry_result(llm):
     try:
         snapshot = llm.fetch_provider_status(llm.ADAPTERS["agy"], write_quotas=True)
+        if snapshot.get("registry_changed"):
+            return None  # überholt: ein paralleler Wechsel hat die Auswertung entwertet
         return _project_registry_snapshot(snapshot)
     except Exception:  # noqa: BLE001 - fail-closed: jeder Fehler wird zu null
         return None
@@ -118,7 +120,10 @@ def _fallback_result(llm):
     if llm is None:
         # Ohne Modul ist der TSV-Parser nicht verfügbar; ein agy-Lauf wäre verworfen. Also gar nicht erst starten.
         return None
-    agy_bin = llm.agy_binary()
+    try:
+        agy_bin = llm.agy_binary()  # prüft AGY_REAL_BIN fail-closed
+    except Exception:  # noqa: BLE001
+        return None
     env = dict(os.environ, HOME=str(llm.live_home()), BROWSER="false", DISPLAY="", XDG_OPEN="")
     try:
         proc = subprocess.run(
@@ -172,7 +177,9 @@ def main():
         try:
             multi = _has_active_slots(llm)
         except Exception:  # noqa: BLE001
-            multi = False
+            # Kaputte accounts.json: kein Rückfall auf ein Konto, sonst würde ein Mehrkonto-Pool still verkürzt.
+            sys.stdout.write("null\n")
+            return 0
         if multi:
             result = _registry_result(llm)
             sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n" if result else "null\n")

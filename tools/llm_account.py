@@ -71,6 +71,7 @@ def proc_root() -> Path:
 
 
 def agy_binary() -> str:
+    validate_agy_binary_override()
     return os.environ.get("AGY_REAL_BIN") or DEFAULT_AGY_BIN
 
 
@@ -355,7 +356,9 @@ def heal_locked(adapter: AgyAdapter) -> str:
     # Die Live-Datei wird genau einmal gelesen. Identität und Kopie stammen aus denselben Bytes, sonst könnte
     # ein Alt-Prozess zwischen Prüfung und Kopie ein fremdes Token in das Profil dieses Kontos schreiben.
     try:
-        token_bytes = live_token.read_bytes()
+        with live_token.open("rb") as fh:
+            live_mtime = os.fstat(fh.fileno()).st_mtime  # Mtime und Bytes aus demselben Deskriptor
+            token_bytes = fh.read()
     except OSError:
         return "unreadable"
     live_email = identity_from_bytes(token_bytes)
@@ -367,7 +370,7 @@ def heal_locked(adapter: AgyAdapter) -> str:
         # Token nur bei neuerem Stand syncen; der Scope zählt, sobald er im Live-Home neu oder anders ist.
         profile_token = pdir / adapter.token_rel
         live_scope = live_home() / adapter.scope_rel
-        token_newer = not profile_token.exists() or live_token.stat().st_mtime > profile_token.stat().st_mtime
+        token_newer = not profile_token.exists() or live_mtime > profile_token.stat().st_mtime
         scope_new = live_scope.exists() and (
             not (pdir / adapter.scope_rel).exists() or live_scope.read_bytes() != (pdir / adapter.scope_rel).read_bytes()
         )
@@ -713,13 +716,13 @@ def cmd_use(adapter: AgyAdapter, slot: str) -> str:
         old_scope = _read_or_none(live_home() / adapter.scope_rel)
         try:
             install_profile_to_live(adapter, pdir)
+            block["active_account"] = slot
+            if not unchanged:
+                block["switch_epoch"] = time.time()  # unveränderte Panes dürfen nicht als veraltet gelten
+            save_registry(reg)
         except BaseException:
             _restore_live(adapter, old_token, old_scope)
             raise
-        block["active_account"] = slot
-        if not unchanged:
-            block["switch_epoch"] = time.time()  # unveränderte Panes dürfen nicht als veraltet gelten
-        save_registry(reg)
         removed = invalidate_caches()
         log_event(
             "switch",
@@ -740,11 +743,17 @@ def _read_or_none(path: Path) -> bytes | None:
 
 
 def _restore_live(adapter: AgyAdapter, old_token: bytes | None, old_scope: bytes | None) -> None:
-    """Stellt die vorherigen Live-Dateien wieder her, wenn ein Kontowechsel auf halber Strecke scheitert."""
+    """Stellt die vorherigen Live-Dateien wieder her, wenn ein Kontowechsel auf halber Strecke scheitert.
+
+    Ohne owner_only: das Live-Home liegt nicht unter dem State-Verzeichnis, owner_only würde dort abbrechen.
+    Fehlte vorher eine Datei, wird die neu geschriebene wieder entfernt.
+    """
     if old_token is not None:
-        atomic_write(live_home() / adapter.token_rel, old_token, owner_only=True)
+        atomic_write(live_home() / adapter.token_rel, old_token)
+    else:
+        _unlink_if_present(live_home() / adapter.token_rel)
     if old_scope is not None:
-        atomic_write(live_home() / adapter.scope_rel, old_scope, owner_only=True)
+        atomic_write(live_home() / adapter.scope_rel, old_scope)
     else:
         _unlink_if_present(live_home() / adapter.scope_rel)
 
@@ -810,6 +819,8 @@ def parse_usage_tsv(text: str, adapter: AgyAdapter = ADAPTERS["agy"]) -> dict[st
         if not match or int(match.group(1)) > 100:
             continue
         pct = int(match.group(1))
+        if "Five Hour" not in limit and "Weekly" not in limit:
+            continue  # unbekannter Limit-Typ: keine leere, scheinbar gesunde Lane
         entry = lanes.setdefault(lane, {"five_hour_pct": None, "five_hour_reset": None, "weekly_pct": None, "weekly_reset": None})
         if "Five Hour" in limit:
             entry["five_hour_pct"], entry["five_hour_reset"] = pct, reset_raw or None
@@ -1119,7 +1130,11 @@ ANTI_LOOP_LOCK_FILE = "bounce-state.lock"
 QUIET_RECHECK_S = 30.0
 HARNESS_INFRA_NAMES = frozenset({"mcp", "language_server", "statusline.sh"})
 ACTIVE_STATUS_RE = re.compile(r"esc to interrupt|\b[1-9]\d* task\(s\)|\brunning\b", re.IGNORECASE)
-AUTH_401_RE = re.compile(r"\b401\b|UNAUTHENTICATED|invalid_grant|Unauthorized")
+AUTH_401_RE = re.compile(
+    r"\b(?:HTTP[/\s]*401|status(?:\s+code)?[:=\s]+401|error[:\s]+401|401\s+Unauthorized)\b"
+    r"|UNAUTHENTICATED|invalid_grant|Unauthorized",
+    re.IGNORECASE,
+)
 REPLAY_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
 BRIEFKASTEN_DEFAULT = "~/.local/state/herdr/briefkasten"
 
