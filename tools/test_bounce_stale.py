@@ -381,7 +381,8 @@ def test_restart_command_quotes_cwd_and_model(world):
     la.execute_bounce(la.ADAPTERS["agy"], plan, herdr, proc=world.proc, exit_timeout_s=2, start_timeout_s=2, poll_s=0.01)
 
     restart = herdr.calls[-1][1]
-    assert restart == f"cd '{odd_cwd}' && agy --conversation {CONV_OLD} --model {MODEL}"
+    # Verglichen wird der geparste Befehl: shlex.quote darf Apostroph und Leerzeichen im Pfad korrekt escapen.
+    assert shlex.split(restart) == ["cd", odd_cwd, "&&", "agy", "--conversation", CONV_OLD, "--model", MODEL]
 
 
 def test_scan_reads_model_from_short_flag_m_as_well(world):
@@ -722,3 +723,50 @@ def test_wakeup_observation_failure_keeps_the_new_pid_and_reports_it_separately(
     assert result["status"] == "ok" and result["new_pid"] == 5151
     assert result["wakeup_sent"] is True
     assert result["wakeup_status"].startswith("beobachtung_fehlgeschlagen")
+
+
+def test_a_restart_send_failure_after_exit_is_a_structured_result_and_is_not_resent(world):
+    add_agy(world.proc, 4242, "w1:p1", cwd=world.cwd)
+
+    def on_run(fake, pane_id, text):
+        if text == "/exit":
+            shutil.rmtree(world.proc / "4242")  # der alte Prozess ist beendet
+        elif text.startswith("cd "):
+            raise la.CliError("herdr pane run schlug fehl", 5)
+
+    herdr = FakeHerdr([pane()], on_run=on_run)
+    plan = la.plan_bounce(la.ADAPTERS["agy"], "w1:p1", herdr, proc=world.proc)
+    result = la.execute_bounce(la.ADAPTERS["agy"], plan, herdr, proc=world.proc, exit_timeout_s=2, poll_s=0.01)
+
+    assert result["status"] == "failed" and result["stage"] == "start"
+    assert result["recommended_action"] == "herdr-mutter-kind"
+    assert [c[1][:3] for c in herdr.calls].count("cd ") == 1  # genau ein Sendeversuch, kein erneutes Senden
+
+
+def test_a_conversation_taken_from_the_pane_session_passes_the_final_guard(world):
+    """Der Prozess trägt kein --conversation, die Pane-Session nennt die Konversation: Planer und Frischprüfung müssen übereinstimmen."""
+    add_agy(world.proc, 4242, "w1:p1", conv=None, cwd=world.cwd)
+
+    def on_run(fake, pane_id, text):
+        if text == "/exit":
+            shutil.rmtree(world.proc / "4242")
+        elif text.startswith("cd "):
+            add_agy(world.proc, 5151, "w1:p1", cwd=world.cwd)
+
+    herdr = FakeHerdr([pane()], on_run=on_run)  # agent_session.value == CONV_OLD
+    plan = la.plan_bounce(la.ADAPTERS["agy"], "w1:p1", herdr, proc=world.proc)
+    assert plan["conversation_id"] == CONV_OLD
+    result = la.execute_bounce(la.ADAPTERS["agy"], plan, herdr, proc=world.proc, exit_timeout_s=2,
+                               start_timeout_s=2, poll_s=0.01)
+    assert result["status"] == "ok"
+
+
+def test_a_conflicting_pane_session_blocks_the_final_guard(world):
+    add_agy(world.proc, 4242, "w1:p1", cwd=world.cwd)
+    herdr = FakeHerdr([pane()])
+    plan = la.plan_bounce(la.ADAPTERS["agy"], "w1:p1", herdr, proc=world.proc)
+    herdr.panes[0]["agent_session"] = {"agent": "agy", "kind": "id", "value": CONV_OTHER}  # Session wechselt
+
+    with pytest.raises(la.CliError, match="konversation_geaendert"):
+        la.execute_bounce(la.ADAPTERS["agy"], plan, herdr, proc=world.proc, exit_timeout_s=0.1, poll_s=0.01)
+    assert herdr.calls == []

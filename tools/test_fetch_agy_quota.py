@@ -134,7 +134,8 @@ def test_embedded_python_c_run_emits_the_contract_without_file_context(env):
 
     proc = subprocess.run(
         [sys.executable, "-c", FETCH_PATH.read_text(encoding="utf-8")],
-        env=dict(os.environ),
+        # Eingebettet ohne __file__: der Checkout-Ort muss ausdrücklich übergeben werden, unabhängig vom Clone-Pfad.
+        env=dict(os.environ, HERDR_NIGHT_WATCH_TOOLS=str(FETCH_PATH.parent)),
         capture_output=True,
         text=True,
         timeout=60,

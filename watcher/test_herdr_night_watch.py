@@ -1758,6 +1758,16 @@ class AttentionSummaryTests(unittest.TestCase):
         self.assertEqual(len(summary["attention_items"]), 8)  # fester Wert: die Grenze darf nicht mit dem Code mitwandern
         self.assertEqual(summary["attention_items"][0]["status"], "done")
 
+    def test_list_valued_tab_id_falls_back_instead_of_crashing_the_summary(self):
+        bad = [{"pane_id": "b1", "tab_id": ["t"], "workspace_id": "wR", "agent_status": "done", "completion_seq": 1}]
+        legacy = [{"pane_id": "p1", "agent_status": "done"}]
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload(bad)), \
+                patch.object(WATCHER, "list_agents", return_value=legacy):
+            summary = WATCHER.live_agent_summary()
+
+        self.assertFalse(summary["attention_available"])
+        self.assertEqual(summary["done"], 1)
+
     def test_malformed_completion_seq_falls_back_instead_of_crashing_the_summary(self):
         bad = [{"pane_id": "b1", "tab_id": "tA", "workspace_id": "wR", "agent_status": "done", "completion_seq": "12"}]
         legacy = [{"pane_id": "p1", "agent_status": "done"}]

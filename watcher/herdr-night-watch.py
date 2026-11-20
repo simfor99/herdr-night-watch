@@ -843,10 +843,19 @@ def _validate_snapshot_field_types(
         status = agent.get("agent_status")
         if status is not None and not isinstance(status, str):
             raise RuntimeError("Herdr api snapshot agent_status is malformed.")
-    for entry in (*tabs, *workspaces):
-        label = entry.get("label")
-        if label is not None and not isinstance(label, str):
-            raise RuntimeError("Herdr api snapshot label is malformed.")
+        _require_text_or_none(agent, ("tab_id", "workspace_id"))
+    for tab in tabs:
+        _require_text_or_none(tab, ("tab_id", "workspace_id", "label"))
+    for workspace in workspaces:
+        _require_text_or_none(workspace, ("workspace_id", "label"))
+
+
+def _require_text_or_none(entry: dict[str, Any], keys: tuple[str, ...]) -> None:
+    """IDs dienen als Dictionary-Schlüssel: nur Text oder fehlend. Listen sind unhashbar und würden außerhalb des Fallbacks brechen."""
+    for key in keys:
+        value = entry.get(key)
+        if value is not None and not isinstance(value, str):
+            raise RuntimeError(f"Herdr api snapshot field {key} is malformed.")
 
 
 def build_attention_summary(

@@ -413,8 +413,22 @@ def _powershell_calls(name):
     return sites
 
 
-def _unsafe_powershell_reasons(node):
-    """Gründe, warum ein powershell-Aufruf nicht sicher gebunden ist. Leer heißt: stdin=DEVNULL und endliche Frist."""
+def _module_constants(src):
+    """Modulebene: Name = Konstante. Eine Konstante mit Wert None bleibt sichtbar (und wird abgelehnt)."""
+    constants = {}
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
+                and isinstance(node.value, ast.Constant):
+            constants[node.targets[0].id] = node.value.value
+    return constants
+
+
+def _unsafe_powershell_reasons(node, constants=None):
+    """Gründe, warum ein powershell-Aufruf nicht sicher gebunden ist. Leer heißt: stdin=DEVNULL und endliche Frist.
+
+    Benannte Werte werden über die Modulkonstanten aufgelöst; ist ein Wert nicht auflösbar, gilt er als unsicher.
+    """
+    constants = constants or {}
     reasons = []
     values = {k.arg: k.value for k in node.keywords}
     stdin = values.get("stdin")
@@ -423,19 +437,41 @@ def _unsafe_powershell_reasons(node):
     timeout = values.get("timeout")
     if timeout is None:
         reasons.append("timeout fehlt")
-    elif isinstance(timeout, ast.Constant) and not (isinstance(timeout.value, (int, float))
-                                                    and not isinstance(timeout.value, bool)
-                                                    and 0 < timeout.value < float("inf")):
-        reasons.append(f"timeout ist keine positive endliche Frist: {timeout.value!r}")
+        return reasons
+    if isinstance(timeout, ast.Name):
+        if timeout.id not in constants:
+            reasons.append(f"timeout {timeout.id} ist nicht auflösbar")
+            return reasons
+        resolved = constants[timeout.id]
+    elif isinstance(timeout, ast.Constant):
+        resolved = timeout.value
+    else:
+        reasons.append("timeout ist kein Literal oder keine Modulkonstante")
+        return reasons
+    if not (isinstance(resolved, (int, float)) and not isinstance(resolved, bool) and 0 < resolved < float("inf")):
+        reasons.append(f"timeout ist keine positive endliche Frist: {resolved!r}")
     return reasons
 
 
 @pytest.mark.parametrize("name", sorted(PS_SITES))
 def test_every_powershell_call_sets_stdin_and_timeout(name):
+    src = _source_under_test(name)
+    constants = _module_constants(src)
     sites = _powershell_calls(name)
     assert sites, f"{name}: kein powershell-Aufruf gefunden (Prüfung wäre leer)"
     for fn_name, node in sites:
-        assert _unsafe_powershell_reasons(node) == [], f"{name}:{fn_name}: {_unsafe_powershell_reasons(node)}"
+        reasons = _unsafe_powershell_reasons(node, constants)
+        assert reasons == [], f"{name}:{fn_name}: {reasons}"
+
+
+def test_named_none_timeout_is_rejected_like_the_literal_none():
+    """Gegenprobe: eine benannte Konstante mit Wert None darf nicht als gebundene Frist gelten."""
+    src = "TIMEOUT = None\nsubprocess.run(['powershell'], stdin=subprocess.DEVNULL, timeout=TIMEOUT)\n"
+    node = ast.parse(src).body[1].value
+    assert _unsafe_powershell_reasons(node, _module_constants(src)) == [
+        "timeout ist keine positive endliche Frist: None"]
+    unknown = ast.parse("subprocess.run(['powershell'], stdin=subprocess.DEVNULL, timeout=MISSING)").body[0].value
+    assert _unsafe_powershell_reasons(unknown, {}) == ["timeout MISSING ist nicht auflösbar"]
 
 
 def test_the_powershell_check_rejects_none_values_and_a_missing_timeout():
@@ -472,3 +508,57 @@ def test_a_stop_timeout_is_reported_as_a_structured_result_without_a_second_stop
     assert out["reason"] == "stop_timeout" and out["stop_pids"] == [111]
     assert out["remaining_tray_pids"] == [111]
     assert sum(1 for argv in calls if argv[0] == "powershell.exe") == 1  # kein blindes Wiederholen
+
+
+def test_a_dump_failure_before_the_stop_is_a_structured_result_and_no_stop_runs(monkeypatch, capsys):
+    import subprocess as sp
+
+    import verify_tray_quit as vtq
+
+    stops = []
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "powershell.exe":
+            stops.append(argv)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    def dump_times_out():
+        raise sp.TimeoutExpired(["python.exe"], 15)
+
+    monkeypatch.setattr(vtq.subprocess, "run", fake_run)
+    monkeypatch.setattr(vtq, "dump", dump_times_out)
+    assert vtq.main() == 2
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["reason"] == "dump_failed" and out["stage"] == "before_stop"
+    assert stops == []
+
+
+def test_a_dump_failure_after_the_stop_reports_unknown_state_without_repeating_the_stop(monkeypatch, capsys):
+    import subprocess as sp
+
+    import verify_tray_quit as vtq
+
+    stops = []
+    payload = {"windows": [{"title": "Herdr-Nachtwächter - Live-Status"}],
+               "processes": [{"ProcessId": 111, "CommandLine": "herdr-nachtwaechter.exe"}]}
+    calls = {"dump": 0}
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "powershell.exe":
+            stops.append(argv)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    def dump_once_then_times_out():
+        calls["dump"] += 1
+        if calls["dump"] == 1:
+            return payload
+        raise sp.TimeoutExpired(["python.exe"], 15)
+
+    monkeypatch.setattr(vtq.subprocess, "run", fake_run)
+    monkeypatch.setattr(vtq, "dump", dump_once_then_times_out)
+    monkeypatch.setattr(vtq.time, "sleep", lambda _s: None)
+    assert vtq.main() == 3
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["reason"] == "dump_failed" and out["stage"] == "after_stop"
+    assert out["stop_pids"] == [111] and out["remaining_state"] == "unknown"
+    assert len(stops) == 1

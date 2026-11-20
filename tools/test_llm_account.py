@@ -727,14 +727,19 @@ def test_heal_copies_the_token_bytes_it_identified_not_a_later_write(env, monkey
     la.main(["use", "agy", "acc1"])  # aktiv A, Live-Home = A
     past = time.time() - 3600
     os.utime(profile_token(env, "acc1"), (past, past))  # Live-Token ist neuer, also wäre ein Sync fällig
-    original_copy = la.copy_files
+    original_identity = la.identity_from_bytes
+    injected = {"done": False}
 
-    def racing_copy(src_root, dst_root, rels, **kwargs):
-        write_account(env.live, "b@example.test", marker="-RACE")  # Alt-Prozess schreibt B in die Live-Datei
-        return original_copy(src_root, dst_root, rels, **kwargs)
+    def write_after_the_read(raw):
+        identity = original_identity(raw)  # Identität aus den bereits gelesenen Bytes (A)
+        if not injected["done"]:
+            injected["done"] = True
+            write_account(env.live, "b@example.test", marker="-RACE")  # Alt-Prozess schreibt B nach dem Lesen
+        return identity
 
-    monkeypatch.setattr(la, "copy_files", racing_copy)
+    monkeypatch.setattr(la, "identity_from_bytes", write_after_the_read)
     assert la.main(["heal", "agy"]) == 0
+    assert injected["done"], "der Schreibvorgang muss tatsächlich zwischen Lesen und Kopieren stattfinden"
     assert "a@example.test" in profile_token(env, "acc1").read_text(encoding="utf-8")
 
 
@@ -762,3 +767,34 @@ def test_quota_snapshot_for_another_account_does_not_prove_the_live_account(env)
     (env.state / "quotas.json").write_text(json.dumps(snap), encoding="utf-8")
 
     assert "disk_token_unhealthy:quotas_anderes_konto" in la.disk_token_blockers(la.ADAPTERS["agy"], reason="auth_401")
+
+
+# ---- CodeRabbit Runde 3: AGY_REAL_BIN, Wechsel-Rollback, Subsekunden beim Wechsel ----
+
+
+def test_a_bare_agy_real_bin_is_refused_before_any_agy_is_started(env, monkeypatch):
+    monkeypatch.setenv("AGY_REAL_BIN", "agy")  # nackter Name würde über $PATH laufen
+    assert la.main(["status", "agy", "--json"]) == 2
+    assert not env.log.exists()  # kein agy gestartet
+
+
+def test_a_failed_account_switch_leaves_the_old_live_pair_and_the_registry_untouched(env):
+    two_accounts_saved(env)  # aktiv B
+    (env.state / "profiles/agy/acc1" / la.AgyAdapter.scope_rel).unlink(missing_ok=True)
+    scope_dir = env.state / "profiles/agy/acc1" / la.AgyAdapter.scope_rel
+    scope_dir.mkdir(parents=True)  # Scope des Ziels ist nicht lesbar (Verzeichnis statt Datei)
+    before_token = live_token(env).read_text(encoding="utf-8")
+    before_active = registry(env)["active_account"]
+
+    with pytest.raises(la.CliError):
+        la.cmd_use(la.ADAPTERS["agy"], "acc1")
+
+    assert live_token(env).read_text(encoding="utf-8") == before_token  # Live-Token B unverändert
+    assert registry(env)["active_account"] == before_active
+
+
+def test_a_switch_records_the_subsecond_switch_time(env, monkeypatch):
+    two_accounts_saved(env)  # aktiv B
+    monkeypatch.setattr(la.time, "time", lambda: 1_795_000_000.75)
+    la.main(["use", "agy", "acc1"])
+    assert registry(env)["switch_epoch"] == 1_795_000_000.75

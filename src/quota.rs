@@ -251,7 +251,7 @@ impl ProviderQuota {
             None,
             None,
         );
-        apply_pool_refill_cap(&mut fc, self.pool_next_refill_epoch, current_utc_epoch());
+        apply_pool_refill_cap(&mut fc, self.pool_next_refill_epoch, current_utc_epoch(), self.is_throttled);
         fc
     }
 
@@ -822,6 +822,13 @@ pub fn current_ymd() -> (i32, u32, u32) {
     days_to_ymd(days)
 }
 
+/// Nicht-Windows-Uhr in lokaler Zeit (wie `local_timezone_offset_minutes`), damit Forecast und Resetanzeige
+/// dieselbe Zeitbasis haben. Sonst liegt die Wochen-Resetzeit zwei Stunden neben der berechneten Reichweite.
+#[cfg(not(windows))]
+fn local_clock_epoch() -> i64 {
+    current_utc_epoch() + local_timezone_offset_minutes() as i64 * 60
+}
+
 pub fn current_hm() -> (u32, u32) {
     #[cfg(windows)]
     {
@@ -842,11 +849,7 @@ pub fn current_hm() -> (u32, u32) {
     }
     #[cfg(not(windows))]
     {
-        let now = std::time::SystemTime::now();
-        let secs = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let secs = local_clock_epoch().max(0) as u64;
         let hour = ((secs % 86400) / 3600) as u32;
         let minute = ((secs % 3600) / 60) as u32;
         (hour, minute)
@@ -861,7 +864,7 @@ fn current_forecast_today() -> (i32, u32, u32) {
     }
     #[cfg(not(windows))]
     {
-        current_ymd()
+        days_to_ymd(local_clock_epoch().div_euclid(86_400))
     }
 }
 
@@ -893,7 +896,8 @@ pub fn current_local_datetime() -> (u32, u32, u32, u32, u32, u32) {
     }
     #[cfg(not(windows))]
     {
-        let (y, m, d) = current_ymd();
+        let local = local_clock_epoch();
+        let (y, m, d) = days_to_ymd(local.div_euclid(86_400));
         let (h, min) = current_hm();
         // Fallback weekday calculation
         (y as u32, m, d, 1, h, min)
@@ -2145,7 +2149,16 @@ impl QuotaSnapshot {
 /// eine Tight-Warnung aus dem 7-Tage-Einzelhorizont ein Fehlalarm und wird
 /// auf OnTrack begrenzt. Throttled, eine 5-h-Erschöpfung und die historische
 /// Burnrate (`cycle_days`) bleiben unberührt.
-fn apply_pool_refill_cap(fc: &mut PacingForecast, pool_next_refill_epoch: Option<i64>, now_epoch: i64) {
+fn apply_pool_refill_cap(
+    fc: &mut PacingForecast,
+    pool_next_refill_epoch: Option<i64>,
+    now_epoch: i64,
+    account_throttled: bool,
+) {
+    // Ein gedrosseltes aktives Konto ist nicht gesund, egal was der Partner-Refill verspricht.
+    if account_throttled {
+        return;
+    }
     let Some(refill_epoch) = pool_next_refill_epoch else {
         return;
     };
@@ -4037,28 +4050,56 @@ mod tests {
         let in_days = |days: f32| now + (days * 86_400.0) as i64;
 
         let mut covered = tight_forecast(PacingHealth::Tight, Some(6.0), false);
-        apply_pool_refill_cap(&mut covered, Some(in_days(2.0)), now);
+        apply_pool_refill_cap(&mut covered, Some(in_days(2.0)), now, false);
         assert_eq!(covered.health, PacingHealth::OnTrack);
 
         let mut not_covered = tight_forecast(PacingHealth::Tight, Some(1.0), false);
-        apply_pool_refill_cap(&mut not_covered, Some(in_days(2.0)), now);
+        apply_pool_refill_cap(&mut not_covered, Some(in_days(2.0)), now, false);
         assert_eq!(not_covered.health, PacingHealth::Tight);
 
         let mut refill_too_far = tight_forecast(PacingHealth::Tight, Some(6.0), false);
-        apply_pool_refill_cap(&mut refill_too_far, Some(in_days(10.0)), now);
+        apply_pool_refill_cap(&mut refill_too_far, Some(in_days(10.0)), now, false);
         assert_eq!(refill_too_far.health, PacingHealth::Tight);
 
         let mut five_hour_out = tight_forecast(PacingHealth::Tight, Some(6.0), true);
-        apply_pool_refill_cap(&mut five_hour_out, Some(in_days(2.0)), now);
+        apply_pool_refill_cap(&mut five_hour_out, Some(in_days(2.0)), now, false);
         assert_eq!(five_hour_out.health, PacingHealth::Tight);
 
         let mut depleted = tight_forecast(PacingHealth::Throttled, Some(0.0), false);
-        apply_pool_refill_cap(&mut depleted, Some(in_days(2.0)), now);
+        apply_pool_refill_cap(&mut depleted, Some(in_days(2.0)), now, false);
         assert_eq!(depleted.health, PacingHealth::Throttled);
 
         let mut no_pool = tight_forecast(PacingHealth::Tight, Some(6.0), false);
-        apply_pool_refill_cap(&mut no_pool, None, now);
+        apply_pool_refill_cap(&mut no_pool, None, now, false);
         assert_eq!(no_pool.health, PacingHealth::Tight);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_non_windows_clock_uses_the_same_local_time_as_the_reset_display() {
+        // Befund: Die Resetanzeige war lokal (+2 h), die Uhr des Forecasts UTC. Beide müssen dieselbe Zeitbasis haben.
+        for _ in 0..3 {
+            let before = current_utc_epoch();
+            let (hour, _minute) = current_hm();
+            let after = current_utc_epoch();
+            if before / 3_600 != after / 3_600 {
+                continue; // Stundenwechsel während des Tests: nicht auswertbar
+            }
+            let (_month, _day, display_hour, _display_minute) = utc_epoch_to_local_month_day_hm(before);
+            assert_eq!(hour, display_hour, "Forecast-Uhr und Resetanzeige liegen auseinander");
+            return;
+        }
+    }
+
+    #[test]
+    fn a_throttled_active_account_is_never_shown_as_covered_by_the_pool() {
+        let now = 1_795_000_000i64;
+        let mut throttled = tight_forecast(PacingHealth::Tight, Some(1.0), false);
+        apply_pool_refill_cap(&mut throttled, Some(now + 43_200), now, true);
+        assert_eq!(throttled.health, PacingHealth::Tight);
+        assert!(!throttled.pool_covered);
+        assert_ne!(runway_light(false, 40, false, &throttled).color, RunwayColor::Green);
+        assert!(!throttled.week_pace_text(Language::German).contains("Pool"));
     }
 
     #[test]
@@ -4069,7 +4110,7 @@ mod tests {
         // Befund-Szenario: 6 Tage eigener Wochenrest, aber nur 1 Tag Reichweite (Defizit), Partner-Refill in 12 Stunden.
         // Kopf-LED wird grün, die Wochenzeile muss denselben Befund zeigen und darf nicht rot bleiben.
         let mut covered = tight_forecast(PacingHealth::Tight, Some(1.0), false);
-        apply_pool_refill_cap(&mut covered, Some(in_days(0.5)), now);
+        apply_pool_refill_cap(&mut covered, Some(in_days(0.5)), now, false);
         assert_eq!(covered.health, PacingHealth::OnTrack);
         assert!(covered.pool_covered);
         let covered_light = runway_light(false, 40, false, &covered);
@@ -4078,7 +4119,7 @@ mod tests {
 
         // Derselbe Einzelkonto-Forecast, aber Refill in 2 Tagen: keine Abdeckung, die Warnung bleibt rot.
         let mut uncovered = tight_forecast(PacingHealth::Tight, Some(1.0), false);
-        apply_pool_refill_cap(&mut uncovered, Some(in_days(2.0)), now);
+        apply_pool_refill_cap(&mut uncovered, Some(in_days(2.0)), now, false);
         assert!(!uncovered.pool_covered);
         let uncovered_light = runway_light(false, 40, false, &uncovered);
         assert_eq!(uncovered_light.color, RunwayColor::Red);
@@ -4095,7 +4136,7 @@ mod tests {
 
         // Ein leergelaufenes Wochenkontingent bleibt rot, auch mit Refill in Reichweite.
         let mut depleted = tight_forecast(PacingHealth::Tight, Some(1.0), false);
-        apply_pool_refill_cap(&mut depleted, Some(in_days(0.5)), now);
+        apply_pool_refill_cap(&mut depleted, Some(in_days(0.5)), now, false);
         assert_eq!(runway_light(false, 0, false, &depleted).color, RunwayColor::Red);
     }
 

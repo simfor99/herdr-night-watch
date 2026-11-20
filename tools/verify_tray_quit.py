@@ -44,7 +44,12 @@ def main() -> int:
     if opened.returncode != 0:
         print(opened.stdout or opened.stderr)
         return opened.returncode
-    before = dump()
+    try:
+        before = dump()
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        print(json.dumps({"ok": False, "reason": "dump_failed", "stage": "before_stop", "detail": str(exc)},
+                         ensure_ascii=False))
+        return 2
     trays = tray_pids(before)
     lives = live_windows(before)
     if not trays or not lives:
@@ -81,7 +86,14 @@ def main() -> int:
     after = before
     while time.time() < deadline:
         time.sleep(0.25)
-        after = dump()
+        try:
+            after = dump()
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            # Der Stop ist bereits gelaufen. Nicht wiederholen; den Zustand als unbekannt melden.
+            print(json.dumps({"ok": False, "reason": "dump_failed", "stage": "after_stop",
+                              "stop_pids": trays, "remaining_state": "unknown", "detail": str(exc)},
+                             ensure_ascii=False))
+            return 3
         if not live_windows(after) and not after.get("processes"):
             print(
                 json.dumps(

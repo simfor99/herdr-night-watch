@@ -74,6 +74,13 @@ def agy_binary() -> str:
     return os.environ.get("AGY_REAL_BIN") or DEFAULT_AGY_BIN
 
 
+def validate_agy_binary_override() -> None:
+    """AGY_REAL_BIN muss ein absoluter Pfad sein. Ein nackter Name liefe über $PATH und könnte den Wrapper treffen."""
+    value = os.environ.get("AGY_REAL_BIN")
+    if value is not None and not os.path.isabs(value):
+        raise CliError(f"AGY_REAL_BIN muss ein absoluter Pfad sein, erhalten: {value!r}.", 2)
+
+
 def utc_iso(epoch: float | None = None) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch if epoch is not None else time.time()))
 
@@ -695,10 +702,23 @@ def cmd_use(adapter: AgyAdapter, slot: str) -> str:
         previous = block.get("active_account")
         # Vor dem Kopieren prüfen: stimmen die Live-Dateien nach heal bereits mit dem Slot überein?
         unchanged = previous == slot and _live_matches_profile(adapter, pdir)
-        install_profile_to_live(adapter, pdir)
+        # Ziel vollständig lesen, bevor die Live-Dateien angefasst werden; alte Live-Dateien für ein Zurücksetzen sichern.
+        target_token = _read_or_none(pdir / adapter.token_rel)
+        target_scope = _read_or_none(pdir / adapter.scope_rel)
+        if target_token is None:
+            raise CliError(f"Profil {slot} ist unvollständig; Token nicht lesbar. Wechsel abgebrochen.", 3)
+        if (pdir / adapter.scope_rel).exists() and target_scope is None:
+            raise CliError(f"Profil {slot} hat einen nicht lesbaren Scope. Wechsel abgebrochen.", 3)
+        old_token = _read_or_none(live_home() / adapter.token_rel)
+        old_scope = _read_or_none(live_home() / adapter.scope_rel)
+        try:
+            install_profile_to_live(adapter, pdir)
+        except BaseException:
+            _restore_live(adapter, old_token, old_scope)
+            raise
         block["active_account"] = slot
         if not unchanged:
-            block["switch_epoch"] = int(time.time())  # unveränderte Panes dürfen nicht als veraltet gelten
+            block["switch_epoch"] = time.time()  # unveränderte Panes dürfen nicht als veraltet gelten
         save_registry(reg)
         removed = invalidate_caches()
         log_event(
@@ -710,6 +730,23 @@ def cmd_use(adapter: AgyAdapter, slot: str) -> str:
             caches_removed=len(removed),
         )
     return f"Aktives Konto gewechselt: {previous or '-'} -> {slot}."
+
+
+def _read_or_none(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _restore_live(adapter: AgyAdapter, old_token: bytes | None, old_scope: bytes | None) -> None:
+    """Stellt die vorherigen Live-Dateien wieder her, wenn ein Kontowechsel auf halber Strecke scheitert."""
+    if old_token is not None:
+        atomic_write(live_home() / adapter.token_rel, old_token, owner_only=True)
+    if old_scope is not None:
+        atomic_write(live_home() / adapter.scope_rel, old_scope, owner_only=True)
+    else:
+        _unlink_if_present(live_home() / adapter.scope_rel)
 
 
 def _live_matches_profile(adapter: AgyAdapter, pdir: Path) -> bool:
@@ -1695,9 +1732,17 @@ def _fresh_blockers(adapter: AgyAdapter, plan: dict[str, Any], herdr: Any, root:
     blockers += guard
     # Derselbe Prozess mit derselben Startzeit und Konversation muss noch allein auf dieser Pane laufen.
     on_pane = [r for r in scan_agy_processes(root) if r["pane_id"] == plan["pane_id"]]
-    if len(on_pane) != 1 or (on_pane[0]["pid"], on_pane[0]["start_epoch"], on_pane[0]["conversation_id"]) != (
-            plan["pid"], plan["start_epoch"], plan["conversation_id"]):
+    if len(on_pane) != 1 or (on_pane[0]["pid"], on_pane[0]["start_epoch"]) != (plan["pid"], plan["start_epoch"]):
         blockers.append("prozessbindung_geaendert")
+    else:
+        # Dieselben Quellen wie der Planer: ein ausdrücklich gesetztes Prozess-Argument und die Pane-Session
+        # müssen zur geplanten Konversation passen. Fehlt beides, war die Konversation nie bestimmt.
+        planned = plan["conversation_id"]
+        pane_session = (pane.get("agent_session") or {}).get("value")
+        process_conversation = on_pane[0]["conversation_id"]
+        if not planned or (process_conversation and process_conversation != planned) or \
+                (pane_session and pane_session != planned):
+            blockers.append("konversation_geaendert")
     if not plan.get("cwd") or not os.path.isdir(plan["cwd"]):
         blockers.append("cwd_ungueltig")
     return blockers
@@ -1770,7 +1815,11 @@ def _bounce_steps(herdr, root, plan, heal_result, exit_timeout_s, start_timeout_
 
     deadline = time.monotonic() + shell_timeout_s
     while True:
-        names = herdr.foreground_names(pane_id)
+        try:
+            names = herdr.foreground_names(pane_id)
+        except CliError as exc:
+            return {**plan, "status": "failed", "stage": "shell", "heal": heal_result, "error": str(exc),
+                    "recommended_action": "herdr-mutter-kind"}
         if names and all(name in SHELL_NAMES for name in names):
             break
         if time.monotonic() > deadline:
@@ -1778,7 +1827,13 @@ def _bounce_steps(herdr, root, plan, heal_result, exit_timeout_s, start_timeout_
                     "recommended_action": "herdr-mutter-kind"}
         time.sleep(poll_s)
 
-    herdr.run(pane_id, f"cd {_shell_quote(plan['cwd'])} && agy --conversation {_shell_quote(conv)} --model {_shell_quote(plan['model'])}")
+    try:
+        herdr.run(pane_id, f"cd {_shell_quote(plan['cwd'])} && agy --conversation {_shell_quote(conv)} --model {_shell_quote(plan['model'])}")
+    except CliError as exc:
+        # Der alte Prozess ist bereits beendet. Ein Fehler beim Senden wird als Ergebnis gemeldet, nicht erneut gesendet:
+        # herdr kann den Befehl trotz Fehlers angenommen haben.
+        return {**plan, "status": "failed", "stage": "start", "heal": heal_result, "error": str(exc),
+                "recommended_action": "herdr-mutter-kind"}
     deadline = time.monotonic() + start_timeout_s
     while True:
         new = [r for r in scan_agy_processes(root) if r["pane_id"] == pane_id and r["conversation_id"] == conv]
@@ -1910,6 +1965,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> str:
     adapter = get_adapter(args.provider)
+    validate_agy_binary_override()  # vor jedem Vorgang, der agy startet
     if args.verb == "save":
         return cmd_save(adapter, args.slot, args.label)
     if args.verb == "login":
