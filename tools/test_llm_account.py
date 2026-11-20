@@ -433,6 +433,7 @@ def test_install_heal_timer_without_systemctl_writes_units_and_calls_nothing(env
 
 def test_install_heal_timer_activates_daemon_reload_then_enable_timer(env, tmp_path, monkeypatch):
     calls = _record_systemctl(monkeypatch)
+    monkeypatch.setattr(la, "DEFAULT_UNIT_DIR", str(tmp_path))  # Standardverzeichnis: Timer per Basename aktivieren
 
     la.cmd_install_heal_timer(env.adapter, 60, str(tmp_path), activate=True, as_json=False)
 
@@ -442,7 +443,8 @@ def test_install_heal_timer_activates_daemon_reload_then_enable_timer(env, tmp_p
 def test_install_heal_timer_removes_only_our_legacy_path_unit_and_disables_it_first(env, tmp_path, monkeypatch):
     calls = _record_systemctl(monkeypatch)
     legacy = tmp_path / "llm-account-agy-heal.path"
-    legacy.write_text("[Path]\nPathChanged=%h/.gemini/antigravity-cli/antigravity-oauth-token\n")
+    # Echter Legacy-Inhalt: derselbe Text, den install-watcher früher erzeugt hat.
+    legacy.write_text(la.watcher_units(env.adapter)["llm-account-agy-heal.path"])
 
     out = json.loads(la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path), activate=True, as_json=True))
 
@@ -578,6 +580,53 @@ def test_inotify_warning_below_512_and_none_at_or_above(env, tmp_path, monkeypat
         assert (out["inotify_warning"] is not None) is expect_warning
         if expect_warning:
             assert "max_user_instances=128" in out["inotify_warning"]
+
+
+def test_foreign_path_unit_and_its_wants_links_are_left_untouched(env, tmp_path, monkeypatch):
+    calls = _record_systemctl(monkeypatch)
+    foreign = tmp_path / "llm-account-agy-heal.path"
+    foreign.write_text(
+        "[Unit]\nDescription=fremd\n[Path]\nPathChanged=%h/Documents/inbox\n[Install]\nWantedBy=default.target\n"
+    )
+    wants = tmp_path / "default.target.wants"
+    wants.mkdir()
+    (wants / "llm-account-agy-heal.path").symlink_to("../llm-account-agy-heal.path")
+
+    out = json.loads(la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path), activate=True, as_json=True))
+
+    assert "PathChanged=%h/Documents/inbox" in foreign.read_text()
+    assert (wants / "llm-account-agy-heal.path").is_symlink()
+    assert out["legacy_path_unit_removed"] is False
+    assert out["removed_legacy_wants"] == []
+    assert not any("llm-account-agy-heal.path" in " ".join(args) for args, _ in calls)
+
+
+def test_custom_unit_dir_links_absolute_service_and_enables_absolute_timer(env, tmp_path, monkeypatch):
+    calls = _record_systemctl(monkeypatch)
+
+    out = json.loads(la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path), activate=True, as_json=True))
+
+    service = (tmp_path / "llm-account-agy-heal.service").resolve()
+    timer = (tmp_path / "llm-account-agy-heal.timer").resolve()
+    assert calls == [
+        (("daemon-reload",), True),
+        (("link", str(service)), True),
+        (("enable", "--now", str(timer)), True),
+    ]
+    assert out["activation_command"] == f"systemctl --user link {service} && systemctl --user enable --now {timer}"
+
+
+def test_custom_unit_dir_recovery_hint_names_both_absolute_commands(env, tmp_path, monkeypatch):
+    def failing(args, *, check=True):
+        raise la.CliError("systemctl --user daemon-reload fehlgeschlagen (Exit 1): Failed to connect to bus", 3)
+
+    monkeypatch.setattr(la, "_systemctl_user", failing)
+    service = (tmp_path / "llm-account-agy-heal.service").resolve()
+    timer = (tmp_path / "llm-account-agy-heal.timer").resolve()
+
+    text = la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path), activate=True, as_json=False)
+
+    assert f"systemctl --user link {service} && systemctl --user enable --now {timer}" in text
 
 
 def test_pure_token_clobber_keeps_origin_scope_and_restores_active_scope(env):

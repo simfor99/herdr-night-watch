@@ -1970,6 +1970,11 @@ def _systemctl_user(args: list[str], *, check: bool = True) -> None:
         raise CliError(f"systemctl --user {' '.join(args)} fehlgeschlagen (Exit {proc.returncode}): {detail}", 3)
 
 
+def _is_own_legacy_path_unit(text: str) -> bool:
+    """Eigene Legacy-Unit nur mit llm-account-Marker und Path-Trigger; fremde Units bleiben unberührt."""
+    return "llm-account" in text and ("PathChanged=" in text or "PathModified=" in text)
+
+
 def _remove_legacy_wants_links(target: Path, legacy_name: str) -> list[str]:
     """Entfernt alte .wants-Verweise auf die .path-Unit, unabhängig von systemctl.
 
@@ -2019,23 +2024,42 @@ def cmd_install_heal_timer(
         atomic_write(target / name, content.encode("utf-8"), mode=0o644)
 
     timer_name = f"llm-account-{adapter.name}-heal.timer"
+    service_name = f"llm-account-{adapter.name}-heal.service"
     legacy_name = f"llm-account-{adapter.name}-heal.path"
     legacy = target / legacy_name
     legacy_removed = False
-    if legacy.is_file() and "PathChanged=" in legacy.read_text(encoding="utf-8", errors="replace"):
-        if activate:
-            _systemctl_user(["disable", "--now", legacy_name], check=False)
-        legacy.unlink()
-        legacy_removed = True
-    removed_wants = _remove_legacy_wants_links(target, legacy_name)
+    legacy_foreign = False
+    if legacy.exists():
+        owned = legacy.is_file() and _is_own_legacy_path_unit(legacy.read_text(encoding="utf-8", errors="replace"))
+        if owned:
+            if activate:
+                _systemctl_user(["disable", "--now", legacy_name], check=False)
+            legacy.unlink()
+            legacy_removed = True
+        else:
+            legacy_foreign = True
+    # Fremde Unit samt ihrer Wants-Links unberührt lassen.
+    removed_wants = [] if legacy_foreign else _remove_legacy_wants_links(target, legacy_name)
     timer_link = _ensure_timer_wants_link(target, timer_name)
+
+    custom_dir = target.resolve() != Path(DEFAULT_UNIT_DIR).expanduser().resolve()
+    service_abs = (target / service_name).resolve()
+    timer_abs = (target / timer_name).resolve()
+    if custom_dir:
+        activation_command = f"systemctl --user link {service_abs} && systemctl --user enable --now {timer_abs}"
+    else:
+        activation_command = f"systemctl --user enable --now {timer_name}"
 
     activated = False
     systemctl_error: str | None = None
     if activate:
         try:
             _systemctl_user(["daemon-reload"])
-            _systemctl_user(["enable", "--now", timer_name])
+            if custom_dir:
+                _systemctl_user(["link", str(service_abs)])
+                _systemctl_user(["enable", "--now", str(timer_abs)])
+            else:
+                _systemctl_user(["enable", "--now", timer_name])
             activated = True
         except CliError as exc:
             systemctl_error = str(exc)
@@ -2057,6 +2081,7 @@ def cmd_install_heal_timer(
         "timer_wants_link": timer_link,
         "activated": activated,
         "systemctl_error": systemctl_error,
+        "activation_command": activation_command,
         "inotify_max_user_instances": limit,
         "inotify_warning": warning,
     }
@@ -2067,9 +2092,9 @@ def cmd_install_heal_timer(
         lines.append("Timer aktiviert.")
     elif activate:
         lines.append(f"Live-Aktivierung NICHT erfolgt: {systemctl_error}")
-        lines.append(f"Nachholen mit: systemctl --user enable --now {timer_name}")
+        lines.append(f"Nachholen mit: {activation_command}")
     else:
-        lines.append(f"Nicht aktiviert; aktivieren mit: systemctl --user enable --now {timer_name}")
+        lines.append(f"Nicht aktiviert; aktivieren mit: {activation_command}")
     if warning:
         lines.append(f"Warnung: {warning}")
     return "\n".join(lines)
