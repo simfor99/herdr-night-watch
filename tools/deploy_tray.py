@@ -21,6 +21,7 @@ def ps(command: str) -> subprocess.CompletedProcess[str]:
         text=True,
         capture_output=True,
         stdin=subprocess.DEVNULL,
+        timeout=30,
     )
 
 

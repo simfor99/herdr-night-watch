@@ -147,6 +147,8 @@ def processes() -> list[dict]:
             "Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'Nacht|herdr-night' } | Select-Object ProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress",
         ],
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=15,
     ).strip()
     if not raw:
         return []

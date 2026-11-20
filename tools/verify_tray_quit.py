@@ -15,7 +15,9 @@ DUMP = ROOT / "tools" / "dump_live_windows.py"
 
 
 def dump() -> dict:
-    return json.loads(subprocess.check_output(["python.exe", str(DUMP)], text=True))
+    return json.loads(
+        subprocess.check_output(["python.exe", str(DUMP)], text=True, stdin=subprocess.DEVNULL, timeout=15)
+    )
 
 
 def live_windows(payload: dict) -> list[dict]:
@@ -42,23 +44,41 @@ def main() -> int:
     if opened.returncode != 0:
         print(opened.stdout or opened.stderr)
         return opened.returncode
-    before = dump()
+    try:
+        before = dump()
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        print(json.dumps({"ok": False, "reason": "dump_failed", "stage": "before_stop", "detail": str(exc)},
+                         ensure_ascii=False))
+        return 2
     trays = tray_pids(before)
     lives = live_windows(before)
     if not trays or not lives:
         print(json.dumps({"ok": False, "reason": "missing_tray_or_live", "before": before}, ensure_ascii=False))
         return 2
-    stop = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-Command",
-            "Stop-Process -Id " + ",".join(str(pid) for pid in trays) + " -Force",
-        ],
-        check=False,
-        text=True,
-        capture_output=True,
-    )
+    try:
+        stop = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Stop-Process -Id " + ",".join(str(pid) for pid in trays) + " -Force",
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        # Ein Teil der Trays kann bereits beendet sein. Kein erneuter Stop-Befehl an dieselben PIDs: nur den
+        # Zustand lesen und als strukturiertes Ergebnis melden.
+        try:
+            remaining: list[int] | None = tray_pids(dump())
+        except (subprocess.SubprocessError, OSError, ValueError):
+            remaining = None
+        print(json.dumps({"ok": False, "reason": "stop_timeout", "stop_pids": trays,
+                          "remaining_tray_pids": remaining}, ensure_ascii=False))
+        return 3
     if stop.returncode != 0:
         print(json.dumps({"ok": False, "reason": "stop_failed", "stderr": stop.stderr}))
         return 3
@@ -66,7 +86,14 @@ def main() -> int:
     after = before
     while time.time() < deadline:
         time.sleep(0.25)
-        after = dump()
+        try:
+            after = dump()
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            # Der Stop ist bereits gelaufen. Nicht wiederholen; den Zustand als unbekannt melden.
+            print(json.dumps({"ok": False, "reason": "dump_failed", "stage": "after_stop",
+                              "stop_pids": trays, "remaining_state": "unknown", "detail": str(exc)},
+                             ensure_ascii=False))
+            return 3
         if not live_windows(after) and not after.get("processes"):
             print(
                 json.dumps(

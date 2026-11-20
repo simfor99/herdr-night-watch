@@ -1,5 +1,7 @@
 //! One bounded, persistent status-only child per UI process.
+use crate::language::Language;
 use anyhow::{Result, anyhow, bail};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -244,6 +246,246 @@ impl Channel {
 impl Drop for Channel {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// One attention-filtered agent row (`attention_items` of `live_agent_summary()`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct AttentionItem {
+    #[serde(default)]
+    pub workspace: String,
+    #[serde(default)]
+    pub tab: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+/// Attention fields of the watcher payload. Every field is optional on the wire:
+/// an older watcher omits them, and `attention_total` stays `None`, so the fourth
+/// KPI tile keeps its raw finished view.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct AttentionPayload {
+    #[serde(default)]
+    pub attention_available: bool,
+    #[serde(default)]
+    pub attention_done: Option<usize>,
+    #[serde(default)]
+    pub attention_blocked: Option<usize>,
+    #[serde(default)]
+    pub attention_total: Option<usize>,
+    #[serde(default)]
+    pub suppressed_done: Option<usize>,
+    #[serde(default)]
+    pub suppressed_blocked: Option<usize>,
+    #[serde(default)]
+    pub suppressed_unknown: Option<usize>,
+    #[serde(default)]
+    pub attention_items: Vec<AttentionItem>,
+}
+
+/// What the fourth KPI tile shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FourthTile {
+    /// Only agents that need attention; `done` is the attention-filtered finished count.
+    Attention {
+        total: usize,
+        done: usize,
+        blocked: usize,
+        suppressed_blocked: usize,
+    },
+    /// Raw view of an older watcher or a failed snapshot: all finished agents.
+    Finished { done: usize },
+}
+
+/// Picks the fourth tile. The attention view needs `attention_available` and an
+/// attention total; anything else falls back to the raw `done` count and never
+/// shows a fake "Für dich 0".
+pub fn fourth_tile(attention: &AttentionPayload, raw_done: usize) -> FourthTile {
+    match (attention.attention_available, attention.attention_total) {
+        (true, Some(total)) => FourthTile::Attention {
+            total,
+            done: attention.attention_done.unwrap_or(0),
+            blocked: attention.attention_blocked.unwrap_or(0),
+            suppressed_blocked: attention.suppressed_blocked.unwrap_or(0),
+        },
+        _ => FourthTile::Finished { done: raw_done },
+    }
+}
+
+/// Whole-fleet counts that the attention tooltip reconciles against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FleetCounts {
+    pub total: usize,
+    pub working: usize,
+    pub idle: usize,
+    pub blocked: usize,
+    pub unknown: usize,
+}
+
+/// Maximum number of attention rows listed in the tooltip.
+pub const ATTENTION_TOOLTIP_ITEM_LIMIT: usize = 8;
+
+/// Hover text of the KPI panel: the full arithmetic of the fleet, a warning line
+/// for suppressed blocked helpers, and up to eight concrete attention rows.
+pub fn attention_tooltip_lines(
+    fleet: FleetCounts,
+    attention: &AttentionPayload,
+    language: Language,
+) -> Vec<String> {
+    let attention_total = attention.attention_total.unwrap_or(0);
+    let suppressed_done = attention.suppressed_done.unwrap_or(0);
+    let suppressed_blocked = attention.suppressed_blocked.unwrap_or(0);
+
+    let mut summary = format!(
+        "{} {}: {} {}, {} {}, {} {}, {} {}",
+        fleet.total,
+        language.text("erkannt", "detected"),
+        fleet.working,
+        language.text("arbeiten", "working"),
+        fleet.idle,
+        language.text("bereit", "ready"),
+        attention_total,
+        language.text("für dich", "for you"),
+        suppressed_done,
+        language.text("Zuarbeiter fertig", "helpers finished"),
+    );
+    // `fleet.blocked` enthält auch Agenten, die schon in „für dich“ (attention_blocked) oder in der ⚠-Zeile
+    // (suppressed_blocked) stehen. Nur der Rest ist wirklich unklar; sonst erscheint ein Agent zweimal.
+    let already_listed_blocked = attention.attention_blocked.unwrap_or(0) + suppressed_blocked;
+    let unclear = fleet.blocked.saturating_sub(already_listed_blocked) + fleet.unknown;
+    if unclear > 0 {
+        summary.push_str(&format!(
+            ", +{unclear} {}",
+            language.text("blockiert/unklar", "blocked/unclear")
+        ));
+    }
+
+    let mut lines = vec![summary];
+    if suppressed_blocked > 0 {
+        lines.push(format!(
+            "⚠ {suppressed_blocked} {}",
+            language.text("Zuarbeiter blockiert", "helpers blocked")
+        ));
+    }
+    for item in attention.attention_items.iter().take(ATTENTION_TOOLTIP_ITEM_LIMIT) {
+        let status = match item.status.as_str() {
+            "done" => language.text("fertig", "finished").to_string(),
+            "blocked" => language.text("blockiert", "blocked").to_string(),
+            other => other.to_string(),
+        };
+        lines.push(format!("{} › {} · {}", item.workspace, item.tab, status));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+
+    const OLD_PAYLOAD: &str =
+        r#"{"available":true,"total":35,"working":12,"idle":6,"done":17,"blocked":0,"unknown":0}"#;
+
+    const NEW_PAYLOAD: &str = r#"{
+        "available": true, "total": 35, "working": 12, "idle": 6, "done": 17,
+        "blocked": 0, "unknown": 0,
+        "attention_available": true, "attention_done": 1, "attention_blocked": 0,
+        "attention_total": 1, "suppressed_done": 16, "suppressed_blocked": 1,
+        "suppressed_unknown": 0,
+        "attention_items": [
+            { "workspace": "🏛️ workspace-a · mother-v1", "tab": "mother-v1", "status": "done" }
+        ]
+    }"#;
+
+    #[test]
+    fn old_watcher_payload_falls_back_to_the_raw_finished_tile() {
+        let attention: AttentionPayload = serde_json::from_str(OLD_PAYLOAD).expect("old payload");
+        assert!(!attention.attention_available);
+        assert_eq!(attention.attention_total, None);
+        assert_eq!(fourth_tile(&attention, 17), FourthTile::Finished { done: 17 });
+    }
+
+    #[test]
+    fn unavailable_or_incomplete_attention_never_shows_for_you_zero() {
+        let mut guard_missing_total: AttentionPayload =
+            serde_json::from_str(NEW_PAYLOAD).expect("new payload");
+        guard_missing_total.attention_total = None;
+        assert_eq!(fourth_tile(&guard_missing_total, 17), FourthTile::Finished { done: 17 });
+
+        let mut snapshot_failed: AttentionPayload =
+            serde_json::from_str(NEW_PAYLOAD).expect("new payload");
+        snapshot_failed.attention_available = false;
+        assert_eq!(fourth_tile(&snapshot_failed, 17), FourthTile::Finished { done: 17 });
+    }
+
+    #[test]
+    fn attention_payload_shows_the_filtered_count_with_the_blocked_marker() {
+        let attention: AttentionPayload = serde_json::from_str(NEW_PAYLOAD).expect("new payload");
+        assert_eq!(
+            fourth_tile(&attention, 17),
+            FourthTile::Attention { total: 1, done: 1, blocked: 0, suppressed_blocked: 1 }
+        );
+    }
+
+    #[test]
+    fn zero_attention_is_a_calm_zero_not_a_fallback() {
+        let mut attention: AttentionPayload = serde_json::from_str(NEW_PAYLOAD).expect("new payload");
+        attention.attention_total = Some(0);
+        attention.attention_done = Some(0);
+        attention.attention_items.clear();
+        assert_eq!(
+            fourth_tile(&attention, 17),
+            FourthTile::Attention { total: 0, done: 0, blocked: 0, suppressed_blocked: 1 }
+        );
+    }
+
+    #[test]
+    fn german_tooltip_spells_out_the_arithmetic_and_the_items() {
+        let attention: AttentionPayload = serde_json::from_str(NEW_PAYLOAD).expect("new payload");
+        let fleet = FleetCounts { total: 35, working: 12, idle: 6, blocked: 0, unknown: 0 };
+        let lines = attention_tooltip_lines(fleet, &attention, Language::German);
+        assert_eq!(
+            lines,
+            vec![
+                "35 erkannt: 12 arbeiten, 6 bereit, 1 für dich, 16 Zuarbeiter fertig".to_string(),
+                "⚠ 1 Zuarbeiter blockiert".to_string(),
+                "🏛️ workspace-a · mother-v1 › mother-v1 · fertig".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn english_tooltip_adds_unclear_agents_and_limits_the_items() {
+        let mut attention: AttentionPayload = serde_json::from_str(NEW_PAYLOAD).expect("new payload");
+        attention.suppressed_blocked = Some(0);
+        attention.attention_items = (0..10)
+            .map(|index| AttentionItem {
+                workspace: format!("ws{index}"),
+                tab: "architekt".into(),
+                status: "blocked".into(),
+            })
+            .collect();
+        let fleet = FleetCounts { total: 35, working: 12, idle: 6, blocked: 2, unknown: 1 };
+        let lines = attention_tooltip_lines(fleet, &attention, Language::English);
+        assert_eq!(
+            lines[0],
+            "35 detected: 12 working, 6 ready, 1 for you, 16 helpers finished, +3 blocked/unclear"
+        );
+        assert_eq!(lines.len(), 1 + ATTENTION_TOOLTIP_ITEM_LIMIT);
+        assert_eq!(lines[1], "ws0 › architekt · blocked");
+    }
+
+    #[test]
+    fn blocked_attention_agents_are_not_counted_again_as_unclear() {
+        let mut attention: AttentionPayload = serde_json::from_str(NEW_PAYLOAD).expect("new payload");
+        attention.attention_blocked = Some(1);
+        attention.suppressed_blocked = Some(0);
+        // Zwei blockierte Agenten insgesamt, davon einer bereits als „für dich“ gezählt.
+        let fleet = FleetCounts { total: 35, working: 12, idle: 6, blocked: 2, unknown: 0 };
+        let lines = attention_tooltip_lines(fleet, &attention, Language::English);
+        assert_eq!(
+            lines[0],
+            "35 detected: 12 working, 6 ready, 1 for you, 16 helpers finished, +1 blocked/unclear"
+        );
     }
 }
 

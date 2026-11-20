@@ -15,6 +15,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -775,8 +776,150 @@ def list_agents() -> list[dict[str, Any]]:
     return agents
 
 
-def live_agent_summary() -> dict[str, Any]:
-    """Return a display-only Herdr summary without affecting safety decisions."""
+ATTENTION_ITEM_LIMIT = 8
+TREE_PREFIXES = ("├─", "╰─", "│", "└")
+ATTENTION_CHIEF_TAB_RE = re.compile(
+    r"^(?:architekt(?:-\d+)?|senior-architekt|eskalations-architekt|mother-v\d+|c1(?:[^a-z0-9].*)?)$"
+)
+ATTENTION_WORKER_TAB_RE = re.compile(
+    r"^(?:bauer(?:-\d+)?|zweitmeinung|kontrolleur|endabnahme|worker(?:-\d+)?|c[2-8](?:[^a-z0-9].*)?)$"
+)
+
+
+def normalize_label(raw: str) -> str:
+    """Führende Nicht-Buchstaben/Ziffern (Emojis, Variation Selectors, ZWJ, NBSP, Satzzeichen) entfernen."""
+    text = raw or ""
+    index = 0
+    while index < len(text) and not text[index].isalnum():
+        index += 1
+    return text[index:].strip().casefold()
+
+
+def classify_attention(agent: dict[str, Any], workspace_label: str, tab_label: str, known: bool) -> str:
+    """'A' = Aufmerksamkeit (Chef oder unbekannt), 'B' = Zuarbeiter. Unbekannt bleibt immer A (fail-open)."""
+    if not known:
+        return "A"
+    tree = workspace_label.lstrip().startswith(TREE_PREFIXES)
+    tab_key = normalize_label(tab_label)
+    if not tree and ATTENTION_CHIEF_TAB_RE.fullmatch(tab_key):
+        return "A"
+    tokens = agent.get("tokens") or {}
+    if isinstance(tokens, dict) and (tokens.get("subordinate_worker") == "1" or tokens.get("supervisor_pane_id")):
+        return "B"
+    if tree or ATTENTION_WORKER_TAB_RE.fullmatch(tab_key):
+        return "B"
+    return "A"
+
+
+def snapshot_inputs() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Ein einziger `herdr api snapshot`-Aufruf. Jeder Formfehler wirft RuntimeError (Fallback folgt)."""
+    payload = run_json(herdr_command("api", "snapshot"))
+    result = payload.get("result") if isinstance(payload, dict) else None
+    snapshot = result.get("snapshot") if isinstance(result, dict) else None
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("Herdr api snapshot has no snapshot object.")
+    parts = []
+    for key in ("agents", "tabs", "workspaces"):
+        value = snapshot.get(key)
+        if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+            raise RuntimeError(f"Herdr api snapshot field {key} is missing or malformed.")
+        parts.append(value)
+    _validate_snapshot_field_types(parts[0], parts[1], parts[2])
+    return parts[0], parts[1], parts[2]
+
+
+def _validate_snapshot_field_types(
+    agents: list[dict[str, Any]], tabs: list[dict[str, Any]], workspaces: list[dict[str, Any]]
+) -> None:
+    """Prüft nur die Felder, die die Aufmerksamkeitsauswertung nutzt. Ein Formfehler wird zum Legacy-Fallback.
+
+    Ein String als completion_seq bestünde die Listenprüfung, würde aber beim Sortieren mit TypeError
+    außerhalb des Fallbacks abbrechen und die Statusausgabe verhindern.
+    """
+    for agent in agents:
+        seq = agent.get("completion_seq")
+        if seq is not None and (not isinstance(seq, int) or isinstance(seq, bool)):
+            raise RuntimeError("Herdr api snapshot agent completion_seq is malformed.")
+        status = agent.get("agent_status")
+        if status is not None and not isinstance(status, str):
+            raise RuntimeError("Herdr api snapshot agent_status is malformed.")
+        _require_text_or_none(agent, ("tab_id", "workspace_id"))
+    for tab in tabs:
+        _require_text_or_none(tab, ("tab_id", "workspace_id", "label"))
+    for workspace in workspaces:
+        _require_text_or_none(workspace, ("workspace_id", "label"))
+
+
+def _require_text_or_none(entry: dict[str, Any], keys: tuple[str, ...]) -> None:
+    """IDs dienen als Dictionary-Schlüssel: nur Text oder fehlend. Listen sind unhashbar und würden außerhalb des Fallbacks brechen."""
+    for key in keys:
+        value = entry.get(key)
+        if value is not None and not isinstance(value, str):
+            raise RuntimeError(f"Herdr api snapshot field {key} is malformed.")
+
+
+def build_attention_summary(
+    agents: list[dict[str, Any]], tabs: list[dict[str, Any]], workspaces: list[dict[str, Any]]
+) -> dict[str, Any]:
+    tab_label_by_id = {tab.get("tab_id"): tab.get("label") or "" for tab in tabs if tab.get("tab_id")}
+    workspace_label_by_id = {ws.get("workspace_id"): ws.get("label") or "" for ws in workspaces if ws.get("workspace_id")}
+    statuses = [agent.get("agent_status") for agent in agents]
+    summary: dict[str, Any] = {
+        "available": True,
+        "total": len(agents),
+        "working": sum(status == "working" for status in statuses),
+        "idle": sum(status == "idle" for status in statuses),
+        "done": sum(status == "done" for status in statuses),
+        "blocked": sum(status == "blocked" for status in statuses),
+        "unknown": sum(status == "unknown" for status in statuses),
+        "attention_available": True,
+    }
+    attention_done = attention_blocked = suppressed_done = suppressed_blocked = suppressed_unknown = 0
+    attention_items: list[dict[str, Any]] = []
+    for agent in agents:
+        status = agent.get("agent_status")
+        workspace_id = agent.get("workspace_id")
+        tab_id = agent.get("tab_id")
+        known = workspace_id in workspace_label_by_id and tab_id in tab_label_by_id
+        workspace_label = workspace_label_by_id.get(workspace_id, "")
+        tab_label = tab_label_by_id.get(tab_id, "")
+        if classify_attention(agent, workspace_label, tab_label, known) == "A":
+            if status == "done":
+                attention_done += 1
+            elif status == "blocked":
+                attention_blocked += 1
+            if status in ("blocked", "done"):
+                attention_items.append({
+                    "workspace": workspace_label,
+                    "tab": tab_label,
+                    "status": status,
+                    "_seq": agent.get("completion_seq") or 0,
+                })
+        else:
+            if status == "done":
+                suppressed_done += 1
+            elif status == "blocked":
+                suppressed_blocked += 1
+            elif status == "unknown":
+                suppressed_unknown += 1
+    attention_items.sort(key=lambda item: (item["status"] != "blocked", -item["_seq"]))
+    summary.update({
+        "attention_done": attention_done,
+        "attention_blocked": attention_blocked,
+        "attention_total": attention_done + attention_blocked,
+        "suppressed_done": suppressed_done,
+        "suppressed_blocked": suppressed_blocked,
+        "suppressed_unknown": suppressed_unknown,
+        "attention_items": [
+            {"workspace": item["workspace"], "tab": item["tab"], "status": item["status"]}
+            for item in attention_items[:ATTENTION_ITEM_LIMIT]
+        ],
+    })
+    return summary
+
+
+def legacy_agent_summary() -> dict[str, Any]:
+    """Bisheriger Pfad über `agent list`; dient nur als Fallback ohne Aufmerksamkeitsdaten."""
     try:
         agents = list_agents()
     except RuntimeError as error:
@@ -791,6 +934,21 @@ def live_agent_summary() -> dict[str, Any]:
         "blocked": sum(status == "blocked" for status in statuses),
         "unknown": sum(status == "unknown" for status in statuses),
     }
+
+
+def live_agent_summary() -> dict[str, Any]:
+    """Return a display-only Herdr summary without affecting safety decisions.
+
+    Ein atomarer Snapshot liefert Zähler und Aufmerksamkeit. Jeder Fehler oder unvollständige Shape fällt
+    auf den bisherigen `agent list`-Pfad zurück, ohne Aufmerksamkeitsdaten (attention_available false).
+    """
+    try:
+        agents, tabs, workspaces = snapshot_inputs()
+    except RuntimeError:
+        summary = legacy_agent_summary()
+        summary["attention_available"] = False
+        return summary
+    return build_attention_summary(agents, tabs, workspaces)
 
 
 def internet_available() -> bool:
