@@ -848,6 +848,9 @@ def _validate_snapshot_field_types(
         _require_text_or_none(tab, ("tab_id", "workspace_id", "label"))
     for workspace in workspaces:
         _require_text_or_none(workspace, ("workspace_id", "label"))
+        status = workspace.get("agent_status")
+        if status is not None and not isinstance(status, str):
+            raise RuntimeError("Herdr api snapshot workspace agent_status is malformed.")
 
 
 def _require_text_or_none(entry: dict[str, Any], keys: tuple[str, ...]) -> None:
@@ -874,8 +877,13 @@ def build_attention_summary(
         "unknown": sum(status == "unknown" for status in statuses),
         "attention_available": True,
     }
+    # Herdr zeigt in der Spaces-Seitenleiste nur dann einen blauen Punkt, wenn der Workspace selbst "done" ist.
+    # Arbeitet irgendein Tab im Workspace, zeigt er einen orangenen Punkt. "Für dich" spiegelt deshalb die
+    # blauen Punkte 1:1: pro Workspace höchstens ein fertiger Tab, und nur wenn der Workspace blau ist.
+    workspace_status_by_id = {ws.get("workspace_id"): ws.get("agent_status") for ws in workspaces if ws.get("workspace_id")}
     attention_done = attention_blocked = suppressed_done = suppressed_blocked = suppressed_unknown = 0
     attention_items: list[dict[str, Any]] = []
+    blue_done_by_workspace: dict[Any, list[dict[str, Any]]] = {}
     for agent in agents:
         status = agent.get("agent_status")
         workspace_id = agent.get("workspace_id")
@@ -884,17 +892,24 @@ def build_attention_summary(
         workspace_label = workspace_label_by_id.get(workspace_id, "")
         tab_label = tab_label_by_id.get(tab_id, "")
         if classify_attention(agent, workspace_label, tab_label, known) == "A":
+            item = {
+                "workspace": workspace_label,
+                "tab": tab_label,
+                "status": status,
+                "_seq": agent.get("completion_seq") or 0,
+            }
             if status == "done":
-                attention_done += 1
+                workspace_status = workspace_status_by_id.get(workspace_id) if known else None
+                if workspace_status is None:
+                    attention_done += 1  # unbekannter Workspace-Status: Fail-open wie bisher
+                    attention_items.append(item)
+                elif workspace_status == "done":
+                    blue_done_by_workspace.setdefault(workspace_id, []).append(item)
+                else:
+                    suppressed_done += 1  # orangener Punkt: kein blauer Punkt in Herdr
             elif status == "blocked":
                 attention_blocked += 1
-            if status in ("blocked", "done"):
-                attention_items.append({
-                    "workspace": workspace_label,
-                    "tab": tab_label,
-                    "status": status,
-                    "_seq": agent.get("completion_seq") or 0,
-                })
+                attention_items.append(item)
         else:
             if status == "done":
                 suppressed_done += 1
@@ -902,6 +917,12 @@ def build_attention_summary(
                 suppressed_blocked += 1
             elif status == "unknown":
                 suppressed_unknown += 1
+    for candidates in blue_done_by_workspace.values():
+        candidates.sort(key=lambda item: -item["_seq"])
+        newest, *others = candidates
+        attention_done += 1  # genau ein blauer Workspace-Punkt
+        attention_items.append(newest)
+        suppressed_done += len(others)
     attention_items.sort(key=lambda item: (item["status"] != "blocked", -item["_seq"]))
     summary.update({
         "attention_done": attention_done,

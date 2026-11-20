@@ -1768,6 +1768,52 @@ class AttentionSummaryTests(unittest.TestCase):
         self.assertFalse(summary["attention_available"])
         self.assertEqual(summary["done"], 1)
 
+    def _ws_with_status(self, status_by_id):
+        return [dict(ws, agent_status=status_by_id.get(ws["workspace_id"])) if ws["workspace_id"] in status_by_id
+                else dict(ws) for ws in WORKSPACES]
+
+    def test_done_tab_in_a_working_workspace_is_not_counted_for_you(self):
+        """Orangener Workspace-Punkt in Herdr (arbeitender Tab): der fertige Chef-Tab zählt nicht als blau."""
+        agents = [{"pane_id": "a1", "tab_id": "tA", "workspace_id": "wR", "agent_status": "done", "completion_seq": 5}]
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload(agents, workspaces=self._ws_with_status({"wR": "working"}))):
+            summary = WATCHER.live_agent_summary()
+
+        self.assertEqual(summary["done"], 1)  # roher Zähler bleibt unverändert
+        self.assertEqual(summary["attention_done"], 0)
+        self.assertEqual(summary["suppressed_done"], 1)
+        self.assertEqual(summary["attention_items"], [])
+
+    def test_blue_workspace_counts_once_with_its_newest_done_tab(self):
+        """Blauer Workspace-Punkt in Herdr: genau 1 in "Für dich", der neueste fertige Tab ist der Eintrag."""
+        agents = [
+            {"pane_id": "a1", "tab_id": "tA", "workspace_id": "wR", "agent_status": "done", "completion_seq": 5},
+            {"pane_id": "a2", "tab_id": "tArch2", "workspace_id": "wR", "agent_status": "done", "completion_seq": 9},
+        ]
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload(agents, workspaces=self._ws_with_status({"wR": "done"}))):
+            summary = WATCHER.live_agent_summary()
+
+        self.assertEqual(summary["attention_done"], 1)
+        self.assertEqual(summary["suppressed_done"], 1)
+        self.assertEqual(len(summary["attention_items"]), 1)
+        self.assertEqual(summary["attention_items"][0]["tab"], "architekt-2")
+
+    def test_blocked_chef_tab_is_counted_even_in_a_working_workspace(self):
+        agents = [{"pane_id": "a1", "tab_id": "tA", "workspace_id": "wR", "agent_status": "blocked", "completion_seq": 3}]
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload(agents, workspaces=self._ws_with_status({"wR": "working"}))):
+            summary = WATCHER.live_agent_summary()
+
+        self.assertEqual(summary["attention_blocked"], 1)
+        self.assertEqual(summary["attention_items"][0]["status"], "blocked")
+
+    def test_invalid_workspace_agent_status_falls_back(self):
+        legacy = [{"pane_id": "p1", "agent_status": "done"}]
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload([], workspaces=self._ws_with_status({"wR": 123}))), \
+                patch.object(WATCHER, "list_agents", return_value=legacy):
+            summary = WATCHER.live_agent_summary()
+
+        self.assertFalse(summary["attention_available"])
+        self.assertNotIn("attention_done", summary)
+
     def test_malformed_completion_seq_falls_back_instead_of_crashing_the_summary(self):
         bad = [{"pane_id": "b1", "tab_id": "tA", "workspace_id": "wR", "agent_status": "done", "completion_seq": "12"}]
         legacy = [{"pane_id": "p1", "agent_status": "done"}]
