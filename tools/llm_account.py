@@ -1915,6 +1915,167 @@ def cmd_install_watcher(adapter: AgyAdapter, dry_run: bool, unit_dir: str | None
 
 
 # ---------------------------------------------------------------------------
+# install-heal-timer: inotify-freier Heal-Takt per systemd-user-Timer
+# ---------------------------------------------------------------------------
+
+HEAL_TIMER_MIN_INTERVAL = 5
+HEAL_TIMER_MAX_INTERVAL = 3600
+INOTIFY_INSTANCES_PATH = Path("/proc/sys/fs/inotify/max_user_instances")
+
+
+def heal_timer_units(adapter: AgyAdapter, interval: int) -> dict[str, str]:
+    base = f"llm-account-{adapter.name}-heal"
+    timer_unit = (
+        "[Unit]\n"
+        f"Description=llm-account: Heal-Takt für {adapter.name} (ohne inotify)\n\n"
+        "[Timer]\n"
+        "OnBootSec=10s\n"
+        "OnActiveSec=10s\n"
+        f"OnUnitActiveSec={interval}s\n"
+        "AccuracySec=5s\n"
+        f"Unit={base}.service\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    service_unit = (
+        "[Unit]\n"
+        f"Description=llm-account: Heal für {adapter.name}\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart=%h/.local/bin/llm-account heal {adapter.name}\n"
+    )
+    return {f"{base}.timer": timer_unit, f"{base}.service": service_unit}
+
+
+def inotify_instance_limit(path: Path = INOTIFY_INSTANCES_PATH) -> int | None:
+    """Preflight-Befund für das Protokoll; der Timer selbst braucht kein inotify."""
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _systemctl_user(args: list[str], *, check: bool = True) -> None:
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", *args],
+            capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if check:
+            raise CliError(f"systemctl --user {' '.join(args)} nicht ausführbar: {exc}", 3)
+        return
+    if check and proc.returncode != 0:
+        detail = proc.stderr.strip()[:300]
+        raise CliError(f"systemctl --user {' '.join(args)} fehlgeschlagen (Exit {proc.returncode}): {detail}", 3)
+
+
+def _remove_legacy_wants_links(target: Path, legacy_name: str) -> list[str]:
+    """Entfernt alte .wants-Verweise auf die .path-Unit, unabhängig von systemctl.
+
+    Fremde, lebende Symlinks mit anderem Ziel bleiben unangetastet.
+    """
+    removed: list[str] = []
+    for wants in ("default.target.wants", "timers.target.wants"):
+        entry = target / wants / legacy_name
+        if not (entry.is_symlink() or entry.exists()):
+            continue
+        if entry.is_symlink() and entry.exists() and os.path.basename(os.readlink(entry)) != legacy_name:
+            continue
+        entry.unlink()
+        removed.append(f"{wants}/{legacy_name}")
+    return removed
+
+
+def _ensure_timer_wants_link(target: Path, timer_name: str) -> str:
+    wants = target / "timers.target.wants"
+    wants.mkdir(parents=True, exist_ok=True)
+    link = wants / timer_name
+    rel = f"../{timer_name}"
+    if link.is_symlink() and os.readlink(link) == rel:
+        return "unveraendert"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    os.symlink(rel, link)
+    return "angelegt"
+
+
+def cmd_install_heal_timer(
+    adapter: AgyAdapter,
+    interval: int,
+    unit_dir: str | None,
+    activate: bool,
+    as_json: bool,
+) -> str:
+    if not HEAL_TIMER_MIN_INTERVAL <= interval <= HEAL_TIMER_MAX_INTERVAL:
+        raise CliError(
+            f"--interval muss zwischen {HEAL_TIMER_MIN_INTERVAL} und {HEAL_TIMER_MAX_INTERVAL} Sekunden liegen.", 2
+        )
+    target = Path(unit_dir or DEFAULT_UNIT_DIR).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    limit = inotify_instance_limit()
+    units = heal_timer_units(adapter, interval)
+    for name, content in units.items():
+        atomic_write(target / name, content.encode("utf-8"), mode=0o644)
+
+    timer_name = f"llm-account-{adapter.name}-heal.timer"
+    legacy_name = f"llm-account-{adapter.name}-heal.path"
+    legacy = target / legacy_name
+    legacy_removed = False
+    if legacy.is_file() and "PathChanged=" in legacy.read_text(encoding="utf-8", errors="replace"):
+        if activate:
+            _systemctl_user(["disable", "--now", legacy_name], check=False)
+        legacy.unlink()
+        legacy_removed = True
+    removed_wants = _remove_legacy_wants_links(target, legacy_name)
+    timer_link = _ensure_timer_wants_link(target, timer_name)
+
+    activated = False
+    systemctl_error: str | None = None
+    if activate:
+        try:
+            _systemctl_user(["daemon-reload"])
+            _systemctl_user(["enable", "--now", timer_name])
+            activated = True
+        except CliError as exc:
+            systemctl_error = str(exc)
+
+    warning = None
+    if limit is not None and limit < 512:
+        warning = (
+            f"fs.inotify.max_user_instances={limit} ist niedrig (< 512); Timer selbst braucht 0 "
+            "inotify-Instanzen, Host-sysctl sollte trotzdem auf >= 4096 erhöht werden."
+        )
+
+    result = {
+        "provider": adapter.name,
+        "timer": str(target / timer_name),
+        "interval_seconds": interval,
+        "unit_dir": str(target),
+        "legacy_path_unit_removed": legacy_removed,
+        "removed_legacy_wants": removed_wants,
+        "timer_wants_link": timer_link,
+        "activated": activated,
+        "systemctl_error": systemctl_error,
+        "inotify_max_user_instances": limit,
+        "inotify_warning": warning,
+    }
+    if as_json:
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    lines = [f"Timer geschrieben nach {target} ({interval} s)."]
+    if activate and systemctl_error is None:
+        lines.append("Timer aktiviert.")
+    elif activate:
+        lines.append(f"Live-Aktivierung NICHT erfolgt: {systemctl_error}")
+        lines.append(f"Nachholen mit: systemctl --user enable --now {timer_name}")
+    else:
+        lines.append(f"Nicht aktiviert; aktivieren mit: systemctl --user enable --now {timer_name}")
+    if warning:
+        lines.append(f"Warnung: {warning}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1959,6 +2120,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--unit-dir")
 
+    p = sub.add_parser("install-heal-timer", help="inotify-freien Heal-Timer schreiben und aktivieren")
+    p.add_argument("provider")
+    p.add_argument("--interval", type=int, default=30, help="Takt in Sekunden (5 bis 3600)")
+    p.add_argument("--systemd-dir", dest="systemd_dir", help="Zielverzeichnis der Units")
+    p.add_argument("--no-systemctl", action="store_true", help="nur Units schreiben, systemctl nicht aufrufen")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("bounce-stale", help="In-Place-Warm-Bounce einer Pane mit veraltetem agy-Prozess")
     p.add_argument("provider")
     p.add_argument("pane_id")
@@ -1997,6 +2165,11 @@ def run(args: argparse.Namespace) -> str:
         return cmd_stale_panes(adapter, args.json)
     if args.verb == "install-watcher":
         return cmd_install_watcher(adapter, args.dry_run, args.unit_dir)
+    if args.verb == "install-heal-timer":
+        return cmd_install_heal_timer(
+            adapter, args.interval, args.systemd_dir,
+            activate=not args.no_systemctl, as_json=args.json,
+        )
     if args.verb == "bounce-stale":
         return cmd_bounce_stale(adapter, args)
     raise CliError(f"Unbekanntes Verb {args.verb!r}.", 2)

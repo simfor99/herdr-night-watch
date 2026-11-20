@@ -400,6 +400,186 @@ def test_install_watcher_dry_run_writes_nothing_and_units_use_home_specifiers(en
     assert oct((unit_dir / "llm-account-agy-heal.path").stat().st_mode & 0o777) == "0o644"
 
 
+def _record_systemctl(monkeypatch):
+    calls = []
+    monkeypatch.setattr(la, "_systemctl_user", lambda args, *, check=True: calls.append((tuple(args), check)))
+    return calls
+
+
+def test_heal_timer_units_are_inotify_free_and_use_the_interval(env, tmp_path):
+    units = la.heal_timer_units(env.adapter, 30)
+
+    timer = units["llm-account-agy-heal.timer"]
+    assert "OnUnitActiveSec=30s" in timer
+    assert "Unit=llm-account-agy-heal.service" in timer
+    assert "WantedBy=timers.target" in timer
+    assert "PathChanged" not in timer
+    assert "ExecStart=%h/.local/bin/llm-account heal agy" in units["llm-account-agy-heal.service"]
+
+
+def test_install_heal_timer_without_systemctl_writes_units_and_calls_nothing(env, tmp_path, monkeypatch):
+    calls = _record_systemctl(monkeypatch)
+    unit_dir = tmp_path / "units"
+
+    out = json.loads(la.cmd_install_heal_timer(env.adapter, 30, str(unit_dir), activate=False, as_json=True))
+
+    assert calls == []
+    assert out["activated"] is False
+    assert out["interval_seconds"] == 30
+    assert "OnUnitActiveSec=30s" in (unit_dir / "llm-account-agy-heal.timer").read_text()
+    assert oct((unit_dir / "llm-account-agy-heal.timer").stat().st_mode & 0o777) == "0o644"
+    assert not (unit_dir / "llm-account-agy-heal.path").exists()
+
+
+def test_install_heal_timer_activates_daemon_reload_then_enable_timer(env, tmp_path, monkeypatch):
+    calls = _record_systemctl(monkeypatch)
+
+    la.cmd_install_heal_timer(env.adapter, 60, str(tmp_path), activate=True, as_json=False)
+
+    assert calls == [(("daemon-reload",), True), (("enable", "--now", "llm-account-agy-heal.timer"), True)]
+
+
+def test_install_heal_timer_removes_only_our_legacy_path_unit_and_disables_it_first(env, tmp_path, monkeypatch):
+    calls = _record_systemctl(monkeypatch)
+    legacy = tmp_path / "llm-account-agy-heal.path"
+    legacy.write_text("[Path]\nPathChanged=%h/.gemini/antigravity-cli/antigravity-oauth-token\n")
+
+    out = json.loads(la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path), activate=True, as_json=True))
+
+    assert not legacy.exists()
+    assert out["legacy_path_unit_removed"] is True
+    assert calls[0] == (("disable", "--now", "llm-account-agy-heal.path"), False)
+
+
+def test_install_heal_timer_keeps_a_path_file_that_is_not_our_unit(env, tmp_path, monkeypatch):
+    _record_systemctl(monkeypatch)
+    foreign = tmp_path / "llm-account-agy-heal.path"
+    foreign.write_text("[Unit]\nDescription=fremd\n")
+
+    out = json.loads(la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path), activate=False, as_json=True))
+
+    assert foreign.read_text() == "[Unit]\nDescription=fremd\n"
+    assert out["legacy_path_unit_removed"] is False
+
+
+def test_install_heal_timer_rejects_intervals_outside_the_range_and_writes_nothing(env, tmp_path, monkeypatch):
+    _record_systemctl(monkeypatch)
+    unit_dir = tmp_path / "units"
+
+    for bad in (0, 4, 3601):
+        with pytest.raises(la.CliError) as exc:
+            la.cmd_install_heal_timer(env.adapter, bad, str(unit_dir), activate=False, as_json=False)
+        assert exc.value.exit_code == 2
+    assert not unit_dir.exists()
+
+
+def test_systemctl_failure_is_reported_with_exit_3(monkeypatch):
+    def failing(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Failed to connect to bus")
+
+    monkeypatch.setattr(la.subprocess, "run", failing)
+
+    with pytest.raises(la.CliError) as exc:
+        la._systemctl_user(["daemon-reload"])
+    assert exc.value.exit_code == 3
+    assert "daemon-reload" in str(exc.value)
+
+
+def test_inotify_limit_is_read_or_reported_as_unknown(tmp_path):
+    limit = tmp_path / "max_user_instances"
+    limit.write_text("128\n")
+
+    assert la.inotify_instance_limit(limit) == 128
+    assert la.inotify_instance_limit(tmp_path / "fehlt") is None
+
+
+def _legacy_wants_fixture(unit_dir: Path, name: str = "llm-account-agy-heal.path") -> None:
+    for wants in ("default.target.wants", "timers.target.wants"):
+        (unit_dir / wants).mkdir(parents=True, exist_ok=True)
+        (unit_dir / wants / name).symlink_to(f"../{name}")  # Ziel existiert nicht mehr (tot)
+
+
+def test_install_heal_timer_cleans_legacy_wants_links_and_links_the_timer_without_systemctl(env, tmp_path, monkeypatch):
+    _record_systemctl(monkeypatch)
+    _legacy_wants_fixture(tmp_path)
+
+    out = json.loads(la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path), activate=False, as_json=True))
+
+    assert not (tmp_path / "default.target.wants" / "llm-account-agy-heal.path").is_symlink()
+    assert not (tmp_path / "timers.target.wants" / "llm-account-agy-heal.path").is_symlink()
+    link = tmp_path / "timers.target.wants" / "llm-account-agy-heal.timer"
+    assert link.is_symlink() and os.readlink(link) == "../llm-account-agy-heal.timer"
+    assert link.exists()
+    assert sorted(out["removed_legacy_wants"]) == [
+        "default.target.wants/llm-account-agy-heal.path",
+        "timers.target.wants/llm-account-agy-heal.path",
+    ]
+    assert out["timer_wants_link"] == "angelegt"
+
+
+def test_install_heal_timer_survives_failing_systemctl_with_valid_json_and_no_exception(env, tmp_path, monkeypatch):
+    _legacy_wants_fixture(tmp_path)
+
+    def dead_bus(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Failed to connect to bus: No such file or directory")
+
+    monkeypatch.setattr(la.subprocess, "run", dead_bus)
+
+    raw = la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path), activate=True, as_json=True)
+    out = json.loads(raw)
+
+    assert out["activated"] is False
+    assert "Failed to connect to bus" in out["systemctl_error"]
+    assert (tmp_path / "llm-account-agy-heal.timer").exists()
+    assert (tmp_path / "timers.target.wants" / "llm-account-agy-heal.timer").is_symlink()
+    assert not (tmp_path / "default.target.wants" / "llm-account-agy-heal.path").is_symlink()
+
+
+def test_orphaned_wants_link_is_removed_even_after_the_path_file_is_already_gone(env, tmp_path, monkeypatch):
+    _record_systemctl(monkeypatch)
+    _legacy_wants_fixture(tmp_path)
+    assert not (tmp_path / "llm-account-agy-heal.path").exists()
+
+    out = json.loads(la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path), activate=False, as_json=True))
+
+    assert out["legacy_path_unit_removed"] is False
+    assert len(out["removed_legacy_wants"]) == 2
+    assert not (tmp_path / "default.target.wants" / "llm-account-agy-heal.path").is_symlink()
+
+
+def test_foreign_live_wants_link_is_kept(env, tmp_path, monkeypatch):
+    _record_systemctl(monkeypatch)
+    wants = tmp_path / "default.target.wants"
+    wants.mkdir(parents=True)
+    other = tmp_path / "fremd.service"
+    other.write_text("[Unit]\n")
+    (wants / "llm-account-agy-heal.path").symlink_to(other)
+
+    out = json.loads(la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path), activate=False, as_json=True))
+
+    assert (wants / "llm-account-agy-heal.path").is_symlink()
+    assert out["removed_legacy_wants"] == []
+
+
+def test_timer_unit_has_on_boot_and_five_second_accuracy_and_no_path_triggers(env):
+    timer = la.heal_timer_units(env.adapter, 45)["llm-account-agy-heal.timer"]
+
+    assert "OnBootSec=10s" in timer
+    assert "OnUnitActiveSec=45s" in timer
+    assert "AccuracySec=5s" in timer
+    assert "Path" not in timer
+
+
+def test_inotify_warning_below_512_and_none_at_or_above(env, tmp_path, monkeypatch):
+    _record_systemctl(monkeypatch)
+    for limit, expect_warning in ((128, True), (4096, False)):
+        monkeypatch.setattr(la, "inotify_instance_limit", lambda limit=limit: limit)
+        out = json.loads(la.cmd_install_heal_timer(env.adapter, 30, str(tmp_path / str(limit)), activate=False, as_json=True))
+        assert (out["inotify_warning"] is not None) is expect_warning
+        if expect_warning:
+            assert "max_user_instances=128" in out["inotify_warning"]
+
+
 def test_pure_token_clobber_keeps_origin_scope_and_restores_active_scope(env):
     """Alt-Prozess überschreibt nur das Token; der Scope gehört weiter zum aktiven Konto."""
     two_accounts_saved(env)  # aktiv acc2 (B); Live-Home = B
