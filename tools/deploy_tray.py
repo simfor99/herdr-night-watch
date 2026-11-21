@@ -161,12 +161,15 @@ class WindowsPowerGuard:
         self._proc: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
         self._lines: queue.Queue[str | None] | None = None
-        self._helper_gone = False
+        self._helper_gone = False  # scoped to one launch; start() resets it
         self.exit_code: int | None = None
 
     def start(self) -> None:
         if self._proc is not None:
             raise RuntimeError("power guard already started")
+        # A second launch of this guard instance must not inherit the EOF
+        # flag of the first helper's reader.
+        self._helper_gone = False
         try:
             proc = self._popen(
                 ["powershell.exe", "-NoProfile", "-Command", _PS_GUARD_SCRIPT],
@@ -366,14 +369,30 @@ def staged_replace(src: Path, dst: Path, copy2: Callable[[Path, Path], object]) 
     destination cannot rename each other's staging file.
     """
     tmp = dst.with_name(f"{dst.name}.{os.getpid()}.deploying.tmp")
-    copy2(src, tmp)
-    os.replace(tmp, dst)
+    try:
+        copy2(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        # Never leave a partial staging file behind for the next attempt.
+        tmp.unlink(missing_ok=True)
+        raise
     return tmp
 
 
 def tray_is_running(ps_fn: Callable[..., subprocess.CompletedProcess[str]]) -> bool:
-    check = ps_fn(LIVENESS_CMD, timeout=30.0)
-    return bool((check.stdout or "").strip())
+    """One bounded retry: a hung first probe must not skip recovery.
+
+    An inconclusive probe is treated as "not running" so the failure
+    handler still attempts recovery instead of silently leaving a stopped
+    tray behind.
+    """
+    for probe_timeout in (30.0, 10.0):
+        try:
+            check = ps_fn(LIVENESS_CMD, timeout=probe_timeout)
+        except subprocess.TimeoutExpired:
+            continue
+        return bool((check.stdout or "").strip())
+    return False
 
 
 def _start_and_confirm(
@@ -381,6 +400,7 @@ def _start_and_confirm(
     ps_fn: Callable[..., subprocess.CompletedProcess[str]],
     sleep: Callable[[float], None],
     clock: Callable[[], float],
+    guard: WindowsPowerGuard,
     win_dst: str,
     liveness_timeout: float,
 ) -> None:
@@ -393,6 +413,13 @@ def _start_and_confirm(
         )
     except SystemExit as exc:
         raise SystemExit(f"recovery failed: {exc}") from exc
+    # Mirror the deploy handover: hold the guard through the overlap window
+    # and confirm the tray again before reporting recovery success.
+    sleep(OVERLAP_AFTER_LIVE)
+    confirm = ps_fn(LIVENESS_CMD, timeout=30.0)
+    if not (confirm.stdout or "").strip():
+        raise SystemExit("recovery failed: tray exited during overlap window")
+    guard.ensure_active(stage="recovery-confirmed")
 
 
 def recover_tray_after_failure(
@@ -411,9 +438,10 @@ def recover_tray_after_failure(
     Runs whenever the deploy failed after the old tray was stopped. The
     original guard may already be gone (helper death), so recovery first
     acquires a new power guard and only then touches files or processes.
-    It tries the current executable first; if that cannot run, the backup
-    is restored and started. Every guard is released by its with-block, so
-    no helper process is orphaned even when recovery itself fails.
+    It tries the current executable first; only a definitively dead tray
+    (empty liveness answer, not a hung probe) falls back to the previous
+    build, staged atomically. Every guard is released by its with-block,
+    so no helper process is orphaned even when recovery itself fails.
     """
     with guard_factory() as recovery_guard:
         recovery_guard.ensure_active(stage="recovery")
@@ -421,24 +449,27 @@ def recover_tray_after_failure(
         def restore_backup(reason: str) -> None:
             if not prev.is_file():
                 raise SystemExit(f"recovery failed: {reason} and no backup available")
-            copy2(prev, dst)
+            staged_replace(prev, dst, copy2)
 
         if not dst.is_file() or dst.stat().st_size == 0:
             restore_backup("tray exe missing or empty")
         try:
             _start_and_confirm(
-                ps_fn=ps_fn, sleep=sleep, clock=clock, win_dst=win_dst,
-                liveness_timeout=RECOVERY_LIVENESS_TIMEOUT,
+                ps_fn=ps_fn, sleep=sleep, clock=clock, guard=recovery_guard,
+                win_dst=win_dst, liveness_timeout=RECOVERY_LIVENESS_TIMEOUT,
             )
         except (SystemExit, OSError, subprocess.TimeoutExpired):
-            # The current build (often the just-installed replacement)
-            # cannot stay running: fall back to the previous build.
+            # An inconclusive probe does not prove the launch failed; only
+            # restore the backup when the tray is definitively not running.
+            confirm = ps_fn(LIVENESS_CMD, timeout=30.0)
+            if (confirm.stdout or "").strip():
+                return
+            recovery_guard.ensure_active(stage="before restore")
             restore_backup("replacement did not stay running")
             _start_and_confirm(
-                ps_fn=ps_fn, sleep=sleep, clock=clock, win_dst=win_dst,
-                liveness_timeout=RECOVERY_LIVENESS_TIMEOUT,
+                ps_fn=ps_fn, sleep=sleep, clock=clock, guard=recovery_guard,
+                win_dst=win_dst, liveness_timeout=RECOVERY_LIVENESS_TIMEOUT,
             )
-        recovery_guard.ensure_active(stage="recovery-confirmed")
 
 
 def main(
@@ -475,9 +506,13 @@ def main(
             if leftover not in {"", "0"}:
                 raise SystemExit(f"tray still running after stop: {leftover}")
             guard.ensure_active(stage="replace")
-            if dst.exists():
-                copy2(dst, prev)
+            # Never overwrite a usable backup with a missing or empty exe;
+            # stage the backup so a failed write cannot destroy it either.
+            if dst.is_file() and dst.stat().st_size > 0:
+                staged_replace(dst, prev, copy2)
+            guard.ensure_active(stage="before rename")
             staged_replace(src, dst, copy2)
+            guard.ensure_active(stage="before launch")
             start = ps_fn(f"Start-Process -FilePath '{win_dst}'", timeout=30.0)
             if start.returncode != 0:
                 raise SystemExit(f"start failed: {start.stderr or start.stdout}")

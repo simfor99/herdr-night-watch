@@ -273,10 +273,14 @@ def make_ps(
     return fake_ps, calls
 
 
-def make_copy2(events: list[object], fail_on: str | None = None):
+def make_copy2(events: list[object], fail_on: str | None = None, fail_src: str | None = None):
     def fake_copy2(src: Path, dst: Path) -> None:
         events.append(f"copy:{src.name}->{dst.name}")
-        if fail_on is not None and (dst.name == fail_on or dst.name.endswith(fail_on)):
+        if (
+            fail_on is not None
+            and (dst.name == fail_on or dst.name.endswith(fail_on))
+            and (fail_src is None or src.name == fail_src)
+        ):
             raise RuntimeError("simulated copy failure")
         dst.write_bytes(src.read_bytes() if src.exists() else b"x")
 
@@ -302,7 +306,11 @@ def run_main(events: list[object], tmp_path: Path, **overrides):
     )
     kwargs = dict(
         ps_fn=ps_fn,
-        copy2=make_copy2(events, fail_on=overrides.pop("fail_on", None)),
+        copy2=make_copy2(
+            events,
+            fail_on=overrides.pop("fail_on", None),
+            fail_src=overrides.pop("fail_src", None),
+        ),
         sleep=lambda s: events.append(f"sleep:{s}"),
         clock=FakeClock(),
         guard_factory=make_guard_factory(events, **overrides.pop("guard_kwargs", {})),
@@ -335,9 +343,12 @@ def test_happy_path_activates_guard_before_stop_and_releases_after_overlap(
               and e.startswith("copy:herdr-night-watch.exe->Herdr-Nachtwaechter.exe.")
               and e.endswith(".deploying.tmp")]
     assert len(staged) == 1
-    backup_event = "copy:Herdr-Nachtwaechter.exe->Herdr-Nachtwaechter.prev.exe"
-    assert events.index("stop_old_tray") < events.index(backup_event)
-    assert events.index(backup_event) < events.index(staged[0])
+    backups = [e for e in events if isinstance(e, str)
+               and e.startswith("copy:Herdr-Nachtwaechter.exe->Herdr-Nachtwaechter.prev.exe.")
+               and e.endswith(".deploying.tmp")]
+    assert len(backups) == 1
+    assert events.index("stop_old_tray") < events.index(backups[0])
+    assert events.index(backups[0]) < events.index(staged[0])
     assert events.index(staged[0]) < events.index("start_new_tray")
     # Liveness, dann Überlappungsschlaf, dann erst Freigabe (Kette gesichert).
     assert events.index("start_new_tray") < events.index("liveness_pid:4242")
@@ -394,8 +405,10 @@ def test_fail_closed_when_tray_exits_during_overlap(tmp_path: Path) -> None:
     # Recovery laeuft unter eigenem Guard und fällt auf das Backup zurueck,
     # weil die neue EXE nicht am Leben bleibt; Ursache bleibt die Overlap-Exception.
     assert events.count("guard_active") == 2
-    restore_event = "copy:Herdr-Nachtwaechter.prev.exe->Herdr-Nachtwaechter.exe"
-    assert restore_event in events
+    restores = [e for e in events if isinstance(e, str)
+                and e.startswith("copy:Herdr-Nachtwaechter.prev.exe->Herdr-Nachtwaechter.exe")
+                and e.endswith(".deploying.tmp")]
+    assert len(restores) == 1
     assert events.count("start_new_tray") == 3  # Start, Recovery-Versuch 1 und 2
     # Beide Guards wurden sauber freigegeben (kein Helfer-Waisenprozess).
     assert events.count("guard_stdin_write") == 2
@@ -506,15 +519,20 @@ def test_copy_failure_recovers_tray_and_releases_guard(tmp_path: Path) -> None:
     events: list[object] = []
 
     with pytest.raises(RuntimeError, match="simulated copy failure"):
-        run_main(events, tmp_path, fail_on=".deploying.tmp")
+        run_main(
+            events, tmp_path, fail_on=".deploying.tmp", fail_src="herdr-night-watch.exe"
+        )
 
-    backup_event = "copy:Herdr-Nachtwaechter.exe->Herdr-Nachtwaechter.prev.exe"
+    backups = [e for e in events if isinstance(e, str)
+               and e.startswith("copy:Herdr-Nachtwaechter.exe->Herdr-Nachtwaechter.prev.exe.")
+               and e.endswith(".deploying.tmp")]
+    assert len(backups) == 1
     staged = [e for e in events if isinstance(e, str)
               and e.startswith("copy:herdr-night-watch.exe->Herdr-Nachtwaechter.exe.")
               and e.endswith(".deploying.tmp")]
     assert len(staged) == 1
-    assert events.index("stop_old_tray") < events.index(backup_event)
-    assert events.index(backup_event) < events.index(staged[0])
+    assert events.index("stop_old_tray") < events.index(backups[0])
+    assert events.index(backups[0]) < events.index(staged[0])
     # Recovery startet die noch intakte alte EXE erneut, unter eigenem Guard.
     assert events.index(staged[0]) < events.index("start_new_tray")
     assert events.index("start_new_tray") < events.index("liveness_pid:4242")
@@ -530,7 +548,7 @@ def test_recovery_restores_backup_when_dst_is_missing(tmp_path: Path) -> None:
     dst = tmp_path / "Herdr-Nachtwaechter.exe"
     prev = tmp_path / "Herdr-Nachtwaechter.prev.exe"
     prev.write_bytes(b"OLDBUILD" * 2)
-    ps_fn, _calls = make_ps(events, liveness_pids=("777",))
+    ps_fn, _calls = make_ps(events, liveness_pids=("777", "777"))
     guard_factory = lambda: deploy_tray.hold_windows_power_guard(
         popen=lambda *args, **kwargs: FakeGuardProcess(events), clock=FakeClock()
     )
@@ -542,8 +560,11 @@ def test_recovery_restores_backup_when_dst_is_missing(tmp_path: Path) -> None:
     )
 
     assert dst.read_bytes() == b"OLDBUILD" * 2
-    restore_event = "copy:Herdr-Nachtwaechter.prev.exe->Herdr-Nachtwaechter.exe"
-    assert events.index(restore_event) < events.index("start_new_tray")
+    restores = [e for e in events if isinstance(e, str)
+                and e.startswith("copy:Herdr-Nachtwaechter.prev.exe->Herdr-Nachtwaechter.exe")
+                and e.endswith(".deploying.tmp")]
+    assert len(restores) == 1
+    assert events.index(restores[0]) < events.index("start_new_tray")
     assert "liveness_pid:777" in events
 
 
@@ -567,8 +588,11 @@ def test_recovery_falls_back_to_prev_when_new_build_dies(tmp_path: Path) -> None
 
     # Erst die aktuelle EXE versuchen, dann das Backup zurueckspielen und erneut starten.
     assert events.count("start_new_tray") == 2
-    restore_event = "copy:Herdr-Nachtwaechter.prev.exe->Herdr-Nachtwaechter.exe"
-    assert events.index("start_new_tray") < events.index(restore_event)
+    restores = [e for e in events if isinstance(e, str)
+                and e.startswith("copy:Herdr-Nachtwaechter.prev.exe->Herdr-Nachtwaechter.exe")
+                and e.endswith(".deploying.tmp")]
+    assert len(restores) == 1
+    assert events.index("start_new_tray") < events.index(restores[0])
     assert dst.read_bytes() == b"OLDBUILD" * 2
 
 
@@ -745,7 +769,7 @@ def test_ps_reads_windows_output_as_utf8_with_replacement() -> None:
 def test_wait_for_tray_alive_bounds_each_probe_by_remaining_budget() -> None:
     events: list[object] = []
     timeouts: list[float] = []
-    ps_fn, _calls = make_ps(events, liveness_pids=("777",))
+    ps_fn, _calls = make_ps(events, liveness_pids=("777", "777"))
 
     def probing_ps(command: str, *, timeout: float = 30.0) -> subprocess.CompletedProcess:
         timeouts.append(timeout)
