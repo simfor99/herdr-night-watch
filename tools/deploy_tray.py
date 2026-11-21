@@ -159,6 +159,8 @@ class WindowsPowerGuard:
         self._terminate_timeout = terminate_timeout
         self._proc: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
+        self._lines: queue.Queue[str | None] | None = None
+        self._helper_gone = False
         self.exit_code: int | None = None
 
     def start(self) -> None:
@@ -178,6 +180,7 @@ class WindowsPowerGuard:
             raise SystemExit(f"power guard failed to start: {exc}") from exc
         self._proc = proc
         lines: queue.Queue[str | None] = queue.Queue()
+        self._lines = lines
 
         def _drain() -> None:
             stdout = proc.stdout
@@ -193,6 +196,8 @@ class WindowsPowerGuard:
                         break
                     lines.put(line.strip())
             finally:
+                # EOF means the helper can no longer hold the power request.
+                self._helper_gone = True
                 lines.put(None)
 
         reader = threading.Thread(target=_drain, daemon=True)
@@ -221,6 +226,23 @@ class WindowsPowerGuard:
             if item == GUARD_SENTINEL:
                 return
             collected.append(item)
+
+    def ensure_active(self, *, stage: str) -> None:
+        """Fail closed when the helper ended after signalling the sentinel.
+
+        The sentinel only proves the requests were active once; a helper that
+        died since (crash, external kill, early stdin EOF) leaves the handover
+        without power protection. Callers must check this before and during
+        the phase where the old tray EXE is stopped and the new one starts.
+        """
+        proc = self._proc
+        if proc is None:
+            raise SystemExit(f"power guard inactive at {stage}: helper not running")
+        exit_code = proc.poll()
+        if self._helper_gone or exit_code is not None:
+            self.close()
+            detail = f"exit code {exit_code}" if exit_code is not None else "stdout closed early"
+            raise SystemExit(f"power guard lost before {stage}: helper ended ({detail})")
 
     def close(self) -> None:
         proc = self._proc
@@ -269,12 +291,14 @@ class WindowsPowerGuard:
 
 
 @contextmanager
-def hold_windows_power_guard(**kwargs: object) -> Iterator[None]:
+def hold_windows_power_guard(**kwargs: object) -> Iterator[WindowsPowerGuard]:
     """Hold the overlapping Windows power guard for a deploy handover."""
     guard = WindowsPowerGuard(**kwargs)  # type: ignore[arg-type]
-    guard.start()
     try:
-        yield
+        # start() inside try: an interruption during the handshake must still
+        # tear the helper down instead of leaving it with active requests.
+        guard.start()
+        yield guard
     finally:
         guard.close()
 
@@ -283,6 +307,7 @@ def ps(
     command: str,
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    timeout: float = 30.0,
 ) -> subprocess.CompletedProcess[str]:
     return run(
         ["powershell.exe", "-NoProfile", "-Command", command],
@@ -292,25 +317,33 @@ def ps(
         errors="replace",
         capture_output=True,
         stdin=subprocess.DEVNULL,
-        timeout=30,
+        timeout=timeout,
     )
 
 
 def wait_for_tray_alive(
     *,
-    ps_fn: Callable[[str], subprocess.CompletedProcess[str]],
+    ps_fn: Callable[..., subprocess.CompletedProcess[str]],
     sleep: Callable[[float], None],
     clock: Callable[[], float],
     liveness_timeout: float = LIVENESS_TIMEOUT,
     poll_interval: float = LIVENESS_POLL_INTERVAL,
 ) -> str:
-    """Poll until at least one tray process is running again, then return its PID."""
+    """Poll until at least one tray process is running again, then return its PID.
+
+    Each probe is bounded by the remaining liveness budget so a hanging
+    powershell probe cannot extend the wait far beyond ``liveness_timeout``.
+    A probe that started before the deadline may still return a PID once its
+    bounded timeout expires; no new probe starts after the deadline.
+    """
     deadline = clock() + liveness_timeout
+    liveness_cmd = (
+        "Get-Process -Name 'Herdr-Nachtwaechter' -ErrorAction SilentlyContinue | "
+        "Select-Object -First 1 -ExpandProperty Id"
+    )
     while True:
-        check = ps_fn(
-            "Get-Process -Name 'Herdr-Nachtwaechter' -ErrorAction SilentlyContinue | "
-            "Select-Object -First 1 -ExpandProperty Id"
-        )
+        remaining = max(deadline - clock(), 0.0)
+        check = ps_fn(liveness_cmd, timeout=min(30.0, max(remaining, 0.1)))
         pid = (check.stdout or "").strip()
         if pid:
             return pid
@@ -321,11 +354,11 @@ def wait_for_tray_alive(
 
 def main(
     *,
-    ps_fn: Callable[[str], subprocess.CompletedProcess[str]] | None = None,
+    ps_fn: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     copy2: Callable[[Path, Path], object] = shutil.copy2,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
-    guard_factory: Callable[[], AbstractContextManager[None]] = hold_windows_power_guard,
+    guard_factory: Callable[[], AbstractContextManager[WindowsPowerGuard]] = hold_windows_power_guard,
     src: Path = SRC,
     dst: Path = DST,
     prev: Path = PREV,
@@ -335,25 +368,40 @@ def main(
         ps_fn = ps
     if not src.is_file():
         raise SystemExit(f"missing build: {src}")
-    with guard_factory():
+    with guard_factory() as guard:
+        guard.ensure_active(stage="stop")
         stop = ps_fn(
             "Get-Process -Name 'Herdr-Nachtwaechter' -ErrorAction SilentlyContinue | Stop-Process -Force; "
             "Start-Sleep -Milliseconds 400; "
-            "(Get-Process -Name 'Herdr-Nachtwaechter' -ErrorAction SilentlyContinue | Measure-Object).Count"
+            "(Get-Process -Name 'Herdr-Nachtwaechter' -ErrorAction SilentlyContinue | Measure-Object).Count",
+            timeout=30.0,
         )
         if stop.returncode != 0:
             raise SystemExit(f"stop failed: {stop.stderr or stop.stdout}")
         leftover = (stop.stdout or "").strip()
         if leftover not in {"", "0"}:
             raise SystemExit(f"tray still running after stop: {leftover}")
+        guard.ensure_active(stage="replace")
         if dst.exists():
             copy2(dst, prev)
         copy2(src, dst)
-        start = ps_fn(f"Start-Process -FilePath '{win_dst}'")
+        start = ps_fn(f"Start-Process -FilePath '{win_dst}'", timeout=30.0)
         if start.returncode != 0:
             raise SystemExit(f"start failed: {start.stderr or start.stdout}")
+        guard.ensure_active(stage="handover")
         pid = wait_for_tray_alive(ps_fn=ps_fn, sleep=sleep, clock=clock)
+        guard.ensure_active(stage="liveness")
         sleep(OVERLAP_AFTER_LIVE)
+        # The replacement must still run after the overlap window while the
+        # guard is held; report failure instead of a dead PID as success.
+        confirm = ps_fn(
+            "Get-Process -Name 'Herdr-Nachtwaechter' -ErrorAction SilentlyContinue | "
+            "Select-Object -First 1 -ExpandProperty Id",
+            timeout=30.0,
+        )
+        if not (confirm.stdout or "").strip():
+            raise SystemExit("tray exited during overlap window")
+        guard.ensure_active(stage="overlap")
     print(f"deployed pid={pid} bytes={dst.stat().st_size}")
     return 0
 

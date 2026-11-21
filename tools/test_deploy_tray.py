@@ -2,11 +2,12 @@
 """Deterministic tests for the overlapping Windows power guard in deploy_tray.py.
 
 Covers the handover invariants from the AC work order: the guard must be
-active before Stop-Process runs, must be released only after liveness plus
-the overlap sleep, must fail closed without ever stopping the tray when the
-helper does not signal POWER_GUARD_ACTIVE, and must tear the helper down on
-every exit path (including terminate/kill timeouts). One optional smoke test
-runs the real powershell.exe helper once, without touching the tray EXE.
+active before Stop-Process runs, must stay confirmed alive across the whole
+handover (helper death after the sentinel fails closed), must be released
+only after liveness, the overlap sleep and a post-overlap PID recheck, and
+must tear the helper down on every exit path (including terminate/kill
+timeouts). One optional smoke test runs the real powershell.exe helper once,
+without touching the tray EXE.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import os
 import queue
 import shutil
 import subprocess
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -52,17 +54,33 @@ class _FakeGuardStdin:
 
 
 class _FakeGuardStdout:
-    """Yields the given lines, then EOF (empty string)."""
+    """Delivers queued lines, then holds the reader until the process ends."""
 
-    def __init__(self, lines: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        lines: tuple[str, ...],
+        on_sentinel: object | None = None,
+        eof_event: threading.Event | None = None,
+    ) -> None:
         self._lines = [f"{line}\n" for line in lines]
+        self._on_sentinel = on_sentinel
+        self._eof_event = eof_event or threading.Event()
         self.closed = False
 
     def readline(self) -> str:
-        return self._lines.pop(0) if self._lines else ""
+        if self._lines:
+            line = self._lines.pop(0)
+            if self._on_sentinel is not None and line.strip() == deploy_tray.GUARD_SENTINEL:
+                self._on_sentinel()
+            return line
+        # A live helper keeps stdout open; EOF arrives only at process end.
+        self._eof_event.wait(timeout=0.5)
+        return ""
 
     def close(self) -> None:
-        self.closed = True
+        if not self.closed:
+            self.closed = True
+            self._eof_event.set()
 
 
 class _BlockingFakeStdout:
@@ -83,6 +101,40 @@ class _BlockingFakeStdout:
         self.closed = True
 
 
+class _SyncedGuardStdout:
+    """Keeps the reader pending after the sentinel until close() releases it.
+
+    close() records ``stdout_closed_early`` when the reader was still blocked,
+    so the drain-order test cannot pass without the real reader join.
+    """
+
+    def __init__(self, events: list[object], hold_seconds: float = 0.3) -> None:
+        self._events = events
+        self._hold_seconds = hold_seconds
+        self._released = threading.Event()
+        self._sentinel_sent = False
+        self._reader_pending = False
+        self.closed = False
+
+    def readline(self) -> str:
+        if not self._sentinel_sent:
+            self._sentinel_sent = True
+            return f"{deploy_tray.GUARD_SENTINEL}\n"
+        self._reader_pending = True
+        self._released.wait(timeout=self._hold_seconds)
+        self._reader_pending = False
+        self._events.append("drain_finished")
+        return ""
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            if self._reader_pending:
+                self._events.append("stdout_closed_early")
+            self._events.append("stdout_closed")
+            self._released.set()
+
+
 class FakeGuardProcess:
     """Popen stand-in for the powershell.exe guard helper."""
 
@@ -93,15 +145,33 @@ class FakeGuardProcess:
         stdout_lines: tuple[str, ...] = (deploy_tray.GUARD_SENTINEL,),
         stdout: object | None = None,
         hang: str | None = None,
+        die_after_sentinel: bool = False,
+        death_code: int = 1,
     ) -> None:
         self.events = events
-        self.stdout = stdout if stdout is not None else _FakeGuardStdout(stdout_lines)
+        self._eof_event = threading.Event()
+        self.stdout = stdout if stdout is not None else _FakeGuardStdout(
+            stdout_lines, on_sentinel=self._mark_sentinel, eof_event=self._eof_event
+        )
         self.stdin = _FakeGuardStdin(events)
         self.hang = hang
+        self.die_after_sentinel = die_after_sentinel
+        self.death_code = death_code
         self.pid = 424242
+        self._sentinel_delivered = False
         self._terminated = False
         self._killed = False
         self.returncode: int | None = None
+
+    def _mark_sentinel(self) -> None:
+        self._sentinel_delivered = True
+
+    def poll(self) -> int | None:
+        if self.die_after_sentinel and self._sentinel_delivered:
+            if self.returncode is None:
+                self.returncode = self.death_code
+            return self.returncode
+        return self.returncode
 
     def wait(self, timeout: float | None = None) -> int:
         hanging = (self.hang == "until_terminate" and not self._terminated) or (
@@ -110,17 +180,21 @@ class FakeGuardProcess:
         if hanging:
             self.events.append("guard_wait_timeout")
             raise subprocess.TimeoutExpired(cmd="powershell.exe", timeout=timeout)
-        self.returncode = -9 if self._killed else (-15 if self._terminated else 0)
+        if self.returncode is None:
+            self.returncode = -9 if self._killed else (-15 if self._terminated else 0)
+        self._eof_event.set()
         self.events.append("guard_wait_ok")
         return self.returncode
 
     def terminate(self) -> None:
         self._terminated = True
         self.events.append("guard_terminate")
+        self._eof_event.set()
 
     def kill(self) -> None:
         self._killed = True
         self.events.append("guard_kill")
+        self._eof_event.set()
 
 
 def make_guard_factory(events: list[object], proc: FakeGuardProcess):
@@ -130,9 +204,9 @@ def make_guard_factory(events: list[object], proc: FakeGuardProcess):
             events.append("guard_start")
             with deploy_tray.hold_windows_power_guard(
                 popen=lambda *args, **kwargs: proc, clock=FakeClock()
-            ):
+            ) as guard:
                 events.append("guard_active")
-                yield
+                yield guard
             events.append("guard_released")
 
         return _ctx()
@@ -150,7 +224,7 @@ def make_ps(
     calls: list[str] = []
     live = list(liveness_pids)
 
-    def fake_ps(command: str) -> subprocess.CompletedProcess:
+    def fake_ps(command: str, *, timeout: float = 30.0) -> subprocess.CompletedProcess:
         calls.append(command)
         if "Stop-Process" in command:
             events.append("stop_old_tray")
@@ -193,11 +267,16 @@ def make_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 def run_main(events: list[object], proc: FakeGuardProcess, tmp_path: Path, **overrides):
     src, dst, prev = make_paths(tmp_path)
-    ps_fn, _calls = make_ps(events)
+    ps_fn, _calls = make_ps(
+        events,
+        stop_leftover=overrides.pop("stop_leftover", "0"),
+        start_ok=overrides.pop("start_ok", True),
+        liveness_pids=overrides.pop("liveness_pids", ("4242",)),
+    )
     kwargs = dict(
         ps_fn=ps_fn,
         copy2=make_copy2(events, fail_on=overrides.pop("fail_on", None)),
-        sleep=overrides.pop("sleep", lambda s: events.append(f"sleep:{s}")),
+        sleep=lambda s: events.append(f"sleep:{s}"),
         clock=FakeClock(),
         guard_factory=make_guard_factory(events, proc),
         src=src,
@@ -216,7 +295,13 @@ def test_happy_path_activates_guard_before_stop_and_releases_after_overlap(
     proc = FakeGuardProcess(events)
     sleeps: list[float] = []
 
-    result = run_main(events, proc, tmp_path, sleep=lambda s: sleeps.append(s))
+    result = run_main(
+        events,
+        proc,
+        tmp_path,
+        liveness_pids=("4242", "4242"),
+        sleep=lambda s: (sleeps.append(s), events.append(f"sleep:{s}")),
+    )
 
     assert result == 0
     # 1. Reihenfolge-Invariante: Guard zuerst, Stop-Process nie vorher.
@@ -227,10 +312,13 @@ def test_happy_path_activates_guard_before_stop_and_releases_after_overlap(
     assert events.index("stop_old_tray") < events.index(backup_event)
     assert events.index(backup_event) < events.index(copy_event)
     assert events.index(copy_event) < events.index("start_new_tray")
-    # Freigabe erst nach Liveness-Check plus Überlappungsfenster.
+    # Liveness, dann Überlappungsschlaf, dann erst Freigabe (Kette gesichert).
     assert events.index("start_new_tray") < events.index("liveness_pid:4242")
-    assert events.index("liveness_pid:4242") < events.index("guard_stdin_write")
+    assert events.index("liveness_pid:4242") < events.index("sleep:2.0")
+    assert events.index("sleep:2.0") < events.index("guard_stdin_write")
     assert sleeps == [deploy_tray.OVERLAP_AFTER_LIVE]
+    # Post-Overlap-Recheck bestätigt die PID ein zweites Mal.
+    assert events.count("liveness_pid:4242") == 2
     # Sauberes Teardown: abgeholt, kein Terminate/Kill im Happy Path.
     assert "guard_stdin_closed" in events
     assert "guard_wait_ok" in events
@@ -242,17 +330,61 @@ def test_happy_path_activates_guard_before_stop_and_releases_after_overlap(
     assert "bytes=32" in out
 
 
+def test_fail_closed_when_helper_dies_after_sentinel(tmp_path: Path) -> None:
+    events: list[object] = []
+    proc = FakeGuardProcess(events, die_after_sentinel=True)
+    src, dst, prev = make_paths(tmp_path)
+    ps_fn, ps_calls = make_ps(events)
+
+    with pytest.raises(SystemExit, match="power guard lost before stop"):
+        deploy_tray.main(
+            ps_fn=ps_fn,
+            copy2=make_copy2(events),
+            sleep=lambda s: events.append(f"sleep:{s}"),
+            clock=FakeClock(),
+            guard_factory=make_guard_factory(events, proc),
+            src=src,
+            dst=dst,
+            prev=prev,
+            win_dst=r"C:\fake\Herdr-Nachtwaechter.exe",
+        )
+
+    # Der Guard-Verlust vor Stop-Process darf das Tray nie anfassen.
+    assert ps_calls == []
+    assert "stop_old_tray" not in events
+    assert "start_new_tray" not in events
+    # Der tote Helfer wurde trotzdem abgeräumt.
+    assert "guard_stdin_write" in events
+    assert "guard_wait_ok" in events
+    assert proc.returncode == 1
+
+
+def test_fail_closed_when_tray_exits_during_overlap(tmp_path: Path) -> None:
+    events: list[object] = []
+    proc = FakeGuardProcess(events)
+
+    with pytest.raises(SystemExit, match="tray exited during overlap window"):
+        run_main(events, proc, tmp_path, liveness_pids=("4242", ""))
+
+    assert events.index("liveness_pid:4242") < events.index("sleep:2.0")
+    assert events.index("sleep:2.0") < events.index("liveness_none")
+    # Exception-Safety: Guard trotzdem sauber freigegeben.
+    assert "guard_stdin_write" in events
+    assert "guard_wait_ok" in events
+    assert "guard_terminate" not in events
+
+
 def test_liveness_polls_until_tray_process_appears(tmp_path: Path) -> None:
     events: list[object] = []
     proc = FakeGuardProcess(events)
     sleeps: list[float] = []
     src, dst, prev = make_paths(tmp_path)
-    ps_fn, _calls = make_ps(events, liveness_pids=("", "777"))
+    ps_fn, _calls = make_ps(events, liveness_pids=("", "777", "777"))
 
     result = deploy_tray.main(
         ps_fn=ps_fn,
         copy2=make_copy2(events),
-        sleep=lambda s: sleeps.append(s),
+        sleep=lambda s: (sleeps.append(s), events.append(f"sleep:{s}")),
         clock=FakeClock(step=0.25),
         guard_factory=make_guard_factory(events, proc),
         src=src,
@@ -427,6 +559,23 @@ def test_teardown_kills_helper_that_ignores_terminate() -> None:
     assert guard.exit_code == -9
 
 
+def test_close_joins_drain_thread_before_closing_stdout() -> None:
+    events: list[object] = []
+    proc = FakeGuardProcess(events, stdout=_SyncedGuardStdout(events))
+    guard = deploy_tray.WindowsPowerGuard(
+        popen=lambda *args, **kwargs: proc, clock=FakeClock()
+    )
+    guard.start()
+    guard.close()
+
+    # Der Reader wurde vor dem stdout.close() abgeholt; ohne join wuerde der
+    # synchronisierte Fake "stdout_closed_early" aufzeichnen und den Test
+    # fehlschlagen lassen.
+    assert "drain_finished" in events
+    assert "stdout_closed_early" not in events
+    assert events.index("drain_finished") < events.index("stdout_closed")
+
+
 def test_helper_command_wires_windows_power_apis() -> None:
     events: list[object] = []
     captured: dict[str, object] = {}
@@ -509,37 +658,25 @@ def test_ps_reads_windows_output_as_utf8_with_replacement() -> None:
     assert captured["kwargs"]["stdin"] == subprocess.DEVNULL
 
 
-class _HookedGuardStdout:
-    """Sentinel first, then EOF; logs when the drain thread saw EOF."""
-
-    def __init__(self, events: list[object]) -> None:
-        self.events = events
-        self.closed = False
-        self._sentinel_sent = False
-
-    def readline(self) -> str:
-        if not self._sentinel_sent:
-            self._sentinel_sent = True
-            return f"{deploy_tray.GUARD_SENTINEL}\n"
-        self.events.append("drain_finished")
-        return ""
-
-    def close(self) -> None:
-        if not self.closed:
-            self.closed = True
-            self.events.append("stdout_closed")
-
-
-def test_close_joins_drain_thread_before_closing_stdout() -> None:
+def test_wait_for_tray_alive_bounds_each_probe_by_remaining_budget() -> None:
     events: list[object] = []
-    proc = FakeGuardProcess(events, stdout=_HookedGuardStdout(events))
-    guard = deploy_tray.WindowsPowerGuard(
-        popen=lambda *args, **kwargs: proc, clock=FakeClock()
-    )
-    guard.start()
-    guard.close()
+    timeouts: list[float] = []
+    ps_fn, _calls = make_ps(events, liveness_pids=("777",))
 
-    assert events.index("drain_finished") < events.index("stdout_closed")
+    def probing_ps(command: str, *, timeout: float = 30.0) -> subprocess.CompletedProcess:
+        timeouts.append(timeout)
+        return ps_fn(command, timeout=timeout)
+
+    pid = deploy_tray.wait_for_tray_alive(
+        ps_fn=probing_ps,
+        sleep=lambda s: events.append(f"sleep:{s}"),
+        clock=FakeClock(step=4.0),
+        liveness_timeout=10.0,
+    )
+
+    assert pid == "777"
+    # Erste Abfrage startet nach einem Clock-Tick (4.0 verstrichen): Restbudget 6.0.
+    assert timeouts == [min(30.0, 10.0 - 4.0)]
 
 
 def test_real_windows_power_guard_smoke() -> None:
@@ -554,6 +691,7 @@ def test_real_windows_power_guard_smoke() -> None:
 
     guard = deploy_tray.WindowsPowerGuard(start_timeout=25.0, release_timeout=15.0)
     guard.start()
+    guard.ensure_active(stage="smoke test")
     guard.close()
 
     assert guard.exit_code == 0
