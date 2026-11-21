@@ -54,7 +54,12 @@ class _FakeGuardStdin:
 
 
 class _FakeGuardStdout:
-    """Delivers queued lines, then holds the reader until the process ends."""
+    """Delivers queued lines; EOF arrives only through the process-end event.
+
+    A live helper keeps stdout open, so readline blocks on ``eof_event``
+    without a timeout instead of simulating an early EOF; activation-failure
+    runs get the event set up front because that helper dies immediately.
+    """
 
     def __init__(
         self,
@@ -73,8 +78,7 @@ class _FakeGuardStdout:
             if self._on_sentinel is not None and line.strip() == deploy_tray.GUARD_SENTINEL:
                 self._on_sentinel()
             return line
-        # A live helper keeps stdout open; EOF arrives only at process end.
-        self._eof_event.wait(timeout=0.5)
+        self._eof_event.wait()
         return ""
 
     def close(self) -> None:
@@ -162,6 +166,11 @@ class FakeGuardProcess:
         self._terminated = False
         self._killed = False
         self.returncode: int | None = None
+        if stdout is None and not any(
+            str(line).strip() == deploy_tray.GUARD_SENTINEL for line in stdout_lines
+        ):
+            # A helper that never reaches the sentinel dies immediately.
+            self._eof_event.set()
 
     def _mark_sentinel(self) -> None:
         self._sentinel_delivered = True
@@ -306,9 +315,9 @@ def test_happy_path_activates_guard_before_stop_and_releases_after_overlap(
     assert result == 0
     # 1. Reihenfolge-Invariante: Guard zuerst, Stop-Process nie vorher.
     assert events.index("guard_active") < events.index("stop_old_tray")
-    # Backup und Kopieren liegen zwischen Stop und Start.
+    # Backup und gestaffelte Kopie (TMP, dann atomarer replace) liegen zwischen Stop und Start.
     backup_event = "copy:Herdr-Nachtwaechter.exe->Herdr-Nachtwaechter.prev.exe"
-    copy_event = "copy:herdr-night-watch.exe->Herdr-Nachtwaechter.exe"
+    copy_event = "copy:herdr-night-watch.exe->Herdr-Nachtwaechter.exe.deploying.tmp"
     assert events.index("stop_old_tray") < events.index(backup_event)
     assert events.index(backup_event) < events.index(copy_event)
     assert events.index(copy_event) < events.index("start_new_tray")
@@ -476,20 +485,54 @@ def test_fail_closed_on_handshake_start_timeout() -> None:
     assert "guard_wait_ok" in events
 
 
-def test_copy_failure_still_releases_guard(tmp_path: Path) -> None:
+def test_copy_failure_recovers_tray_and_releases_guard(tmp_path: Path) -> None:
     events: list[object] = []
     proc = FakeGuardProcess(events)
 
     with pytest.raises(RuntimeError, match="simulated copy failure"):
-        run_main(events, proc, tmp_path, fail_on="Herdr-Nachtwaechter.exe")
+        run_main(
+            events,
+            proc,
+            tmp_path,
+            fail_on="Herdr-Nachtwaechter.exe.deploying.tmp",
+        )
 
     backup_event = "copy:Herdr-Nachtwaechter.exe->Herdr-Nachtwaechter.prev.exe"
+    staged_event = "copy:herdr-night-watch.exe->Herdr-Nachtwaechter.exe.deploying.tmp"
     assert events.index("stop_old_tray") < events.index(backup_event)
-    assert "guard_stdin_write" in events
+    assert events.index(backup_event) < events.index(staged_event)
+    # Recovery startet den Tray erneut, waehrend der Guard noch haelt.
+    assert events.index(staged_event) < events.index("start_new_tray")
+    assert "liveness_pid:4242" in events
+    # Guard wurde trotzdem sauber freigegeben (kein Helfer-Waisenprozess).
     assert "guard_stdin_closed" in events
     assert "guard_wait_ok" in events
     assert "guard_terminate" not in events
     assert proc.returncode == 0
+
+
+def test_recovery_restores_backup_when_dst_is_missing(tmp_path: Path) -> None:
+    events: list[object] = []
+    proc = FakeGuardProcess(events)
+    dst = tmp_path / "Herdr-Nachtwaechter.exe"
+    prev = tmp_path / "Herdr-Nachtwaechter.prev.exe"
+    prev.write_bytes(b"OLDBUILD" * 2)
+    ps_fn, _calls = make_ps(events, liveness_pids=("777",))
+    guard = deploy_tray.WindowsPowerGuard(
+        popen=lambda *args, **kwargs: proc, clock=FakeClock()
+    )
+    guard.start()
+
+    deploy_tray.recover_tray_after_failure(
+        ps_fn=ps_fn, copy2=make_copy2(events), sleep=lambda s: events.append(f"sleep:{s}"),
+        clock=FakeClock(), guard=guard, dst=dst, prev=prev,
+        win_dst=r"C:\fake\Herdr-Nachtwaechter.exe",
+    )
+
+    assert dst.read_bytes() == b"OLDBUILD" * 2
+    assert "start_new_tray" in events
+    assert "liveness_pid:777" in events
+    guard.close()
 
 
 def test_start_failure_still_releases_guard(tmp_path: Path) -> None:
@@ -511,9 +554,11 @@ def test_start_failure_still_releases_guard(tmp_path: Path) -> None:
             win_dst=r"C:\fake\Herdr-Nachtwaechter.exe",
         )
 
-    assert events.index("copy:herdr-night-watch.exe->Herdr-Nachtwaechter.exe") < events.index(
+    assert events.index("copy:herdr-night-watch.exe->Herdr-Nachtwaechter.exe.deploying.tmp") < events.index(
         "start_new_tray"
     )
+    # Recovery-Start schlaegt ebenfalls fehl; die Ursache bleibt die Start-Exception.
+    assert events.count("start_new_tray") == 2
     assert "guard_stdin_write" in events
     assert "guard_wait_ok" in events
     assert "guard_kill" not in events

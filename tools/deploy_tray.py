@@ -17,6 +17,7 @@ its own tray power guard time to come up.
 
 from __future__ import annotations
 
+import os
 import queue
 import shutil
 import subprocess
@@ -333,8 +334,9 @@ def wait_for_tray_alive(
 
     Each probe is bounded by the remaining liveness budget so a hanging
     powershell probe cannot extend the wait far beyond ``liveness_timeout``.
-    A probe that started before the deadline may still return a PID once its
-    bounded timeout expires; no new probe starts after the deadline.
+    The deadline is re-checked before every probe and each polling sleep is
+    capped at the remaining budget, so no new probe starts once the budget
+    is exhausted; a probe that started in time may still return a late PID.
     """
     deadline = clock() + liveness_timeout
     liveness_cmd = (
@@ -342,14 +344,64 @@ def wait_for_tray_alive(
         "Select-Object -First 1 -ExpandProperty Id"
     )
     while True:
-        remaining = max(deadline - clock(), 0.0)
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise SystemExit("tray did not start")
         check = ps_fn(liveness_cmd, timeout=min(30.0, max(remaining, 0.1)))
         pid = (check.stdout or "").strip()
         if pid:
             return pid
-        if clock() >= deadline:
-            raise SystemExit("tray did not start")
-        sleep(poll_interval)
+        sleep(min(poll_interval, max(deadline - clock(), 0.0)))
+
+
+RECOVERY_LIVENESS_TIMEOUT = 5.0
+
+
+def staged_replace(src: Path, dst: Path, copy2: Callable[[Path, Path], object]) -> Path:
+    """Copy to a temp file next to dst, then swap dst in atomically.
+
+    os.replace guarantees that dst is either the complete old file or the
+    complete new build, never a half-written executable.
+    """
+    tmp = dst.with_name(dst.name + ".deploying.tmp")
+    copy2(src, tmp)
+    os.replace(tmp, dst)
+    return tmp
+
+
+def recover_tray_after_failure(
+    *,
+    ps_fn: Callable[..., subprocess.CompletedProcess[str]],
+    copy2: Callable[[Path, Path], object],
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+    guard: WindowsPowerGuard,
+    dst: Path,
+    prev: Path,
+    win_dst: str,
+) -> None:
+    """Best-effort tray recovery while the power guard is still held.
+
+    Runs whenever the deploy failed after the old tray was stopped: restore
+    the backup if the target executable is missing or clearly broken, restart
+    the tray and confirm liveness. The caller releases the guard in its
+    finally regardless of the recovery outcome, so no helper process is
+    leaked; a failing recovery only turns the deploy exit into a clear error.
+    """
+    if not dst.is_file() or dst.stat().st_size == 0:
+        if not prev.is_file():
+            raise SystemExit("recovery failed: tray exe missing and no backup available")
+        copy2(prev, dst)
+    start = ps_fn(f"Start-Process -FilePath '{win_dst}'", timeout=30.0)
+    if start.returncode != 0:
+        raise SystemExit(f"recovery start failed: {start.stderr or start.stdout}")
+    try:
+        wait_for_tray_alive(
+            ps_fn=ps_fn, sleep=sleep, clock=clock, liveness_timeout=RECOVERY_LIVENESS_TIMEOUT
+        )
+    except SystemExit as exc:
+        raise SystemExit(f"recovery failed: {exc}") from exc
+    guard.ensure_active(stage="recovery")
 
 
 def main(
@@ -382,26 +434,45 @@ def main(
         if leftover not in {"", "0"}:
             raise SystemExit(f"tray still running after stop: {leftover}")
         guard.ensure_active(stage="replace")
-        if dst.exists():
-            copy2(dst, prev)
-        copy2(src, dst)
-        start = ps_fn(f"Start-Process -FilePath '{win_dst}'", timeout=30.0)
-        if start.returncode != 0:
-            raise SystemExit(f"start failed: {start.stderr or start.stdout}")
-        guard.ensure_active(stage="handover")
-        pid = wait_for_tray_alive(ps_fn=ps_fn, sleep=sleep, clock=clock)
-        guard.ensure_active(stage="liveness")
-        sleep(OVERLAP_AFTER_LIVE)
-        # The replacement must still run after the overlap window while the
-        # guard is held; report failure instead of a dead PID as success.
-        confirm = ps_fn(
-            "Get-Process -Name 'Herdr-Nachtwaechter' -ErrorAction SilentlyContinue | "
-            "Select-Object -First 1 -ExpandProperty Id",
-            timeout=30.0,
-        )
-        if not (confirm.stdout or "").strip():
-            raise SystemExit("tray exited during overlap window")
-        guard.ensure_active(stage="overlap")
+        try:
+            if dst.exists():
+                copy2(dst, prev)
+            staged_replace(src, dst, copy2)
+            start = ps_fn(f"Start-Process -FilePath '{win_dst}'", timeout=30.0)
+            if start.returncode != 0:
+                raise SystemExit(f"start failed: {start.stderr or start.stdout}")
+            guard.ensure_active(stage="handover")
+            pid = wait_for_tray_alive(ps_fn=ps_fn, sleep=sleep, clock=clock)
+            guard.ensure_active(stage="liveness")
+            sleep(OVERLAP_AFTER_LIVE)
+            # The replacement must still run after the overlap window while
+            # the guard is held; report failure instead of a dead PID.
+            confirm = ps_fn(
+                "Get-Process -Name 'Herdr-Nachtwaechter' -ErrorAction SilentlyContinue | "
+                "Select-Object -First 1 -ExpandProperty Id",
+                timeout=30.0,
+            )
+            if not (confirm.stdout or "").strip():
+                raise SystemExit("tray exited during overlap window")
+            guard.ensure_active(stage="overlap")
+        except BaseException as exc:
+            # Every failure after Stop-Process leaves the machine without a
+            # tray; restart it while the guard is still protecting the hand
+            # over, then surface the original deploy error. The with-block
+            # always releases the guard, so no helper process is orphaned.
+            try:
+                recover_tray_after_failure(
+                    ps_fn=ps_fn, copy2=copy2, sleep=sleep, clock=clock, guard=guard,
+                    dst=dst, prev=prev, win_dst=win_dst,
+                )
+            except SystemExit as recovery_exc:
+                print(
+                    f"deploy failed ({exc}) and tray recovery failed: {recovery_exc}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"deploy failed ({exc}); tray was recovered and restarted", file=sys.stderr)
+            raise
     print(f"deployed pid={pid} bytes={dst.stat().st_size}")
     return 0
 
