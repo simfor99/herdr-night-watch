@@ -172,6 +172,14 @@ impl PoolReach {
 
     /// Standby-Karte, unten rechts: `Pool-Pace: X.XXx · +Xh Puffer` bzw. `-Xh Lücke` bei Defizit.
     pub fn pace_text(&self, language: Language) -> String {
+        // Leerer Pool (Reichweite 0, etwa unter der Notreserve): keine Division, sondern ein fester Text.
+        if self.finite_runway().is_some_and(|days| days <= 1e-6) {
+            let gap = self.days_to_refill.max(0.0);
+            return match language {
+                Language::German => format!("Pool erschöpft · -{gap:.1}d Lücke"),
+                Language::English => format!("Pool exhausted · -{gap:.1}d gap"),
+            };
+        }
         let (pace, buffer) = match self.finite_runway() {
             Some(days) => (self.days_to_refill / days, days - self.days_to_refill),
             None => (0.0, f32::INFINITY),
@@ -5296,6 +5304,25 @@ mod track56_pool_pacing_tests {
         assert!(!reach.covered);
         assert_eq!(reach.tone(), PoolTone::Tight, "Hälfte der Restzeit getragen, also gelb");
         assert!(reach.pace_text(Language::German).contains("Lücke"), "{}", reach.pace_text(Language::German));
+    }
+
+    #[test]
+    fn pace_text_never_shows_infinity_or_nan_when_the_pool_is_empty() {
+        for days_to_refill in [5.7_f32, 0.0] {
+            let reach = PoolReach {
+                runway_days: 0.0,
+                days_to_refill,
+                refill_epoch: NOW + (days_to_refill * DAY) as i64,
+                computed_at_epoch: NOW,
+                covered: false,
+                active_label: None,
+            };
+            for language in [Language::German, Language::English] {
+                let text = reach.pace_text(language);
+                assert!(!text.contains("inf"), "{text}");
+                assert!(!text.contains("NaN"), "{text}");
+            }
+        }
     }
 
     #[test]
