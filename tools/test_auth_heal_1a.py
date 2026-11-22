@@ -177,7 +177,10 @@ def _quota(env, *, updated, auth="ok", active="a"):
     reg_path.write_text(json.dumps(reg), encoding="utf-8")
     snap = {"version": 1, "updated_epoch": updated, "providers": {"agy": {
         "active_account": active, "switch_epoch": SWITCH_EPOCH,
-        "accounts": [{"id": active, "auth_state": auth}]}}}
+        "accounts": [{"id": active, "auth_state": auth, "lanes": {
+            lane: {"five_hour_pct": None, "five_hour_reset": None, "weekly_pct": None, "weekly_reset": None}
+            for lane in env.adapter.lanes
+        }}]}}}
     (env.state / "quotas.json").write_text(json.dumps(snap), encoding="utf-8")
 
 
@@ -382,10 +385,38 @@ PS_SITES = {
 }
 
 
-def _is_subprocess_call(node):
-    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"run", "check_output", "Popen", "call"}
-            and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess")
+def _is_subprocess_call(node, aliases=frozenset()):
+    if not isinstance(node, ast.Call):
+        return False
+    if isinstance(node.func, ast.Attribute) and node.func.attr in {"run", "check_output", "Popen", "call"}:
+        return isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess"
+    return isinstance(node.func, ast.Name) and node.func.id in aliases
+
+
+def _fn_subprocess_aliases(fn):
+    """Parameter der Funktion, deren Default direkt auf subprocess.{run,Popen,...} verweist."""
+    aliases = set()
+    pos_args = list(fn.args.posonlyargs) + list(fn.args.args)
+    pairs = list(zip(pos_args[len(pos_args) - len(fn.args.defaults):], fn.args.defaults))
+    pairs += list(zip(fn.args.kwonlyargs, fn.args.kw_defaults))
+    for arg, default in pairs:
+        if (isinstance(default, ast.Attribute) and isinstance(default.value, ast.Name)
+                and default.value.id == "subprocess"
+                and default.attr in {"run", "check_output", "Popen", "call"}):
+            aliases.add(arg.arg)
+    return aliases
+
+
+def _fn_default_constants(fn):
+    """Konstante Parameter-Defaults der Funktion (z. B. timeout: float = 30.0)."""
+    constants = {}
+    pos_args = list(fn.args.posonlyargs) + list(fn.args.args)
+    pairs = list(zip(pos_args[len(pos_args) - len(fn.args.defaults):], fn.args.defaults))
+    pairs += list(zip(fn.args.kwonlyargs, fn.args.kw_defaults))
+    for arg, default in pairs:
+        if isinstance(default, ast.Constant):
+            constants[arg.arg] = default.value
+    return constants
 
 
 def _source_under_test(name):
@@ -405,11 +436,14 @@ def _powershell_calls(name):
     tree = ast.parse(src)
     sites = []
     for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        aliases = _fn_subprocess_aliases(fn)
         for node in ast.walk(fn):
-            if _is_subprocess_call(node):
+            if _is_subprocess_call(node, aliases):
                 segment = ast.get_source_segment(src, node) or ""
                 if "powershell" in segment.lower() or fn.name == "run_powershell":
-                    sites.append((fn.name, node))
+                    # Der Funktionsknoten selbst statt einer nach Namen geschlüsselten Map: gleichnamige
+                    # oder verschachtelte Funktionen dürfen die Defaults nicht vermischt auflösen.
+                    sites.append((fn, node))
     return sites
 
 
@@ -459,9 +493,10 @@ def test_every_powershell_call_sets_stdin_and_timeout(name):
     constants = _module_constants(src)
     sites = _powershell_calls(name)
     assert sites, f"{name}: kein powershell-Aufruf gefunden (Prüfung wäre leer)"
-    for fn_name, node in sites:
-        reasons = _unsafe_powershell_reasons(node, constants)
-        assert reasons == [], f"{name}:{fn_name}: {reasons}"
+    for fn, node in sites:
+        scope = {**constants, **_fn_default_constants(fn)}
+        reasons = _unsafe_powershell_reasons(node, scope)
+        assert reasons == [], f"{name}:{fn.name}: {reasons}"
 
 
 def test_named_none_timeout_is_rejected_like_the_literal_none():
