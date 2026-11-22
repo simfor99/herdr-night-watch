@@ -8820,7 +8820,13 @@ fn render_quota_tooltip(
                     } else {
                         egui::Color32::from_rgb(252, 165, 165)
                     };
-                    ui.colored_label(pace_color, forecast.five_hour_pace_text(language));
+                    let standby_hint = (!quota.is_active_account && quota.five_hour_confirmed_exhausted)
+                        .then(|| quota.pool_reach.as_ref().map(|reach| reach.standby_hint_text(language)))
+                        .flatten();
+                    ui.colored_label(
+                        pace_color,
+                        standby_hint.clone().unwrap_or_else(|| forecast.five_hour_pace_text(language)),
+                    );
                     ui.end_row();
 
                     ui.label(egui::RichText::new(language.text("Reichweite:", "Runway:")).color(egui::Color32::from_rgb(148, 163, 184)));
@@ -8829,7 +8835,12 @@ fn render_quota_tooltip(
                     } else {
                         egui::Color32::from_rgb(56, 189, 248)
                     };
-                    ui.colored_label(rw_color, forecast.five_hour_runway_text(language));
+                    let runway_text = if standby_hint.is_some() {
+                        String::new()
+                    } else {
+                        forecast.five_hour_runway_text(language)
+                    };
+                    ui.colored_label(rw_color, runway_text);
                     ui.end_row();
 
                     ui.label(egui::RichText::new(language.text("Reserve-Lage:", "Reserve status:")).color(egui::Color32::from_rgb(148, 163, 184)));
@@ -8879,6 +8890,9 @@ fn render_quota_tooltip(
             ui.label(egui::RichText::new(title_wk).strong().color(egui::Color32::from_rgb(226, 232, 240)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.colored_label(egui::Color32::from_rgb(157, 196, 118), format!("{pct}% {}", language.text("verfügbar", "remaining")));
+                if let Some(reach) = quota.pool_reach.as_ref().filter(|_| !quota.is_active_account) {
+                    ui.colored_label(pool_tone_color(reach.tone()), reach.runway_text(language));
+                }
             });
         });
 
@@ -8894,7 +8908,14 @@ fn render_quota_tooltip(
                 } else {
                     format!("{phrase} ({reset_str})")
                 };
-                ui.label(label_text);
+                if let Some(reach) = quota.pool_reach.as_ref().filter(|_| !quota.is_active_account) {
+                    ui.horizontal(|ui| {
+                        ui.label(label_text);
+                        ui.colored_label(pool_tone_color(reach.tone()), reach.pace_text(language));
+                    });
+                } else {
+                    ui.label(label_text);
+                }
                 ui.end_row();
 
                 if let Some(ratio) = forecast.pace_ratio {
@@ -10801,5 +10822,14 @@ mod tests {
         assert_eq!(provider_palette_color(0), PROVIDER_PASTEL_PALETTE[0].color);
         assert_eq!(provider_palette_color(9), PROVIDER_PASTEL_PALETTE[9].color);
         assert_eq!(provider_palette_color(10), PROVIDER_PASTEL_PALETTE[0].color);
+    }
+}
+
+/// Farbe der Pool-Ampel: grün (trägt bis Reset), gelb (knapp), rot (leer vor Reset).
+fn pool_tone_color(tone: crate::quota::PoolTone) -> egui::Color32 {
+    match tone {
+        crate::quota::PoolTone::Covered => egui::Color32::from_rgb(120, 184, 134),
+        crate::quota::PoolTone::Tight => egui::Color32::from_rgb(253, 224, 71),
+        crate::quota::PoolTone::Critical => egui::Color32::from_rgb(252, 165, 165),
     }
 }
