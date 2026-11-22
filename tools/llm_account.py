@@ -18,10 +18,12 @@ import contextlib
 import copy
 import fcntl
 import json
+import math
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,6 +39,11 @@ AUTH_UNAVAILABLE = "unavailable"
 
 FLOOR_PCT = 15
 FEFO_FIVE_HOUR_MIN_PCT = 10
+DRAIN_ZERO_THRESHOLD_PCT = 1
+FEFO_RETURN_FIVE_HOUR_MIN_PCT = 20
+AUTO_SWITCH_WALLCLOCK_BUDGET_S = 120.0
+AUTO_SWITCH_STALE_CACHE_MAX_AGE_S = 120.0
+AUTO_SWITCH_BOUNCE_LOCK_FILE = "auto-switch-bounce.lock"
 USAGE_TIMEOUT_S = 12
 DEFAULT_AGY_BIN = str(Path.home() / ".local" / "bin" / "agy")
 DEFAULT_STATE_DIR = "~/.local/state/llm-accounts"
@@ -255,14 +262,55 @@ def switch_lock() -> Iterator[None]:
 # ---------------------------------------------------------------------------
 
 
+def _read_json_nofollow(path: Path) -> dict[str, Any] | None:
+    """Liest JSON strikt über O_NOFOLLOW + O_NONBLOCK + S_ISREG.
+
+    Verweigert Symlinks, Nicht-Dateien und defektes JSON; O_NONBLOCK verhindert Blockade an einer FIFO,
+    die statt einer regulären Datei gelegt wurde (die S_ISREG-Prüfung verwirft sie dann fail-closed).
+    """
+    fd = -1
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            fd = -1
+            data = json.load(fh)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    finally:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    return data if isinstance(data, dict) else None
+
+
+def _read_quotas_snapshot_safe(path: Path | None = None) -> dict[str, Any] | None:
+    return _read_json_nofollow(path or (state_dir() / QUOTA_SNAPSHOT_FILE))
+
+
 def load_registry() -> dict[str, Any]:
     path = state_dir() / "accounts.json"
-    if not path.exists():
-        return {"version": 1, "providers": {}}
+    fd = -1
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise CliError("accounts.json ist keine reguläre Datei.", 3)
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            fd = -1
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {"version": 1, "providers": {}}
+    except CliError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise CliError(f"accounts.json ist nicht lesbar: {exc}", 3) from exc
+    finally:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    if not isinstance(data, dict):
+        raise CliError("accounts.json hat unerwartetes Format.", 3)
     data.setdefault("providers", {})
     return data
 
@@ -685,54 +733,67 @@ def cmd_login(adapter: AgyAdapter, slot: str, label: str | None) -> str:
     return f"Slot {slot} ({email}) angemeldet und registriert. Das aktive Konto blieb unverändert."
 
 
+def _switch_slot_locked(adapter: AgyAdapter, slot: str) -> dict[str, Any]:
+    """Kernlogik für den Kontowechsel. Vorbedingung: switch_lock() wird bereits vom Aufrufer gehalten."""
+    reg = load_registry()
+    target = find_slot(provider_block(reg, adapter), slot)
+    if target is None:
+        raise CliError(f"Unbekannter Slot {slot}.", 4)
+    if target.get("state") != ACTIVE:
+        raise CliError(f"Slot {slot} ist retired und kann nicht aktiviert werden.", 4)
+    pdir = profile_root(adapter, slot)
+    if not (pdir / adapter.token_rel).exists():
+        raise CliError(f"Profil {slot} ist unvollständig; zuerst save oder login ausführen.", 3)
+    heal_result = heal_locked(adapter)
+    if heal_result == "unreadable":
+        raise CliError("Live-Token ist nicht lesbar; Wechsel abgebrochen.", 3)
+    reg = load_registry()
+    block = provider_block(reg, adapter)
+    previous = block.get("active_account")
+    # Vor dem Kopieren prüfen: stimmen die Live-Dateien nach heal bereits mit dem Slot überein?
+    unchanged = previous == slot and _live_matches_profile(adapter, pdir)
+    # Ziel vollständig lesen, bevor die Live-Dateien angefasst werden; alte Live-Dateien für ein Zurücksetzen sichern.
+    target_token = _read_or_none(pdir / adapter.token_rel)
+    target_scope = _read_or_none(pdir / adapter.scope_rel)
+    if target_token is None:
+        raise CliError(f"Profil {slot} ist unvollständig; Token nicht lesbar. Wechsel abgebrochen.", 3)
+    if (pdir / adapter.scope_rel).exists() and target_scope is None:
+        raise CliError(f"Profil {slot} hat einen nicht lesbaren Scope. Wechsel abgebrochen.", 3)
+    old_token = _read_or_none(live_home() / adapter.token_rel)
+    old_scope = _read_or_none(live_home() / adapter.scope_rel)
+    try:
+        install_profile_to_live(adapter, pdir)
+        block["active_account"] = slot
+        if not unchanged:
+            block["switch_epoch"] = time.time()  # unveränderte Panes dürfen nicht als veraltet gelten
+        save_registry(reg)
+    except BaseException:
+        _restore_live(adapter, old_token, old_scope)
+        raise
+    removed = invalidate_caches()
+    log_event(
+        "switch",
+        provider=adapter.name,
+        from_slot=previous,
+        to_slot=slot,
+        heal=heal_result,
+        caches_removed=len(removed),
+    )
+    return {
+        "previous": previous,
+        "slot": slot,
+        "heal": heal_result,
+        "unchanged": unchanged,
+        "switch_epoch": block.get("switch_epoch"),
+        "caches_removed": len(removed),
+    }
+
+
 def cmd_use(adapter: AgyAdapter, slot: str) -> str:
     validate_slot(slot)
     with switch_lock():
-        reg = load_registry()
-        target = find_slot(provider_block(reg, adapter), slot)
-        if target is None:
-            raise CliError(f"Unbekannter Slot {slot}.", 4)
-        if target.get("state") != ACTIVE:
-            raise CliError(f"Slot {slot} ist retired und kann nicht aktiviert werden.", 4)
-        pdir = profile_root(adapter, slot)
-        if not (pdir / adapter.token_rel).exists():
-            raise CliError(f"Profil {slot} ist unvollständig; zuerst save oder login ausführen.", 3)
-        heal_result = heal_locked(adapter)
-        if heal_result == "unreadable":
-            raise CliError("Live-Token ist nicht lesbar; Wechsel abgebrochen.", 3)
-        reg = load_registry()
-        block = provider_block(reg, adapter)
-        previous = block.get("active_account")
-        # Vor dem Kopieren prüfen: stimmen die Live-Dateien nach heal bereits mit dem Slot überein?
-        unchanged = previous == slot and _live_matches_profile(adapter, pdir)
-        # Ziel vollständig lesen, bevor die Live-Dateien angefasst werden; alte Live-Dateien für ein Zurücksetzen sichern.
-        target_token = _read_or_none(pdir / adapter.token_rel)
-        target_scope = _read_or_none(pdir / adapter.scope_rel)
-        if target_token is None:
-            raise CliError(f"Profil {slot} ist unvollständig; Token nicht lesbar. Wechsel abgebrochen.", 3)
-        if (pdir / adapter.scope_rel).exists() and target_scope is None:
-            raise CliError(f"Profil {slot} hat einen nicht lesbaren Scope. Wechsel abgebrochen.", 3)
-        old_token = _read_or_none(live_home() / adapter.token_rel)
-        old_scope = _read_or_none(live_home() / adapter.scope_rel)
-        try:
-            install_profile_to_live(adapter, pdir)
-            block["active_account"] = slot
-            if not unchanged:
-                block["switch_epoch"] = time.time()  # unveränderte Panes dürfen nicht als veraltet gelten
-            save_registry(reg)
-        except BaseException:
-            _restore_live(adapter, old_token, old_scope)
-            raise
-        removed = invalidate_caches()
-        log_event(
-            "switch",
-            provider=adapter.name,
-            from_slot=previous,
-            to_slot=slot,
-            heal=heal_result,
-            caches_removed=len(removed),
-        )
-    return f"Aktives Konto gewechselt: {previous or '-'} -> {slot}."
+        info = _switch_slot_locked(adapter, slot)
+    return f"Aktives Konto gewechselt: {info['previous'] or '-'} -> {slot}."
 
 
 def _read_or_none(path: Path) -> bytes | None:
@@ -956,10 +1017,17 @@ def build_snapshot(
     return {"version": 1, "updated_epoch": int(now), "heal": heal_result, "providers": {adapter.name: provider_out}}
 
 
-def fetch_provider_status(adapter: AgyAdapter, *, write_quotas: bool = False, now: float | None = None) -> dict[str, Any]:
+def fetch_provider_status(
+    adapter: AgyAdapter,
+    *,
+    write_quotas: bool = False,
+    now: float | None = None,
+    heal: bool = True,
+) -> dict[str, Any]:
     current = time.time() if now is None else now
     with switch_lock():
-        heal_result = heal_locked(adapter)
+        # heal=False bleibt rein lesend (Dry-Run): heal_locked würde Live-Token und Profile verändern.
+        heal_result = heal_locked(adapter) if heal else heal_preview(adapter)
         block = copy.deepcopy(provider_block(load_registry(), adapter))
     # Probes laufen bewusst ohne Lock: agy -p /usage kann bis 12 s dauern.
     active_slots = [s for s in block["slots"] if s.get("state") == ACTIVE]
@@ -1121,7 +1189,7 @@ PROTECTED_TAB_PREFIXES = ("vermarkter", "design studio", "architekt", "senior-ar
 # AUTH-HEAL-1a: menschliche Diskussions-Tabs sind immer gesperrt, Architekten-Tabs nur beim 401-Grund.
 HUMAN_PROTECTED_TAB_PREFIXES = ("vermarkter", "design studio")
 ARCHITEKT_TAB_PREFIXES = ("architekt", "senior-architekt", "eskalations-architekt")
-BOUNCE_REASONS = ("switch_epoch", "auth_401", "manual")
+BOUNCE_REASONS = ("switch_epoch", "auth_401", "quota_reached", "manual")
 QUOTA_SNAPSHOT_FILE = "quotas.json"
 QUOTA_MAX_AGE_S = 300.0
 ANTI_LOOP_COOLDOWN_S = 1800.0
@@ -1135,6 +1203,7 @@ AUTH_401_RE = re.compile(
     r"|UNAUTHENTICATED|invalid_grant|Unauthorized",
     re.IGNORECASE,
 )
+QUOTA_REACHED_RE = re.compile(r"Individual quota reached", re.IGNORECASE)
 REPLAY_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
 BRIEFKASTEN_DEFAULT = "~/.local/state/herdr/briefkasten"
 
@@ -1306,18 +1375,26 @@ def statusline_active(screen: str) -> bool:
 
 
 def _load_anti_loop_state() -> dict[str, Any]:
-    """Liest den Cooldown-Zustand ohne Seiteneffekte; ein fehlendes State-Verzeichnis ist ein leerer Zustand."""
+    """Liest den Cooldown-Zustand über O_NOFOLLOW + O_NONBLOCK; ein fehlendes State-Verzeichnis ist leer."""
     path = state_dir() / ANTI_LOOP_STATE_FILE
+    fd = -1
     try:
-        text = path.read_text(encoding="utf-8")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise CliError(f"{ANTI_LOOP_STATE_FILE} ist keine reguläre Datei.", 3)
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            fd = -1
+            data = json.load(fh)
     except FileNotFoundError:
         return {}
-    except OSError as exc:
+    except CliError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise CliError(f"{ANTI_LOOP_STATE_FILE} nicht lesbar: {exc}", 3) from exc
-    try:
-        data = json.loads(text)
-    except ValueError as exc:
-        raise CliError(f"{ANTI_LOOP_STATE_FILE} nicht lesbar: {exc}", 3) from exc
+    finally:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
     if not isinstance(data, dict):
         raise CliError(f"{ANTI_LOOP_STATE_FILE} hat unerwartetes Format.", 3)
     return data
@@ -1393,14 +1470,14 @@ def disk_token_blockers(adapter: AgyAdapter, now: float | None = None, reason: s
 
     Immer blockiert: unlesbares Live-Token, abgelaufenes oder unlesbares Ablaufdatum, quotas.json mit
     veraltetem Stand (> 300 s), unlesbarem Inhalt, fehlendem aktiven Slot oder auth_state ungleich ok.
-    Bei reason auth_401 zusätzlich fail-closed: jeder heal_preview-Wert außer den gesunden Fällen
-    (also no_live_token, no_active, unknown_active) und eine fehlende quotas.json.
+    Bei reason auth_401 und quota_reached zusätzlich fail-closed: jeder heal_preview-Wert außer den gesunden
+    Fällen (also no_live_token, no_active, unknown_active) und eine fehlende quotas.json.
     Bei switch_epoch bleibt ein fehlendes Live-Token kein Blocker, weil heal es als gültiges Ergebnis führt.
     """
     blockers: list[str] = []
     current = time.time() if now is None else now
     preview = heal_preview(adapter)
-    strict = reason == "auth_401"
+    strict = reason in {"auth_401", "quota_reached"}
     if preview == "unreadable":
         blockers.append("disk_token_unhealthy:unreadable")
     elif strict and preview not in HEAL_PREVIEWS_HEALTHY:
@@ -1410,15 +1487,19 @@ def disk_token_blockers(adapter: AgyAdapter, now: float | None = None, reason: s
         if expiry_blocker:
             blockers.append(expiry_blocker)
     quota = state_dir() / QUOTA_SNAPSHOT_FILE
-    if not quota.exists():
+    if not quota.exists() and not quota.is_symlink():
         if strict:
             blockers.append("disk_token_unhealthy:quotas_fehlt")
         return blockers
+    snap = _read_quotas_snapshot_safe(quota)
+    if snap is None:
+        return blockers + ["disk_token_unhealthy:quotas_unlesbar"]
     try:
-        snap = json.loads(quota.read_text(encoding="utf-8"))
         updated = float(snap["updated_epoch"])
         provider = snap["providers"][adapter.name]
-    except (OSError, ValueError, KeyError, TypeError):
+    except (KeyError, TypeError, ValueError):
+        return blockers + ["disk_token_unhealthy:quotas_unlesbar"]
+    if not isinstance(provider, dict):
         return blockers + ["disk_token_unhealthy:quotas_unlesbar"]
     if current - updated > QUOTA_MAX_AGE_S:
         blockers.append("disk_token_unhealthy:quotas_veraltet")
@@ -1429,12 +1510,21 @@ def disk_token_blockers(adapter: AgyAdapter, now: float | None = None, reason: s
             provider.get("switch_epoch") != reg_block.get("switch_epoch"):
         blockers.append("disk_token_unhealthy:quotas_anderes_konto")
         return blockers
+    accounts = provider.get("accounts")
+    if not isinstance(accounts, list) or any(
+        not isinstance(a, dict) or not isinstance(a.get("id"), str) for a in accounts
+    ):
+        return blockers + ["disk_token_unhealthy:quotas_unlesbar"]
     active = provider.get("active_account")
-    account = next((a for a in provider.get("accounts", []) if a.get("id") == active), None)
+    account = next((a for a in accounts if a.get("id") == active), None)
     if account is None:
         blockers.append("disk_token_unhealthy:aktiver_slot_fehlt")
-    elif account.get("auth_state") != AUTH_OK:
-        blockers.append(f"disk_token_unhealthy:auth_{account.get('auth_state')}")
+    else:
+        lanes = account.get("lanes")
+        if not isinstance(lanes, dict) or not isinstance(lanes.get(adapter.primary_lane), dict):
+            return blockers + ["disk_token_unhealthy:quotas_unlesbar"]
+        if account.get("auth_state") != AUTH_OK:
+            blockers.append(f"disk_token_unhealthy:auth_{account.get('auth_state')}")
     return blockers
 
 
@@ -1448,6 +1538,12 @@ def conversation_collision(root: Path, conversation: str | None, pid: int) -> bo
 def auth_401_evidence(screen: str) -> bool:
     tail = [line for line in screen.splitlines() if line.strip()][-15:]
     return any(AUTH_401_RE.search(line) for line in tail)
+
+
+def quota_reached_evidence(screen: str) -> bool:
+    """Prüft die letzten 15 nicht-leeren Zeilen analog auth_401_evidence auf Individual quota reached."""
+    tail = [line for line in screen.splitlines() if line.strip()][-15:]
+    return any(QUOTA_REACHED_RE.search(line) for line in tail)
 
 
 def briefkasten_unread(pane_id: str) -> int | None:
@@ -1481,12 +1577,14 @@ def guard_blockers(
         blockers.append("tab_schutz_unbekannt")
     if human_protected_tab(label):
         blockers.append("protected_human_tab")
-    elif architekt_tab(label) and reason != "auth_401":
+    elif architekt_tab(label) and reason not in {"auth_401", "quota_reached"}:
         blockers.append("protected_architekt_tab")
-    if reason == "auth_401" and not source:
+    if reason in {"auth_401", "quota_reached"} and not source:
         blockers.append("zielbindung_quelle_fehlt")
     if reason == "auth_401" and not auth_401_evidence(screen):
         blockers.append("auth_401_nicht_belegt")
+    if reason == "quota_reached" and not quota_reached_evidence(screen):
+        blockers.append("quota_reached_nicht_belegt")
     blockers += focus_blockers(pane, allow_focused)
     descendants = find_active_descendants(root, pid)
     if descendants:
@@ -1683,8 +1781,8 @@ def execute_bounce(adapter: AgyAdapter, plan: dict[str, Any], herdr: Any, *, pro
     fresh = _fresh_blockers(adapter, plan, herdr, root)
     if fresh:
         raise CliError("Live-Vorbedingung verletzt, fail-closed, kein /exit: " + "; ".join(fresh), 4)
-    # Bedingung 4c: außer beim eindeutigen 401-Beleg muss die Pane über zwei Messungen unverändert ruhen.
-    if plan["reason"] != "auth_401":
+    # Bedingung 4c: außer beim eindeutigen 401- oder quota_reached-Beleg muss die Pane über zwei Messungen ruhen.
+    if plan["reason"] not in {"auth_401", "quota_reached"}:
         first = _quiet_snapshot(herdr, pane_id, root, plan["pid"])
         if quiet_recheck_s > 0:
             time.sleep(quiet_recheck_s)
@@ -2005,6 +2103,75 @@ def _ensure_timer_wants_link(target: Path, timer_name: str) -> str:
     return "angelegt"
 
 
+AUTOSWITCH_TIMER_MIN_INTERVAL = 15
+AUTOSWITCH_TIMER_MAX_INTERVAL = 3600
+
+
+def _activate_systemd_timer(
+    target: Path,
+    service_name: str,
+    timer_name: str,
+    activate: bool,
+) -> tuple[bool, str | None, str]:
+    custom_dir = target.resolve() != Path(DEFAULT_UNIT_DIR).expanduser().resolve()
+    service_abs = (target / service_name).resolve()
+    timer_abs = (target / timer_name).resolve()
+    if custom_dir:
+        activation_command = (
+            f"systemctl --user link {shlex.quote(str(service_abs))} && "
+            f"systemctl --user enable --now {shlex.quote(str(timer_abs))}"
+        )
+    else:
+        activation_command = f"systemctl --user enable --now {timer_name}"
+
+    activated = False
+    systemctl_error: str | None = None
+    if activate:
+        try:
+            _systemctl_user(["daemon-reload"])
+            if custom_dir:
+                _systemctl_user(["link", str(service_abs)])
+                _systemctl_user(["enable", "--now", str(timer_abs)])
+            else:
+                _systemctl_user(["enable", "--now", timer_name])
+            activated = True
+        except CliError as exc:
+            systemctl_error = str(exc)
+    return activated, systemctl_error, activation_command
+
+
+def _inotify_warning(limit: int | None) -> str | None:
+    if limit is not None and limit < 512:
+        return (
+            f"fs.inotify.max_user_instances={limit} ist niedrig (< 512); Timer selbst braucht 0 "
+            "inotify-Instanzen, Host-sysctl sollte trotzdem auf >= 4096 erhöht werden."
+        )
+    return None
+
+
+def _format_timer_result(
+    result: dict[str, Any],
+    *,
+    target: Path,
+    interval: int,
+    activate: bool,
+    as_json: bool,
+) -> str:
+    if as_json:
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    lines = [f"Timer geschrieben nach {target} ({interval} s)."]
+    if activate and result["systemctl_error"] is None:
+        lines.append("Timer aktiviert.")
+    elif activate:
+        lines.append(f"Live-Aktivierung NICHT erfolgt: {result['systemctl_error']}")
+        lines.append(f"Nachholen mit: {result['activation_command']}")
+    else:
+        lines.append(f"Nicht aktiviert; aktivieren mit: {result['activation_command']}")
+    if result.get("inotify_warning"):
+        lines.append(f"Warnung: {result['inotify_warning']}")
+    return "\n".join(lines)
+
+
 def cmd_install_heal_timer(
     adapter: AgyAdapter,
     interval: int,
@@ -2041,35 +2208,10 @@ def cmd_install_heal_timer(
     # Fremde Unit samt ihrer Wants-Links unberührt lassen.
     removed_wants = [] if legacy_foreign else _remove_legacy_wants_links(target, legacy_name)
     timer_link = _ensure_timer_wants_link(target, timer_name)
-
-    custom_dir = target.resolve() != Path(DEFAULT_UNIT_DIR).expanduser().resolve()
-    service_abs = (target / service_name).resolve()
-    timer_abs = (target / timer_name).resolve()
-    if custom_dir:
-        activation_command = f"systemctl --user link {service_abs} && systemctl --user enable --now {timer_abs}"
-    else:
-        activation_command = f"systemctl --user enable --now {timer_name}"
-
-    activated = False
-    systemctl_error: str | None = None
-    if activate:
-        try:
-            _systemctl_user(["daemon-reload"])
-            if custom_dir:
-                _systemctl_user(["link", str(service_abs)])
-                _systemctl_user(["enable", "--now", str(timer_abs)])
-            else:
-                _systemctl_user(["enable", "--now", timer_name])
-            activated = True
-        except CliError as exc:
-            systemctl_error = str(exc)
-
-    warning = None
-    if limit is not None and limit < 512:
-        warning = (
-            f"fs.inotify.max_user_instances={limit} ist niedrig (< 512); Timer selbst braucht 0 "
-            "inotify-Instanzen, Host-sysctl sollte trotzdem auf >= 4096 erhöht werden."
-        )
+    activated, systemctl_error, activation_command = _activate_systemd_timer(
+        target, service_name, timer_name, activate
+    )
+    warning = _inotify_warning(limit)
 
     result = {
         "provider": adapter.name,
@@ -2085,19 +2227,781 @@ def cmd_install_heal_timer(
         "inotify_max_user_instances": limit,
         "inotify_warning": warning,
     }
+    return _format_timer_result(result, target=target, interval=interval, activate=activate, as_json=as_json)
+
+
+# ---------------------------------------------------------------------------
+# auto-switch & install-autoswitch-timer (DRAIN-TO-ZERO + FEFO-Rückwechsel)
+# ---------------------------------------------------------------------------
+
+
+def _validate_finite_range(name: str, value: Any, low: float, high: float, *, integer: bool = False) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CliError(f"{name} muss eine Zahl sein (erhalten: {value!r}).", 2)
+    if integer and not isinstance(value, int):
+        raise CliError(f"{name} muss eine ganze Zahl sein (erhalten: {value!r}).", 2)
+    if not math.isfinite(value) or not (low <= value <= high):
+        raise CliError(f"{name} muss zwischen {low} und {high} liegen (erhalten: {value!r}).", 2)
+    return value
+
+
+def _validate_auto_switch_args(
+    max_quota_age: float,
+    cooldown: float,
+    max_bounces: int,
+    quiet_recheck: float,
+) -> tuple[float, float, int, float]:
+    age = float(_validate_finite_range("--max-quota-age", max_quota_age, 10, 3600))
+    cd = float(_validate_finite_range("--cooldown", cooldown, 0, 86400))
+    bounces = int(_validate_finite_range("--max-bounces", max_bounces, 0, 10, integer=True))
+    quiet = float(_validate_finite_range("--quiet-recheck", quiet_recheck, 0.0, 300.0))
+    return age, cd, bounces, quiet
+
+
+def _active_slot_ids(block: dict[str, Any]) -> list[str]:
+    return [s["id"] for s in block.get("slots", []) if isinstance(s, dict) and s.get("state") == ACTIVE]
+
+
+def _cache_snapshot_matches_block(
+    snap: dict[str, Any] | None,
+    adapter: AgyAdapter,
+    block: dict[str, Any],
+    now: float,
+    max_quota_age: float,
+) -> tuple[bool, float]:
+    if not isinstance(snap, dict) or snap.get("version") != 1:
+        return False, float("inf")
+    updated = snap.get("updated_epoch")
+    if isinstance(updated, bool) or not isinstance(updated, (int, float)) or not math.isfinite(updated):
+        return False, float("inf")
+    age = now - float(updated)
+    if age < 0 or age > max_quota_age or float(updated) > now + 60:
+        return False, age
+    providers = snap.get("providers")
+    if not isinstance(providers, dict):
+        return False, age
+    prov = providers.get(adapter.name)
+    if not isinstance(prov, dict):
+        return False, age
+    if prov.get("active_account") != block.get("active_account"):
+        return False, age
+    if prov.get("switch_epoch") != block.get("switch_epoch"):
+        return False, age
+    accounts = prov.get("accounts")
+    if not isinstance(accounts, list):
+        return False, age
+    for acc in accounts:
+        # Kaputte Struktur (kein dict, id kein str, Lane kein dict) ist ein Cache-Miss statt eines Crashes.
+        if not isinstance(acc, dict) or not isinstance(acc.get("id"), str):
+            return False, age
+        lanes = acc.get("lanes")
+        if not isinstance(lanes, dict) or not isinstance(lanes.get(adapter.primary_lane), dict):
+            return False, age
+    expected_ids = _active_slot_ids(block)
+    snap_ids = [acc["id"] for acc in accounts]
+    if set(snap_ids) != set(expected_ids) or len(snap_ids) != len(expected_ids):
+        return False, age
+    return True, age
+
+
+def _evaluate_auto_switch_decision(
+    accounts: list[dict[str, Any]],
+    active_slot: str | None,
+    lane: str,
+    *,
+    reactive_exhausted: bool = False,
+) -> dict[str, Any]:
+    active_accounts = [a for a in accounts if isinstance(a, dict) and a.get("state") == ACTIVE]
+
+    def _lane(acc: dict[str, Any]) -> dict[str, Any]:
+        lanes = acc.get("lanes")
+        return lanes.get(lane) or {} if isinstance(lanes, dict) else {}
+
+    def _pct(acc: dict[str, Any], field: str) -> int | float | None:
+        val = _lane(acc).get(field)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
+            return val
+        return None
+
+    def _weekly(acc: dict[str, Any]) -> int | float | None:
+        return _pct(acc, "weekly_pct")
+
+    def _five_hour(acc: dict[str, Any]) -> int | float | None:
+        return _pct(acc, "five_hour_pct")
+
+    def _reset(acc: dict[str, Any]) -> float | None:
+        return iso_to_epoch(_lane(acc).get("weekly_reset"))
+
+    def _ok(acc: dict[str, Any]) -> bool:
+        return (
+            acc.get("auth_state") == AUTH_OK
+            and _weekly(acc) is not None
+            and _five_hour(acc) is not None
+        )
+
+    def _drained(acc: dict[str, Any]) -> bool:
+        if not _ok(acc):
+            return True
+        return _weekly(acc) <= DRAIN_ZERO_THRESHOLD_PCT or _five_hour(acc) <= DRAIN_ZERO_THRESHOLD_PCT  # type: ignore[operator]
+
+    def _reserve_healthy(acc: dict[str, Any]) -> bool:
+        if not _ok(acc):
+            return False
+        return _weekly(acc) >= FLOOR_PCT and _five_hour(acc) >= FEFO_FIVE_HOUR_MIN_PCT  # type: ignore[operator]
+
+    def _fefo_return_ready(acc: dict[str, Any]) -> bool:
+        if not _ok(acc):
+            return False
+        return _weekly(acc) > DRAIN_ZERO_THRESHOLD_PCT and _five_hour(acc) >= FEFO_RETURN_FIVE_HOUR_MIN_PCT  # type: ignore[operator]
+
+    active_entry = next((a for a in active_accounts if a.get("id") == active_slot), None)
+    active_w = _weekly(active_entry) if active_entry is not None else None
+    active_h = _five_hour(active_entry) if active_entry is not None else None
+
+    def _result(
+        action: str,
+        *,
+        target: dict[str, Any] | None = None,
+        trigger_reason: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "action": action,
+            "target_slot": target.get("id") if target is not None else None,
+            "trigger_reason": trigger_reason,
+            "active_account": active_slot,
+            "active_weekly_pct": active_w,
+            "active_five_hour_pct": active_h,
+            "target_weekly_pct": _weekly(target) if target is not None else None,
+            "target_five_hour_pct": _five_hour(target) if target is not None else None,
+        }
+
+    # Pfad A: Aktives Konto muss verlassen werden.
+    if active_entry is None or _drained(active_entry) or reactive_exhausted:
+        if active_entry is None:
+            trigger = "active_slot_missing"
+        elif active_entry.get("auth_state") == AUTH_RELOGIN:
+            trigger = "auth_relogin_required"
+        elif not _ok(active_entry):
+            trigger = "auth_unavailable"
+        elif (active_w or 0) <= DRAIN_ZERO_THRESHOLD_PCT:
+            trigger = "weekly_exhausted"
+        elif (active_h or 0) <= DRAIN_ZERO_THRESHOLD_PCT:
+            trigger = "five_hour_exhausted"
+        else:
+            trigger = "reactive_quota_reached"
+
+        others = [(idx, a) for idx, a in enumerate(active_accounts) if a.get("id") != active_slot and _ok(a)]
+        tier1 = [(idx, a) for idx, a in others if _reserve_healthy(a)]
+        if tier1:
+            _, best = min(
+                tier1,
+                key=lambda item: (
+                    _reset(item[1]) if _reset(item[1]) is not None else float("inf"),
+                    -(_five_hour(item[1]) or 0),
+                    item[0],
+                ),
+            )
+            return _result("switch", target=best, trigger_reason=trigger)
+
+        tier2 = [
+            (idx, a)
+            for idx, a in others
+            if (_weekly(a) or 0) > DRAIN_ZERO_THRESHOLD_PCT and (_five_hour(a) or 0) > DRAIN_ZERO_THRESHOLD_PCT
+        ]
+        if not tier2:
+            return _result("all_slots_exhausted", trigger_reason=trigger)
+
+        active_must_leave = (
+            active_entry is None
+            or not _ok(active_entry)
+            or (active_w or 0) <= DRAIN_ZERO_THRESHOLD_PCT
+            or (active_h or 0) <= DRAIN_ZERO_THRESHOLD_PCT
+            or reactive_exhausted
+        )
+        if active_must_leave:
+            with_min_5h = [(idx, a) for idx, a in tier2 if (_five_hour(a) or 0) >= FEFO_FIVE_HOUR_MIN_PCT]
+            if with_min_5h:
+                _, best = min(
+                    with_min_5h,
+                    key=lambda item: (
+                        _reset(item[1]) if _reset(item[1]) is not None else float("inf"),
+                        -(_five_hour(item[1]) or 0),
+                        item[0],
+                    ),
+                )
+            else:
+                _, best = min(
+                    tier2,
+                    key=lambda item: (
+                        -(_five_hour(item[1]) or 0),
+                        _reset(item[1]) if _reset(item[1]) is not None else float("inf"),
+                        item[0],
+                    ),
+                )
+            return _result("switch", target=best, trigger_reason=trigger)
+
+        # Kein besserer Slot im Drain-Pfad: die FEFO-Rückwechselregeln (Pfad B) tragen die Hysterese
+        # über ihr 19-Punkte-Band (Rückkehr erst ab 20 %, Drain-Schwelle bei 1 %).
+        return _result("no_better_slot", trigger_reason=trigger)
+
+    # Pfad B: Aktives Konto ist nicht leer -> smarter FEFO-Rückwechsel auf früher verfallendes Konto.
+    active_reset = _reset(active_entry)
+    fefo_candidates = [
+        (idx, a)
+        for idx, a in enumerate(active_accounts)
+        if a.get("id") != active_slot
+        and _fefo_return_ready(a)
+        and _reset(a) is not None
+        and (active_reset is None or _reset(a) < active_reset)  # type: ignore[operator]
+    ]
+    if fefo_candidates:
+        _, best = min(
+            fefo_candidates,
+            key=lambda item: (
+                _reset(item[1]) if _reset(item[1]) is not None else float("inf"),
+                -(_five_hour(item[1]) or 0),
+                item[0],
+            ),
+        )
+        return _result("switch", target=best, trigger_reason="fefo_earlier_reset_ready")
+
+    # Pfad C: Aktives Konto bleibt gesund.
+    return _result("stay_healthy")
+
+
+def _sync_quotas_after_switch(
+    adapter: AgyAdapter,
+    snapshot: dict[str, Any],
+    *,
+    target_slot: str,
+    switch_epoch: float | None,
+    heal_result: str,
+) -> None:
+    updated_snap = copy.deepcopy(snapshot)
+    updated_snap["heal"] = heal_result
+    prov_out = updated_snap["providers"][adapter.name]
+    prov_out["active_account"] = target_slot
+    prov_out["switch_epoch"] = switch_epoch
+    for acc in prov_out.get("accounts", []):
+        if isinstance(acc, dict):
+            acc["is_active"] = acc.get("id") == target_slot
+    snap_epoch = float(updated_snap.get("updated_epoch") or time.time())
+    prov_out["effective"] = {
+        "lanes": {
+            lane: _effective_lane(prov_out.get("accounts", []), lane, target_slot, snap_epoch)
+            for lane in adapter.lanes
+        }
+    }
+    atomic_write(
+        state_dir() / QUOTA_SNAPSHOT_FILE,
+        (json.dumps(updated_snap, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+        mode=0o600,
+        owner_only=True,
+    )
+
+
+def _run_autoswitch_phase3_bounces(
+    adapter: AgyAdapter,
+    *,
+    current_switch_epoch: float | None,
+    dry_run: bool,
+    no_bounce: bool,
+    max_bounces: int,
+    quiet_recheck: float,
+    herdr: Any = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if no_bounce:
+        return [], {
+            "enabled": False,
+            "stale_count": 0,
+            "executed": 0,
+            "skipped_reason": "no_bounce",
+            "stopped_reason": None,
+        }
+    if current_switch_epoch is None:
+        return [], {
+            "enabled": True,
+            "stale_count": 0,
+            "executed": 0,
+            "skipped_reason": "no_switch_epoch",
+            "stopped_reason": None,
+        }
+    stale_panes = find_stale_panes(proc_root(), current_switch_epoch)
+    if not stale_panes:
+        return [], {
+            "enabled": True,
+            "stale_count": 0,
+            "executed": 0,
+            "skipped_reason": None,
+            "stopped_reason": None,
+        }
+
+    sorted_panes = sorted(stale_panes, key=lambda p: (float(p.get("start_epoch") or 0.0), int(p.get("pid") or 0)))
+    bounce_lock_fd = -1
+    if not dry_run:
+        root = ensure_state()
+        try:
+            bounce_lock_fd = os.open(
+                root / AUTO_SWITCH_BOUNCE_LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+            )
+            try:
+                os.fchmod(bounce_lock_fd, 0o600)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.close(bounce_lock_fd)
+                bounce_lock_fd = -1
+                raise
+        except OSError as exc:
+            raise CliError(f"{AUTO_SWITCH_BOUNCE_LOCK_FILE} nicht sicher zu öffnen: {exc}", 3) from exc
+        try:
+            fcntl.flock(bounce_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(bounce_lock_fd)
+            return [], {
+                "enabled": True,
+                "stale_count": len(sorted_panes),
+                "executed": 0,
+                "skipped_reason": "bounce_lock_busy",
+                "stopped_reason": None,
+            }
+        except OSError as exc:
+            os.close(bounce_lock_fd)
+            raise CliError(f"{AUTO_SWITCH_BOUNCE_LOCK_FILE} nicht sperrbar: {exc}", 3) from exc
+
+    bounces: list[dict[str, Any]] = []
+    executed = 0
+    stopped_reason: str | None = None
+    try:
+        herdr_cli = herdr or HerdrCli()
+        run_started = time.monotonic()
+
+        def _remaining_s() -> float:
+            return AUTO_SWITCH_WALLCLOCK_BUDGET_S - (time.monotonic() - run_started)
+
+        # Ein Bounce braucht die Ruhephase plus Start-/Resume-Frist; ohne dieses Restbudget läuft er nicht an.
+        min_execute_budget_s = quiet_recheck + 15.0 if quiet_recheck > 0 else 1.0
+        for stale in sorted_panes:
+            if not dry_run and max_bounces > 0 and executed >= max_bounces:
+                stopped_reason = "max_bounces_reached"
+                break
+            if _remaining_s() <= 0:
+                stopped_reason = "wallclock_budget_reached"
+                break
+            pane_id = stale.get("pane_id")
+            if not pane_id:
+                bounces.append({"pane_id": None, "pid": stale.get("pid"), "status": "skipped", "reason": "missing_pane_id"})
+                continue
+            try:
+                plan = plan_bounce(adapter, pane_id, herdr_cli, reason="switch_epoch", allow_focused=False)
+            except CliError as exc:
+                bounces.append({"pane_id": pane_id, "pid": stale.get("pid"), "status": "error", "error": str(exc)})
+                continue
+            if dry_run or max_bounces == 0:
+                bounces.append({
+                    "pane_id": pane_id,
+                    "pid": stale.get("pid"),
+                    "status": "planned",
+                    "recommended_action": plan["recommended_action"],
+                    "blockers": plan["blockers"],
+                })
+                continue
+            if plan.get("live_blockers"):
+                # Red S3-2: Live-Blocker als skipped ausweisen, statt execute_bounce fail-closed werfen zu lassen.
+                bounces.append({
+                    "pane_id": pane_id,
+                    "pid": stale.get("pid"),
+                    "status": "skipped",
+                    "reason": "live_blockers",
+                    "blockers": plan["live_blockers"],
+                })
+                continue
+            if plan["recommended_action"] != "in_place_resume":
+                bounces.append({
+                    "pane_id": pane_id,
+                    "pid": stale.get("pid"),
+                    "status": "skipped",
+                    "recommended_action": plan["recommended_action"],
+                    "blockers": plan["blockers"],
+                })
+                continue
+            if _remaining_s() < min_execute_budget_s:
+                stopped_reason = "wallclock_budget_reached"
+                break
+            try:
+                res = execute_bounce(
+                    adapter, plan, herdr_cli, resume_prompt=False, quiet_recheck_s=quiet_recheck
+                )
+            except CliError as exc:
+                bounces.append({"pane_id": pane_id, "pid": stale.get("pid"), "status": "error", "error": str(exc)})
+                continue
+            executed += 1
+            bounces.append({
+                "pane_id": pane_id,
+                "pid": stale.get("pid"),
+                "status": res.get("status"),
+                "new_pid": res.get("new_pid"),
+                "stage": res.get("stage"),
+                "wakeup_status": res.get("wakeup_status"),
+            })
+    finally:
+        if bounce_lock_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(bounce_lock_fd)
+
+    return bounces, {
+        "enabled": True,
+        "stale_count": len(sorted_panes),
+        "executed": executed,
+        "skipped_reason": None,
+        "stopped_reason": stopped_reason,
+    }
+
+
+def _format_autoswitch_result(result: dict[str, Any], as_json: bool) -> str:
     if as_json:
         return json.dumps(result, indent=2, ensure_ascii=False)
-    lines = [f"Timer geschrieben nach {target} ({interval} s)."]
-    if activate and systemctl_error is None:
-        lines.append("Timer aktiviert.")
-    elif activate:
-        lines.append(f"Live-Aktivierung NICHT erfolgt: {systemctl_error}")
-        lines.append(f"Nachholen mit: {activation_command}")
+    decision = result["decision"]
+    if decision in {"switched", "dry_run_would_switch"}:
+        prefix = "Dry-Run Wechselkandidat" if decision == "dry_run_would_switch" else "Konto gewechselt"
+        base = (
+            f"{prefix}: {result['previous_account'] or '-'} -> {result['target_slot']} "
+            f"(Grund: {result['trigger_reason']})."
+        )
+        if result.get("quota_sync_error"):
+            base += f" Quota-Sync fehlgeschlagen: {result['quota_sync_error']}"
+    elif decision == "cooldown_active":
+        base = (
+            f"Wechsel {result['active_account'] or '-'} -> {result['target_slot']} im Cooldown "
+            f"({result['cooldown_remaining_s']} s verbleibend)."
+        )
     else:
-        lines.append(f"Nicht aktiviert; aktivieren mit: {activation_command}")
-    if warning:
-        lines.append(f"Warnung: {warning}")
-    return "\n".join(lines)
+        base = f"Auto-Switch: {decision} (aktiv: {result['active_account'] or '-'})."
+    bsum = result["bounce_summary"]
+    if bsum["executed"] or bsum["stale_count"]:
+        return f"{base} Bounces: {bsum['executed']}/{bsum['stale_count']}."
+    return base
+
+
+def cmd_auto_switch(
+    adapter: AgyAdapter,
+    *,
+    as_json: bool = False,
+    dry_run: bool = False,
+    max_quota_age: float = 180,
+    cooldown: float = 300,
+    force_probe: bool = False,
+    reactive_exhausted: bool = False,
+    no_bounce: bool = False,
+    max_bounces: int = 2,
+    quiet_recheck: float = QUIET_RECHECK_S,
+    herdr: Any = None,
+) -> str:
+    max_quota_age, cooldown, max_bounces, quiet_recheck = _validate_auto_switch_args(
+        max_quota_age, cooldown, max_bounces, quiet_recheck
+    )
+
+    # Phase 1: Cache-Fast-Path + S1-1 Live-Verify vor echtem Switch
+    with switch_lock():
+        heal_res = heal_preview(adapter) if dry_run else heal_locked(adapter)
+        if heal_res == "unreadable":
+            raise CliError("Live-Token ist nicht lesbar; Auto-Switch abgebrochen.", 3)
+        phase1_block = copy.deepcopy(provider_block(load_registry(), adapter))
+
+    now = time.time()
+    cached_snap = _read_quotas_snapshot_safe()
+    cache_ok, cache_age = _cache_snapshot_matches_block(cached_snap, adapter, phase1_block, now, max_quota_age)
+
+    needs_live_probe = force_probe or reactive_exhausted or not cache_ok
+    if not needs_live_probe and cached_snap is not None:
+        prelim = _evaluate_auto_switch_decision(
+            cached_snap["providers"][adapter.name]["accounts"],
+            phase1_block.get("active_account"),
+            adapter.primary_lane,
+            reactive_exhausted=False,
+        )
+        if prelim["action"] != "stay_healthy":
+            needs_live_probe = True
+        elif not no_bounce and cache_age > AUTO_SWITCH_STALE_CACHE_MAX_AGE_S:
+            if find_stale_panes(proc_root(), phase1_block.get("switch_epoch")):
+                needs_live_probe = True
+
+    probe_used = False
+    if needs_live_probe:
+        probe_used = True
+        snapshot = fetch_provider_status(adapter, write_quotas=not dry_run, heal=not dry_run)
+        if snapshot.get("registry_changed"):
+            res = {
+                "provider": adapter.name,
+                "decision": "skipped_registry_changed",
+                "dry_run": dry_run,
+                "probe_used": True,
+                "active_account": phase1_block.get("active_account"),
+                "previous_account": phase1_block.get("active_account"),
+                "target_slot": None,
+                "trigger_reason": None,
+                "switch_epoch": phase1_block.get("switch_epoch"),
+                "cooldown_remaining_s": 0.0,
+                "quota_sync_error": None,
+                "bounces": [],
+                "bounce_summary": {
+                    "enabled": not no_bounce,
+                    "stale_count": 0,
+                    "executed": 0,
+                    "skipped_reason": "registry_changed",
+                    "stopped_reason": None,
+                },
+            }
+            return _format_autoswitch_result(res, as_json)
+    else:
+        snapshot = cached_snap  # type: ignore[assignment]
+
+    # Phase 2: DRAIN-TO-ZERO + FEFO-Rückwechsel unter switch_lock()
+    decision: str
+    target_slot: str | None = None
+    trigger_reason: str | None = None
+    cooldown_remaining_s = 0.0
+    previous_account = phase1_block.get("active_account")
+    active_account = previous_account
+    current_switch_epoch = phase1_block.get("switch_epoch")
+    skip_phase3 = False
+    skip_phase3_reason = "registry_changed"
+    quota_sync_error: str | None = None
+
+    cache_recheck_pending = not probe_used
+    while True:
+        stale_cache = False
+        with switch_lock():
+            phase2_heal = heal_preview(adapter) if dry_run else heal_locked(adapter)
+            if phase2_heal == "unreadable":
+                raise CliError("Live-Token ist nicht lesbar; Auto-Switch abgebrochen.", 3)
+            block = provider_block(load_registry(), adapter)
+            if (
+                block.get("active_account") != phase1_block.get("active_account")
+                or block.get("switch_epoch") != phase1_block.get("switch_epoch")
+                or _active_slot_ids(block) != _active_slot_ids(phase1_block)
+            ):
+                decision = "skipped_registry_changed"
+                active_account = block.get("active_account")
+                current_switch_epoch = block.get("switch_epoch")
+                skip_phase3 = True
+            elif cache_recheck_pending:
+                # Der Cache-Snapshot kann während des Wartens auf das Lock das Alterslimit überschritten
+                # haben; dann entscheidet der Lauf einmalig auf frischem Live-Stand statt auf altem Cache.
+                cache_ok_now, _ = _cache_snapshot_matches_block(snapshot, adapter, block, time.time(), max_quota_age)
+                cache_recheck_pending = False
+                stale_cache = not cache_ok_now
+            if not stale_cache:
+                eval_res = _evaluate_auto_switch_decision(
+                    snapshot["providers"][adapter.name]["accounts"],
+                    block.get("active_account"),
+                    adapter.primary_lane,
+                    reactive_exhausted=reactive_exhausted,
+                )
+                trigger_reason = eval_res["trigger_reason"]
+                if eval_res["action"] != "switch":
+                    decision = eval_res["action"]
+                else:
+                    target_slot = eval_res["target_slot"]
+                    validate_slot(target_slot or "")
+                    last_switch = float(block.get("switch_epoch") or 0.0)
+                    elapsed = (time.time() - last_switch) if last_switch > 0 else float("inf")
+                    if cooldown > 0 and last_switch > 0 and elapsed < cooldown:
+                        decision = "cooldown_active"
+                        cooldown_remaining_s = round(max(0.0, cooldown - elapsed), 1)
+                    elif dry_run:
+                        decision = "dry_run_would_switch"
+                    else:
+                        info = _switch_slot_locked(adapter, target_slot)  # type: ignore[arg-type]
+                        previous_account = info["previous"]
+                        active_account = target_slot
+                        current_switch_epoch = info["switch_epoch"]
+                        # Der Wechsel selbst ist verbindlich; ein scheiternder Quota-Sync macht ihn nicht
+                        # rückgängig, wird aber gemeldet und hebt die Bounces dieses Laufs auf.
+                        try:
+                            _sync_quotas_after_switch(
+                                adapter,
+                                snapshot,
+                                target_slot=target_slot,  # type: ignore[arg-type]
+                                switch_epoch=current_switch_epoch,
+                                heal_result=info["heal"],
+                            )
+                        except (OSError, CliError) as exc:
+                            quota_sync_error = str(exc)
+                            skip_phase3 = True
+                            skip_phase3_reason = "quota_sync_failed"
+                        log_event(
+                            "auto_switch",
+                            provider=adapter.name,
+                            from_slot=previous_account,
+                            to_slot=target_slot,
+                            reason=trigger_reason,
+                            active_weekly_pct=eval_res["active_weekly_pct"],
+                            active_five_hour_pct=eval_res["active_five_hour_pct"],
+                            target_weekly_pct=eval_res["target_weekly_pct"],
+                            target_five_hour_pct=eval_res["target_five_hour_pct"],
+                            switch_epoch=current_switch_epoch,
+                            caches_removed=info["caches_removed"],
+                        )
+                        decision = "switched"
+        if not stale_cache:
+            break
+        snapshot = fetch_provider_status(adapter, write_quotas=not dry_run, heal=not dry_run)
+        if snapshot.get("registry_changed"):
+            res = {
+                "provider": adapter.name,
+                "decision": "skipped_registry_changed",
+                "dry_run": dry_run,
+                "probe_used": True,
+                "active_account": phase1_block.get("active_account"),
+                "previous_account": phase1_block.get("active_account"),
+                "target_slot": None,
+                "trigger_reason": None,
+                "switch_epoch": phase1_block.get("switch_epoch"),
+                "cooldown_remaining_s": 0.0,
+                "quota_sync_error": None,
+                "bounces": [],
+                "bounce_summary": {
+                    "enabled": not no_bounce,
+                    "stale_count": 0,
+                    "executed": 0,
+                    "skipped_reason": "registry_changed",
+                    "stopped_reason": None,
+                },
+            }
+            return _format_autoswitch_result(res, as_json)
+        probe_used = True
+
+    # Phase 3: Opportunistischer 7-Bedingungen-Warm-Bounce (außerhalb switch_lock())
+    if skip_phase3:
+        bounces: list[dict[str, Any]] = []
+        bounce_summary = {
+            "enabled": not no_bounce,
+            "stale_count": 0,
+            "executed": 0,
+            "skipped_reason": skip_phase3_reason,
+            "stopped_reason": None,
+        }
+    else:
+        bounces, bounce_summary = _run_autoswitch_phase3_bounces(
+            adapter,
+            current_switch_epoch=current_switch_epoch,
+            dry_run=dry_run,
+            no_bounce=no_bounce,
+            max_bounces=max_bounces,
+            quiet_recheck=quiet_recheck,
+            herdr=herdr,
+        )
+
+    result = {
+        "provider": adapter.name,
+        "decision": decision,
+        "dry_run": dry_run,
+        "probe_used": probe_used,
+        "active_account": active_account,
+        "previous_account": previous_account,
+        "target_slot": target_slot,
+        "trigger_reason": trigger_reason,
+        "switch_epoch": current_switch_epoch,
+        "cooldown_remaining_s": cooldown_remaining_s,
+        "quota_sync_error": quota_sync_error,
+        "bounces": bounces,
+        "bounce_summary": bounce_summary,
+    }
+    return _format_autoswitch_result(result, as_json)
+
+
+def _format_timer_num(value: int | float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def autoswitch_timer_units(
+    adapter: AgyAdapter,
+    *,
+    interval: int,
+    max_quota_age: float,
+    cooldown: float,
+    max_bounces: int,
+) -> dict[str, str]:
+    base = f"llm-account-{adapter.name}-autoswitch"
+    timer_unit = (
+        "[Unit]\n"
+        f"Description=llm-account: Autonomer Kontowechsel-Takt für {adapter.name} (ohne inotify)\n\n"
+        "[Timer]\n"
+        "OnBootSec=30s\n"
+        "OnActiveSec=30s\n"
+        f"OnUnitActiveSec={interval}s\n"
+        "AccuracySec=5s\n"
+        f"Unit={base}.service\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    service_unit = (
+        "[Unit]\n"
+        "Description=Autonomer AGY-Kontowechsel bei Drain-to-Zero oder FEFO-Rueckwechsel\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "Slice=herdr-control.slice\n"
+        "TimeoutStartSec=300\n"
+        f"ExecStart=%h/.local/bin/llm-account auto-switch {adapter.name} "
+        f"--max-quota-age {_format_timer_num(max_quota_age)} "
+        f"--cooldown {_format_timer_num(cooldown)} "
+        f"--max-bounces {max_bounces}\n"
+    )
+    return {f"{base}.timer": timer_unit, f"{base}.service": service_unit}
+
+
+def cmd_install_autoswitch_timer(
+    adapter: AgyAdapter,
+    *,
+    interval: int = 60,
+    max_quota_age: float = 180,
+    cooldown: float = 300,
+    max_bounces: int = 2,
+    unit_dir: str | None = None,
+    activate: bool = True,
+    as_json: bool = False,
+) -> str:
+    interval = int(_validate_finite_range("--interval", interval, AUTOSWITCH_TIMER_MIN_INTERVAL, AUTOSWITCH_TIMER_MAX_INTERVAL, integer=True))
+    max_quota_age, cooldown, max_bounces, _ = _validate_auto_switch_args(
+        max_quota_age, cooldown, max_bounces, QUIET_RECHECK_S
+    )
+    target = Path(unit_dir or DEFAULT_UNIT_DIR).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    limit = inotify_instance_limit()
+    units = autoswitch_timer_units(
+        adapter,
+        interval=interval,
+        max_quota_age=max_quota_age,
+        cooldown=cooldown,
+        max_bounces=max_bounces,
+    )
+    for name, content in units.items():
+        atomic_write(target / name, content.encode("utf-8"), mode=0o644)
+
+    timer_name = f"llm-account-{adapter.name}-autoswitch.timer"
+    service_name = f"llm-account-{adapter.name}-autoswitch.service"
+    timer_link = _ensure_timer_wants_link(target, timer_name)
+    activated, systemctl_error, activation_command = _activate_systemd_timer(
+        target, service_name, timer_name, activate
+    )
+    warning = _inotify_warning(limit)
+    result = {
+        "provider": adapter.name,
+        "timer": str(target / timer_name),
+        "service": str(target / service_name),
+        "interval_seconds": interval,
+        "max_quota_age": max_quota_age,
+        "cooldown": cooldown,
+        "max_bounces": max_bounces,
+        "unit_dir": str(target),
+        "timer_wants_link": timer_link,
+        "activated": activated,
+        "systemctl_error": systemctl_error,
+        "activation_command": activation_command,
+        "inotify_max_user_instances": limit,
+        "inotify_warning": warning,
+    }
+    return _format_timer_result(result, target=target, interval=interval, activate=activate, as_json=as_json)
 
 
 # ---------------------------------------------------------------------------
@@ -2152,6 +3056,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-systemctl", action="store_true", help="nur Units schreiben, systemctl nicht aufrufen")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("auto-switch", help="Autonomer Kontowechsel (DRAIN-TO-ZERO + FEFO-Rückwechsel)")
+    p.add_argument("provider", nargs="?", default="agy")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--max-quota-age", type=float, default=180)
+    p.add_argument("--cooldown", type=float, default=300)
+    p.add_argument("--force-probe", action="store_true")
+    p.add_argument("--reactive-exhausted", action="store_true")
+    p.add_argument("--no-bounce", action="store_true")
+    p.add_argument("--max-bounces", type=int, default=2)
+    p.add_argument("--quiet-recheck", type=float, default=QUIET_RECHECK_S)
+
+    p = sub.add_parser("install-autoswitch-timer", help="inotify-freien Auto-Switch-Timer schreiben und aktivieren")
+    p.add_argument("provider", nargs="?", default="agy")
+    p.add_argument("--interval", type=int, default=60, help="Takt in Sekunden (15 bis 3600)")
+    p.add_argument("--max-quota-age", type=float, default=180)
+    p.add_argument("--cooldown", type=float, default=300)
+    p.add_argument("--max-bounces", type=int, default=2)
+    p.add_argument("--systemd-dir", dest="systemd_dir", help="Zielverzeichnis der Units")
+    p.add_argument("--no-systemctl", action="store_true", help="nur Units schreiben, systemctl nicht aufrufen")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("bounce-stale", help="In-Place-Warm-Bounce einer Pane mit veraltetem agy-Prozess")
     p.add_argument("provider")
     p.add_argument("pane_id")
@@ -2163,8 +3089,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force-pane", action="store_true")
     p.add_argument("--no-resume-prompt", action="store_true", help="Weckruf nach dem Wechsel auslassen")
     p.add_argument("--reason", choices=BOUNCE_REASONS, default="switch_epoch",
-                   help="Grund des Eingriffs; auth_401 erlaubt den In-Place-Warm-Bounce auch auf Architekten-Tabs")
-    p.add_argument("--quelle", help="Zielbindung: Nachrichten-ID oder Vertragsname (Pflicht bei --reason auth_401)")
+                   help="Grund des Eingriffs; auth_401/quota_reached erlauben Bounce auch auf Architekten-Tabs")
+    p.add_argument("--quelle", help="Zielbindung: Nachrichten-ID oder Vertragsname (Pflicht bei auth_401/quota_reached)")
     p.add_argument("--allow-focused", action="store_true", help="nur ausdrücklich benannte fokussierte Pane")
     p.add_argument("--replay-msg-id", action="append", default=[], dest="replay_msg_ids",
                    help="abgebrochene Briefkasten-Nachricht im Weckruf nennen (wiederholbar)")
@@ -2194,6 +3120,30 @@ def run(args: argparse.Namespace) -> str:
         return cmd_install_heal_timer(
             adapter, args.interval, args.systemd_dir,
             activate=not args.no_systemctl, as_json=args.json,
+        )
+    if args.verb == "auto-switch":
+        return cmd_auto_switch(
+            adapter,
+            as_json=args.json,
+            dry_run=args.dry_run,
+            max_quota_age=args.max_quota_age,
+            cooldown=args.cooldown,
+            force_probe=args.force_probe,
+            reactive_exhausted=args.reactive_exhausted,
+            no_bounce=args.no_bounce,
+            max_bounces=args.max_bounces,
+            quiet_recheck=args.quiet_recheck,
+        )
+    if args.verb == "install-autoswitch-timer":
+        return cmd_install_autoswitch_timer(
+            adapter,
+            interval=args.interval,
+            max_quota_age=args.max_quota_age,
+            cooldown=args.cooldown,
+            max_bounces=args.max_bounces,
+            unit_dir=args.systemd_dir,
+            activate=not args.no_systemctl,
+            as_json=args.json,
         )
     if args.verb == "bounce-stale":
         return cmd_bounce_stale(adapter, args)
