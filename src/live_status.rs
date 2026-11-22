@@ -8349,8 +8349,15 @@ fn draw_smooth_limit_block(
     is_five_hour: bool,
     is_throttled: bool,
     forecast: &PacingForecast,
+    pool: Option<&crate::quota::PoolReach>,
+    is_active: bool,
     language: Language,
 ) {
+    // Standby-Karte: Pool-Hinweise statt Eigenreichweite. Aktive Karte: Alarm-Rot dämpfen, solange der Pool trägt.
+    let standby_pool = if is_active { None } else { pool };
+    let standby_hint_5h = crate::quota::standby_five_hour_hint(pool, is_active, is_five_hour, language);
+    let damped = crate::quota::pool_damps_alarm(pool, is_active, is_five_hour, is_throttled);
+
     // Line 1: Header (Left: Title + pct, Right: Runway tag)
     // A throttled provider has no spendable budget at all, so its whole card
     // renders in the disabled gray instead of the traffic-light colors.
@@ -8367,7 +8374,11 @@ fn draw_smooth_limit_block(
     );
     painter.galley(top_left, title_galley, title_color);
 
-    let runway_text = if is_five_hour {
+    let runway_text = if let Some(reach) = standby_pool.filter(|_| !is_five_hour) {
+        reach.runway_text(language)
+    } else if is_five_hour && standby_pool.is_some() {
+        String::new()
+    } else if is_five_hour {
         forecast.five_hour_runway_text(language)
     } else {
         forecast.week_runway_text(language)
@@ -8380,8 +8391,15 @@ fn draw_smooth_limit_block(
     // Throttled overrides the light: no budget means unusable, not critical.
     let light = crate::quota::runway_light(is_throttled, pct, is_five_hour, forecast);
     let (lr, lg, lb) = light.color.rgb();
-    let runway_color = egui::Color32::from_rgb(lr, lg, lb);
-    let (is_red_alert, is_yellow_alert) = (light.red, light.yellow);
+    let runway_color = if let Some(reach) = standby_pool.filter(|_| !is_five_hour) {
+        pool_tone_color(reach.tone())
+    } else if damped && light.red {
+        egui::Color32::from_rgb(253, 224, 71)
+    } else {
+        egui::Color32::from_rgb(lr, lg, lb)
+    };
+    let is_red_alert = light.red && !damped;
+    let is_yellow_alert = light.yellow || (damped && light.red);
     // Alert aliases: the micro dots below consume them; the pace line uses
     // `light` directly through pace_light.
 
@@ -8452,7 +8470,11 @@ fn draw_smooth_limit_block(
     );
 
     // Right: Tempo / Pace
-    let (pace_text, pace_ratio_opt) = if is_five_hour {
+    let (pace_text, pace_ratio_opt) = if let Some(hint) = standby_hint_5h.clone() {
+        (hint, None)
+    } else if let Some(reach) = standby_pool {
+        (reach.pace_text(language), None)
+    } else if is_five_hour {
         (
             forecast.five_hour_pace_text(language),
             forecast.five_hour_forecast.as_ref().map(|fh| fh.pace_ratio),
@@ -8464,11 +8486,20 @@ fn draw_smooth_limit_block(
         )
     };
     if !pace_text.is_empty() {
-        let pace_color = {
+        let pace_color = if standby_hint_5h.is_some() {
+            egui::Color32::from_rgb(148, 163, 184)
+        } else if let Some(reach) = standby_pool {
+            pool_tone_color(reach.tone())
+        } else {
             let pc = if is_five_hour {
                 crate::quota::pace_light(is_throttled, pct, &light, pace_ratio_opt)
             } else {
                 crate::quota::week_pace_light(is_throttled, pct, &light, forecast)
+            };
+            let pc = if damped && pc == crate::quota::RunwayColor::Red {
+                crate::quota::RunwayColor::Yellow
+            } else {
+                pc
             };
             let (pr, pg, pb) = pc.rgb();
             egui::Color32::from_rgb(pr, pg, pb)
@@ -8667,6 +8698,8 @@ fn draw_provider_card(
             true,
             five_h_throttled,
             forecast,
+            quota.pool_reach.as_ref(),
+            quota.is_active_account,
             language,
         );
 
@@ -8686,6 +8719,8 @@ fn draw_provider_card(
             false,
             week_throttled,
             forecast,
+            quota.pool_reach.as_ref(),
+            quota.is_active_account,
             language,
         );
     } else if has_5h {
@@ -8705,6 +8740,8 @@ fn draw_provider_card(
             true,
             five_h_throttled,
             forecast,
+            quota.pool_reach.as_ref(),
+            quota.is_active_account,
             language,
         );
     } else if has_wk {
@@ -8724,6 +8761,8 @@ fn draw_provider_card(
             false,
             week_throttled,
             forecast,
+            quota.pool_reach.as_ref(),
+            quota.is_active_account,
             language,
         );
     } else {
@@ -8820,7 +8859,7 @@ fn render_quota_tooltip(
                     } else {
                         egui::Color32::from_rgb(252, 165, 165)
                     };
-                    let standby_hint = (!quota.is_active_account && quota.five_hour_confirmed_exhausted)
+                    let standby_hint = (!quota.is_active_account)
                         .then(|| quota.pool_reach.as_ref().map(|reach| reach.standby_hint_text(language)))
                         .flatten();
                     ui.colored_label(

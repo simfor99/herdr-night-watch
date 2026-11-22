@@ -5248,6 +5248,29 @@ mod tests {
     }
 }
 
+/// Standby-Hinweis bei der 5-h-Zeile: `Standby · ab 0% <aktives Konto>`, unabhängig davon ob die Standby-Karte erschöpft ist.
+pub fn standby_five_hour_hint(
+    pool: Option<&crate::quota::PoolReach>,
+    is_active: bool,
+    is_five_hour: bool,
+    language: Language,
+) -> Option<String> {
+    if is_active || !is_five_hour {
+        return None;
+    }
+    pool.map(|reach| reach.standby_hint_text(language))
+}
+
+/// Dämpft Alarm-Rot der aktiven Wochenkarte auf Gelb, solange der Pool bis zum frühesten Reset trägt.
+pub fn pool_damps_alarm(
+    pool: Option<&crate::quota::PoolReach>,
+    is_active: bool,
+    is_five_hour: bool,
+    is_throttled: bool,
+) -> bool {
+    is_active && !is_five_hour && !is_throttled && pool.is_some_and(|reach| reach.covered)
+}
+
 #[cfg(test)]
 mod track56_pool_pacing_tests {
     use super::*;
@@ -5433,6 +5456,44 @@ mod track56_pool_pacing_tests {
         assert!(snapshot.get_card(ProviderId::Agy, Some("acc2")).expect("leipzig").pool_reach.is_none());
     }
 
+    #[test]
+    fn live_ingestion_gives_the_active_card_a_nonzero_burn_rate_at_pool_time() {
+        // Live-Muster: leipzig aktiv 45 %, Reset in ~5,7 Tagen; privat Standby 100 %. Die Burnrate muss beim Übernehmen schon gelten.
+        let now = current_utc_epoch();
+        let reset_in = |days: f32| iso_for_test(now + (days * 86_400.0) as i64);
+        let json = format!(
+            r#"{{"version":1,"active_account":"acc2","pooled_count":2,"pool_next_refill_epoch":null,"accounts":[
+              {{"id":"acc1","label":"privat","email":null,"is_active":false,"five_hour_pct":100,"week_pct":100,"week_reset":"{}","auth_state":"ok","auth_error":null}},
+              {{"id":"acc2","label":"leipzig","email":null,"is_active":true,"five_hour_pct":80,"week_pct":45,"week_reset":"{}","auth_state":"ok","auth_error":null}}
+            ]}}"#,
+            reset_in(6.7),
+            reset_in(5.7),
+        );
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_agy_json(&mut snapshot, &json);
+        let active = snapshot.get_card(ProviderId::Agy, Some("acc2")).expect("leipzig");
+        let burn = active.pool_burn_pct_per_day();
+        assert!(burn > 0.0, "Burnrate beim Übernehmen ist {burn}, der Pool wäre fälschlich unbegrenzt");
+        let reach = active.pool_reach.as_ref().expect("pool");
+        assert!(reach.runway_days.is_finite(), "runway {}", reach.runway_days);
+    }
+
+    /// Epoch-Sekunden als ISO-UTC-Zeitstempel (Howard-Hinnant-Umrechnung, nur für Tests).
+    fn iso_for_test(epoch: i64) -> String {
+        let days = epoch.div_euclid(86_400);
+        let secs = epoch.rem_euclid(86_400);
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, (secs % 3600) / 60, secs % 60)
+    }
+
     fn tight_forecast_for_test() -> PacingForecast {
         PacingForecast {
             pace_ratio: Some(1.5),
@@ -5451,5 +5512,51 @@ mod track56_pool_pacing_tests {
             projected_week_reserve: None,
             pool_covered: false,
         }
+    }
+
+    // Sichtbare Karte (Track 56b): Entscheidungen für Standby-Hinweis und Alarm-Dämpfung.
+    fn reach_for_visible_card_test(covered: bool) -> PoolReach {
+        PoolReach {
+            runway_days: if covered { 7.5 } else { 2.0 },
+            days_to_refill: 5.7,
+            refill_epoch: 1_795_000_000 + 492_480,
+            computed_at_epoch: 1_795_000_000,
+            covered,
+            active_label: Some("leipzig".to_string()),
+        }
+    }
+
+    #[test]
+    fn standby_five_hour_hint_shows_even_when_the_standby_is_not_exhausted() {
+        // Standby bei 100 %: der Hinweis gilt trotzdem (kein five_hour_confirmed_exhausted-Gate mehr).
+        let r = reach_for_visible_card_test(true);
+        assert_eq!(
+            standby_five_hour_hint(Some(&r), false, true, Language::German).as_deref(),
+            Some("Standby · ab 0% leipzig")
+        );
+    }
+
+    #[test]
+    fn no_five_hour_hint_for_the_active_card_or_the_week_row_or_without_pool() {
+        let r = reach_for_visible_card_test(true);
+        assert!(standby_five_hour_hint(Some(&r), true, true, Language::German).is_none());
+        assert!(standby_five_hour_hint(Some(&r), false, false, Language::German).is_none());
+        assert!(standby_five_hour_hint(None, false, true, Language::German).is_none());
+    }
+
+    #[test]
+    fn covered_pool_damps_only_the_active_weekly_alarm() {
+        let covered = reach_for_visible_card_test(true);
+        assert!(pool_damps_alarm(Some(&covered), true, false, false));
+        assert!(!pool_damps_alarm(Some(&covered), true, false, true), "gedrosselt bleibt Alarm");
+        assert!(!pool_damps_alarm(Some(&covered), true, true, false), "5-h-Zeile wird nicht gedämpft");
+        assert!(!pool_damps_alarm(Some(&covered), false, false, false), "Standby wird nicht gedämpft");
+    }
+
+    #[test]
+    fn uncovered_pool_keeps_the_alarm_red() {
+        let uncovered = reach_for_visible_card_test(false);
+        assert!(!pool_damps_alarm(Some(&uncovered), true, false, false));
+        assert!(!pool_damps_alarm(None, true, false, false));
     }
 }
