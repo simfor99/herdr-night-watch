@@ -1867,5 +1867,170 @@ class AttentionSummaryTests(unittest.TestCase):
         self.assertEqual(calls[0][-2:], ["api", "snapshot"])
 
 
+def _team_ws(ws_id, label, number=None):
+    ws = {"workspace_id": ws_id, "label": label}
+    if number is not None:
+        ws["number"] = number
+    return ws
+
+
+def _team_agent(pane_id, tab_id, ws_id, status, seq=1, tokens=None):
+    agent_entry = {"pane_id": pane_id, "tab_id": tab_id, "workspace_id": ws_id, "agent_status": status,
+                   "completion_seq": seq}
+    if tokens is not None:
+        agent_entry["tokens"] = tokens
+    return agent_entry
+
+
+TEAM_TABS = [
+    {"tab_id": "tArch", "workspace_id": "wArch", "label": "📐 architekt"},
+    {"tab_id": "tArch2", "workspace_id": "wArch", "label": "architekt-2"},
+    {"tab_id": "tBau", "workspace_id": "wBau", "label": "🔨 bauer"},
+    {"tab_id": "tMid", "workspace_id": "wMid", "label": "zwischenstation"},
+    {"tab_id": "tFlat", "workspace_id": "wFlat", "label": "rechercheur"},
+    {"tab_id": "tB", "workspace_id": "wB", "label": "📐 architekt"},
+    {"tab_id": "tBBau", "workspace_id": "wBBau", "label": "🔨 bauer"},
+]
+
+
+def _team_workspaces(**status_by_id):
+    """Zwei Team-Cluster: wArch mit Kind wBau, wB mit Kind wBBau; plus Einzel-Workspaces wMid und wFlat."""
+    workspaces = [
+        _team_ws("wArch", "📐 architekt-team", 1),
+        _team_ws("wBau", "├─ 🔨 Bau", 2),
+        _team_ws("wMid", "🏛️ mittler", 3),
+        _team_ws("wFlat", "🧰 ad-hoc", 4),
+        _team_ws("wB", "📐 renderer-v4-1", 5),
+        _team_ws("wBBau", "╰─ 🔨 Bau", 6),
+    ]
+    for ws in workspaces:
+        if ws["workspace_id"] in status_by_id:
+            ws["agent_status"] = status_by_id[ws["workspace_id"]]
+    return workspaces
+
+
+class TeamClusterAttentionTests(unittest.TestCase):
+    """Team-Cluster-Wahrheit: fertige Teamleads zählen nicht, solange ihr Team (Tabs, Kinder, Worker) arbeitet."""
+
+    def setUp(self):
+        patcher = patch.object(WATCHER, "herdr_executable", return_value="/usr/bin/herdr")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def summary(self, agents, workspaces):
+        return WATCHER.build_attention_summary(agents, TEAM_TABS, workspaces)
+
+    def test_t1_done_teamlead_with_working_child_workspace_is_suppressed(self):
+        agents = [_team_agent("wArch:p1", "tArch", "wArch", "done", 5),
+                  _team_agent("wBau:p1", "tBau", "wBau", "working")]
+        summary = self.summary(agents, _team_workspaces(wArch="done", wBau="working"))
+        self.assertEqual(summary["attention_done"], 0)
+        self.assertEqual(summary["suppressed_done"], 1)
+
+    def test_t2_done_teamlead_with_working_tab_in_same_workspace_is_suppressed(self):
+        agents = [_team_agent("wArch:p1", "tArch", "wArch", "done", 5),
+                  _team_agent("wArch:p2", "tArch2", "wArch", "working")]
+        summary = self.summary(agents, _team_workspaces(wArch="done"))
+        self.assertEqual(summary["attention_done"], 0)
+        self.assertEqual(summary["suppressed_done"], 1)
+
+    def test_t3_done_child_workspace_with_working_tab_still_suppresses_the_teamlead(self):
+        agents = [_team_agent("wArch:p1", "tArch", "wArch", "done", 5),
+                  _team_agent("wBau:p1", "tBau", "wBau", "working")]
+        summary = self.summary(agents, _team_workspaces(wArch="done", wBau="done"))
+        self.assertEqual(summary["attention_done"], 0)
+        self.assertEqual(summary["suppressed_done"], 1)
+
+    def test_t4_transitive_supervisor_chain_of_a_flat_worker_suppresses_the_root_teamlead(self):
+        agents = [
+            _team_agent("wArch:p1", "tArch", "wArch", "done", 5),
+            _team_agent("wMid:p1", "tMid", "wMid", "idle", tokens={"supervisor_pane_id": "wArch:p1"}),
+            _team_agent("wFlat:p1", "tFlat", "wFlat", "working", tokens={"supervisor_pane_id": "wMid:p1"}),
+        ]
+        summary = self.summary(agents, _team_workspaces(wArch="done", wFlat="working"))
+        self.assertEqual(summary["attention_done"], 0)
+        self.assertEqual(summary["suppressed_done"], 1)
+
+    def test_t5_done_teamlead_with_idle_cluster_is_counted_exactly_once(self):
+        agents = [_team_agent("wArch:p1", "tArch", "wArch", "done", 5),
+                  _team_agent("wBau:p1", "tBau", "wBau", "idle")]
+        summary = self.summary(agents, _team_workspaces(wArch="done", wBau="idle"))
+        self.assertEqual(summary["attention_done"], 1)
+        self.assertEqual(summary["suppressed_done"], 0)
+        self.assertEqual(len(summary["attention_items"]), 1)
+
+    def test_t6_blocked_teamlead_is_never_hidden_by_working_team_members(self):
+        agents = [_team_agent("wArch:p1", "tArch", "wArch", "blocked", 5),
+                  _team_agent("wBau:p1", "tBau", "wBau", "working")]
+        summary = self.summary(agents, _team_workspaces(wArch="done", wBau="working"))
+        self.assertEqual(summary["attention_blocked"], 1)
+        self.assertEqual(summary["attention_items"][0]["status"], "blocked")
+
+    def test_t7_cluster_roots_follow_number_not_list_position(self):
+        agents = [_team_agent("wArch:p1", "tArch", "wArch", "done", 5),
+                  _team_agent("wBau:p1", "tBau", "wBau", "working")]
+        reversed_workspaces = list(reversed(_team_workspaces(wArch="done", wBau="working")))
+        self.assertEqual(WATCHER._build_workspace_cluster_roots(reversed_workspaces)["wBau"], "wArch")
+        self.assertEqual(self.summary(agents, reversed_workspaces)["attention_done"], 0)
+
+        without_number = [_team_ws("wArch", "📐 architekt-team"), _team_ws("wBau", "├─ 🔨 Bau")]
+        self.assertEqual(WATCHER._build_workspace_cluster_roots(without_number)["wBau"], "wArch")
+
+    def test_t7_malformed_workspace_number_triggers_the_validation_fallback(self):
+        for bad_number in (True, "2", 2.0):
+            with self.subTest(number=bad_number), self.assertRaises(RuntimeError):
+                WATCHER._validate_snapshot_field_types([], [], [_team_ws("wArch", "📐 x", bad_number)])
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload([], tabs=TEAM_TABS,
+                                                                             workspaces=[_team_ws("wArch", "x", True)])), \
+                patch.object(WATCHER, "list_agents", return_value=[]):
+            self.assertFalse(WATCHER.live_agent_summary()["attention_available"])
+
+    def test_t8_work_in_one_cluster_never_suppresses_a_finished_other_cluster(self):
+        agents = [_team_agent("wArch:p1", "tArch", "wArch", "done", 5),
+                  _team_agent("wBau:p1", "tBau", "wBau", "working"),
+                  _team_agent("wB:p1", "tB", "wB", "done", 9),
+                  _team_agent("wBBau:p1", "tBBau", "wBBau", "idle")]
+        summary = self.summary(agents, _team_workspaces(wArch="done", wBau="working", wB="done", wBBau="idle"))
+        self.assertEqual(summary["attention_done"], 1)
+        self.assertEqual(summary["attention_items"][0]["workspace"], "📐 renderer-v4-1")
+
+    def test_t9_malformed_pane_id_falls_back_instead_of_crashing(self):
+        bad = [_team_agent(["wArch:p1"], "tArch", "wArch", "done", 5)]
+        legacy = [{"pane_id": "p1", "agent_status": "done"}]
+        with patch.object(WATCHER, "run_json", return_value=snapshot_payload(bad, tabs=TEAM_TABS,
+                                                                             workspaces=_team_workspaces())), \
+                patch.object(WATCHER, "list_agents", return_value=legacy):
+            summary = WATCHER.live_agent_summary()
+        self.assertFalse(summary["attention_available"])
+        self.assertEqual(summary["done"], 1)
+
+    def test_t10_malformed_tokens_and_missing_workspace_id_do_not_crash(self):
+        agents = [
+            _team_agent("wArch:p1", "tArch", "wArch", "done", 5),
+            _team_agent("wFlat:p1", "tFlat", "wFlat", "working", tokens={"supervisor_pane_id": ["x"]}),
+            _team_agent("wFlat:p2", "tFlat", "wFlat", "working", tokens={"supervisor_pane_id": 7}),
+            _team_agent("wFlat:p3", "tFlat", "wFlat", "working", tokens="kaputt"),
+        ]
+        workspaces = _team_workspaces(wArch="done", wFlat="working") + [{"label": "├─ Waise", "agent_status": "working"}]
+        summary = self.summary(agents, workspaces)
+        self.assertEqual(summary["attention_done"], 1)
+        self.assertEqual(set(summary), {
+            "available", "total", "working", "idle", "done", "blocked", "unknown", "attention_available",
+            "attention_done", "attention_blocked", "attention_total", "suppressed_done", "suppressed_blocked",
+            "suppressed_unknown", "attention_items",
+        })
+
+    def test_t11_cyclic_supervisor_reference_terminates(self):
+        agents = [
+            _team_agent("wFlat:p1", "tFlat", "wFlat", "working", tokens={"supervisor_pane_id": "wFlat:p2"}),
+            _team_agent("wFlat:p2", "tFlat", "wFlat", "working", tokens={"supervisor_pane_id": "wFlat:p1"}),
+            _team_agent("wArch:p1", "tArch", "wArch", "done", 5),
+        ]
+        workspaces = _team_workspaces(wArch="done")
+        cluster_root_by_ws = WATCHER._build_workspace_cluster_roots(workspaces)
+        self.assertEqual(WATCHER._find_active_working_roots(agents, workspaces, cluster_root_by_ws), {"wFlat"})
+        self.assertEqual(self.summary(agents, workspaces)["attention_done"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

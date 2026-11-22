@@ -843,7 +843,7 @@ def _validate_snapshot_field_types(
         status = agent.get("agent_status")
         if status is not None and not isinstance(status, str):
             raise RuntimeError("Herdr api snapshot agent_status is malformed.")
-        _require_text_or_none(agent, ("tab_id", "workspace_id"))
+        _require_text_or_none(agent, ("pane_id", "tab_id", "workspace_id"))
     for tab in tabs:
         _require_text_or_none(tab, ("tab_id", "workspace_id", "label"))
     for workspace in workspaces:
@@ -851,6 +851,9 @@ def _validate_snapshot_field_types(
         status = workspace.get("agent_status")
         if status is not None and not isinstance(status, str):
             raise RuntimeError("Herdr api snapshot workspace agent_status is malformed.")
+        number = workspace.get("number")
+        if number is not None and (not isinstance(number, int) or isinstance(number, bool)):
+            raise RuntimeError("Herdr api snapshot workspace number is malformed.")
 
 
 def _require_text_or_none(entry: dict[str, Any], keys: tuple[str, ...]) -> None:
@@ -859,6 +862,92 @@ def _require_text_or_none(entry: dict[str, Any], keys: tuple[str, ...]) -> None:
         value = entry.get(key)
         if value is not None and not isinstance(value, str):
             raise RuntimeError(f"Herdr api snapshot field {key} is malformed.")
+
+
+def _workspace_number(workspace: dict[str, Any]) -> int | None:
+    number = workspace.get("number")
+    if isinstance(number, int) and not isinstance(number, bool):
+        return number
+    return None
+
+
+def _supervisor_pane_id(agent: dict[str, Any]) -> str | None:
+    tokens = agent.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    supervisor = tokens.get("supervisor_pane_id")
+    return supervisor if isinstance(supervisor, str) and supervisor else None
+
+
+def _build_workspace_cluster_roots(workspaces: list[dict[str, Any]]) -> dict[str, str]:
+    """Ordnet jeden Workspace seinem Team-Cluster zu (Root-Workspace plus eingerückte Baum-Kinder).
+
+    Die Reihenfolge folgt `number`; fehlt sie, bleibt die Listenposition als stabiler Tiebreak. Einträge ohne
+    gültige `workspace_id` werden übersprungen, damit der aktuelle Root nie auf None kippt.
+    """
+    ordered: list[tuple[tuple[bool, int, int], dict[str, Any], str]] = []
+    for idx, ws in enumerate(workspaces):
+        ws_id = ws.get("workspace_id")
+        if not isinstance(ws_id, str) or not ws_id:
+            continue
+        number = _workspace_number(ws)
+        ordered.append(((number is None, number or 0, idx), ws, ws_id))
+    ordered.sort(key=lambda entry: entry[0])
+
+    cluster_root_by_ws: dict[str, str] = {}
+    current_root: str | None = None
+    for _, ws, ws_id in ordered:
+        if (ws.get("label") or "").lstrip().startswith(TREE_PREFIXES):
+            cluster_root_by_ws[ws_id] = current_root or ws_id
+        else:
+            current_root = ws_id
+            cluster_root_by_ws[ws_id] = ws_id
+    return cluster_root_by_ws
+
+
+def _find_active_working_roots(
+    agents: list[dict[str, Any]], workspaces: list[dict[str, Any]], cluster_root_by_ws: dict[str, str]
+) -> set[str]:
+    """Cluster-Roots, in denen gerade Arbeit läuft.
+
+    Herdr meldet bei gemischten Tabs für den Workspace "done", weil Done dort Working schlägt. Arbeit zählt deshalb
+    auf drei Wegen: Workspace-Status, Agent-Status im Cluster und die transitive supervisor_pane_id-Kette
+    flacher Worker. Die Kette ist durch `visited` gegen Zyklen abgesichert.
+    """
+    active: set[str] = set()
+
+    def mark(ws_id: Any) -> None:
+        if isinstance(ws_id, str) and ws_id:
+            active.add(cluster_root_by_ws.get(ws_id, ws_id))
+
+    agent_by_pane: dict[str, dict[str, Any]] = {}
+    for agent in agents:
+        pane_id = agent.get("pane_id")
+        if isinstance(pane_id, str) and pane_id:
+            agent_by_pane[pane_id] = agent
+
+    for ws in workspaces:
+        if ws.get("agent_status") == "working":
+            mark(ws.get("workspace_id"))
+    for agent in agents:
+        if agent.get("agent_status") != "working":
+            continue
+        mark(agent.get("workspace_id"))
+        visited: set[str] = set()
+        supervisor_pane = _supervisor_pane_id(agent)
+        while supervisor_pane and supervisor_pane not in visited:
+            visited.add(supervisor_pane)
+            supervisor_agent = agent_by_pane.get(supervisor_pane)
+            supervisor_ws_id = supervisor_agent.get("workspace_id") if supervisor_agent else None
+            if not supervisor_ws_id:
+                prefix = supervisor_pane.split(":", 1)[0]
+                if prefix in cluster_root_by_ws:
+                    supervisor_ws_id = prefix
+            mark(supervisor_ws_id)
+            if supervisor_agent is None:
+                break
+            supervisor_pane = _supervisor_pane_id(supervisor_agent)
+    return active
 
 
 def build_attention_summary(
@@ -877,10 +966,14 @@ def build_attention_summary(
         "unknown": sum(status == "unknown" for status in statuses),
         "attention_available": True,
     }
-    # Herdr zeigt in der Spaces-Seitenleiste nur dann einen blauen Punkt, wenn der Workspace selbst "done" ist.
-    # Arbeitet irgendein Tab im Workspace, zeigt er einen orangenen Punkt. "Für dich" spiegelt deshalb die
-    # blauen Punkte 1:1: pro Workspace höchstens ein fertiger Tab, und nur wenn der Workspace blau ist.
+    # Herdr zeigt einen blauen Workspace-Punkt nur, wenn der Workspace selbst "done" ist. Done hat dabei Vorrang
+    # vor Working (herdr/src/workspace/aggregate.rs), ein Workspace mit arbeitendem Tab kann also trotzdem "done"
+    # melden. Fertige Tabs in Clustern mit laufender Arbeit (eigener Tab, Kind-Workspace oder Worker über
+    # supervisor_pane_id) werden deshalb unterdrückt. Ohne laufende Arbeit spiegelt "Für dich" die blauen Punkte:
+    # pro Workspace höchstens ein fertiger Tab, und nur wenn der Workspace blau ist.
     workspace_status_by_id = {ws.get("workspace_id"): ws.get("agent_status") for ws in workspaces if ws.get("workspace_id")}
+    cluster_root_by_ws = _build_workspace_cluster_roots(workspaces)
+    active_working_roots = _find_active_working_roots(agents, workspaces, cluster_root_by_ws)
     attention_done = attention_blocked = suppressed_done = suppressed_blocked = suppressed_unknown = 0
     attention_items: list[dict[str, Any]] = []
     blue_done_by_workspace: dict[Any, list[dict[str, Any]]] = {}
@@ -899,8 +992,11 @@ def build_attention_summary(
                 "_seq": agent.get("completion_seq") or 0,
             }
             if status == "done":
+                root_ws_id = cluster_root_by_ws.get(workspace_id, workspace_id) if workspace_id else None
                 workspace_status = workspace_status_by_id.get(workspace_id) if known else None
-                if workspace_status is None:
+                if root_ws_id and root_ws_id in active_working_roots:
+                    suppressed_done += 1  # Team oder Cluster arbeitet noch
+                elif workspace_status is None:
                     attention_done += 1  # unbekannter Workspace-Status: Fail-open wie bisher
                     attention_items.append(item)
                 elif workspace_status == "done":

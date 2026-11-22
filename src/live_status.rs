@@ -1,11 +1,15 @@
 use crate::{
     autostart,
     backend::{self, AgentSummary, CompletionAction, WatchStatus},
-    status_channel::{FleetCounts, FourthTile, attention_tooltip_lines, fourth_tile},
+    status_channel::{
+        FleetCounts, FourthTile, FourthTileMode, attention_tooltip_lines, finished_tooltip_lines,
+        fourth_tile_for_mode,
+    },
     language::Language,
     log_viewer,
     media::{self, MediaCommand, MediaSnapshot},
     quota::{PacingForecast, PacingHealth, ProviderId, ProviderQuota, QuotaSnapshot},
+    repaint_cadence,
     settings,
     system_metrics::{self, SystemMetrics},
     taskbar,
@@ -21,7 +25,7 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender},
 };
 use std::thread;
@@ -164,6 +168,7 @@ const OWNER_PID_PREFIX: &str = "--owner-pid=";
 const LIVE_OPEN_ATTEMPT_MUTEX: &str = "Local\\HerdrNachtwaechter.LiveOpenAttempt";
 const LIVE_STATUS_OPEN_FAILURE_EVENT: &str = "live_status_open_failed";
 const LIVE_STATUS_DPI_HEAL_EVENT: &str = "live_status_dpi_healed";
+const LIVE_STATUS_SESSION_LOCK_EVENT: &str = "live_status_session_lock_monitor";
 const LIVE_STATUS_PANIC_EVENT: &str = "live_status_panic";
 #[cfg(test)]
 const LIVE_OPEN_ATTEMPT_MUTEX_ENV: &str = "HERDR_LIVE_OPEN_ATTEMPT_MUTEX";
@@ -1547,10 +1552,13 @@ fn run_window() -> Result<()> {
         Box::new(move |creation_context| {
             creation_context.egui_ctx.set_zoom_factor(scale);
             configure_visuals(&creation_context.egui_ctx);
-            Ok(Box::new(LiveStatusApp::new(
-                scale,
-                parse_owner_pid(std::env::args()),
-            )))
+            let app = LiveStatusApp::new(scale, parse_owner_pid(std::env::args()));
+            spawn_session_lock_monitor(
+                &creation_context.egui_ctx,
+                Arc::clone(&app.session_locked),
+                Arc::clone(&app.session_lock_monitor_stop),
+            );
+            Ok(Box::new(app))
         }),
     )
     .map_err(|error| anyhow::anyhow!("Live-Status-Fenster konnte nicht ausgeführt werden: {error}"))
@@ -1620,6 +1628,13 @@ struct LiveStatusApp {
     clock_visible: bool,
     clock_second_hand_visible: bool,
     repaint_interval_ms: u32,
+    fourth_tile_mode: FourthTileMode,
+    /// Whether the Windows session is currently locked; the repaint cadence
+    /// switches to a calm interval while no frame is visible. Updated once per
+    /// second by the session-lock monitor thread.
+    session_locked: Arc<AtomicBool>,
+    /// Signals the session-lock monitor thread to stop when the app drops.
+    session_lock_monitor_stop: Arc<AtomicBool>,
     scale: f32,
     last_saved_position: Option<[f32; 2]>,
     owner_pid: Option<u32>,
@@ -1685,7 +1700,101 @@ pub enum ConfigTab {
 impl Drop for LiveStatusApp {
     fn drop(&mut self) {
         self.metrics_cancellation.cancel();
+        self.session_lock_monitor_stop.store(true, Ordering::Relaxed);
         let _ = self.media_command_tx.send(MediaCommand::Shutdown);
+    }
+}
+
+/// Whether the current Windows session is locked (or disconnected). Reads the
+/// extended session info once; every failure path stays fail-open (`false`),
+/// so a denied or partial query never calms the UI into invisibility.
+#[cfg(windows)]
+fn is_windows_session_locked() -> bool {
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTSDisconnected, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNKNOWN,
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSINFOEXW, WTSFreeMemory,
+        WTSQuerySessionInformationW, WTSSessionInfoEx,
+    };
+
+    /// WTSQuerySessionInformationW hands out a buffer that the caller must
+    /// release with WTSFreeMemory; the guard keeps that pairing airtight.
+    struct WtsBuffer(*mut core::ffi::c_void);
+    impl Drop for WtsBuffer {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { WTSFreeMemory(self.0) };
+            }
+        }
+    }
+
+    let mut buffer = std::ptr::null_mut();
+    let mut bytes = 0u32;
+    let ok = unsafe {
+        WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            WTS_CURRENT_SESSION,
+            WTSSessionInfoEx,
+            &mut buffer,
+            &mut bytes,
+        )
+    };
+    let _guard = WtsBuffer(buffer.cast());
+    if ok == 0
+        || buffer.is_null()
+        || (bytes as usize) < std::mem::size_of::<WTSINFOEXW>()
+    {
+        return false;
+    }
+    let info = unsafe { &*(buffer.cast::<WTSINFOEXW>()) };
+    if info.Level != 1 {
+        return false;
+    }
+    let level1 = unsafe { &info.Data.WTSInfoExLevel1 };
+    let session_flags = level1.SessionFlags;
+    if session_flags == WTS_SESSIONSTATE_UNKNOWN as i32 {
+        return false;
+    }
+    session_flags == WTS_SESSIONSTATE_LOCK as i32 || level1.SessionState == WTSDisconnected
+}
+
+/// Polls the session lock once per second on a tiny background thread and
+/// refreshes `session_locked` accordingly. Only the unlock transition asks the
+/// UI for an immediate repaint, so the visible cadence resumes at once while
+/// the locked phase stays calm.
+#[cfg(windows)]
+fn spawn_session_lock_monitor(
+    ctx: &egui::Context,
+    session_locked: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    // egui::Context is a cheap Arc-based clone and outlives the monitor
+    // thread; the Arc clone keeps the original available for the fail-open
+    // store below when the thread could not be spawned.
+    let ctx = ctx.clone();
+    let monitor_locked = Arc::clone(&session_locked);
+    let spawned = thread::Builder::new()
+        .name("session-lock-monitor".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(1));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let now_locked = is_windows_session_locked();
+                let was_locked = monitor_locked.swap(now_locked, Ordering::Relaxed);
+                if was_locked && !now_locked {
+                    ctx.request_repaint();
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        // Fail-open: without a monitor the lock state must never stick at its
+        // startup value, so calm-down is disabled entirely.
+        session_locked.store(false, Ordering::Relaxed);
+        record_ui_error(
+            LIVE_STATUS_SESSION_LOCK_EVENT,
+            &format!("Sitzungssperren-Monitor konnte nicht gestartet werden: {error}"),
+        );
     }
 }
 
@@ -1753,6 +1862,9 @@ impl LiveStatusApp {
             clock_visible: window_settings::clock_visible(),
             clock_second_hand_visible: window_settings::clock_second_hand_visible(),
             repaint_interval_ms: window_settings::live_status_repaint_interval_ms(),
+            fourth_tile_mode: window_settings::live_status_fourth_tile_mode(),
+            session_locked: Arc::new(AtomicBool::new(is_windows_session_locked())),
+            session_lock_monitor_stop: Arc::new(AtomicBool::new(false)),
             scale,
             last_saved_position: window_settings::live_status_position(),
             owner_pid,
@@ -2305,7 +2417,12 @@ impl eframe::App for LiveStatusApp {
             // would fire a fresh nudge in exactly that frame.
             if main_moved || self.window_drag_started {
                 self.main_dpi_heal = None;
-            } else if window_chrome::scale_mismatch(native_ppp, monitor_ppp) {
+            // No DPI heals against a locked desktop: the monitor DPI can read
+            // differently while the display subsystem sleeps, which would burn
+            // the nudge budget for nothing.
+            } else if !self.session_locked.load(Ordering::Relaxed)
+                && window_chrome::scale_mismatch(native_ppp, monitor_ppp)
+            {
                 if dpi_heal_due(&mut self.main_dpi_heal, Instant::now())
                     && window_chrome::heal_stale_window_scale(main_hwnd)
                 {
@@ -2437,7 +2554,8 @@ impl eframe::App for LiveStatusApp {
                 }
             }
             self.pomodoro_last_tick = Some(now);
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            // The pomodoro cadence itself is decided by the single repaint
+            // authority at the end of this frame (see repaint_cadence).
         } else {
             self.pomodoro_last_tick = None;
         }
@@ -2630,7 +2748,7 @@ impl eframe::App for LiveStatusApp {
                                 if self.status_available && agents.available {
                                     let old_spacing = ui.spacing().item_spacing.x;
                                     ui.spacing_mut().item_spacing.x = 4.0;
-                                    let fourth = fourth_tile(&agents.attention, agents.done);
+                                    let fourth = fourth_tile_for_mode(&agents.attention, agents.done, self.fourth_tile_mode);
                                     ui.horizontal(|ui| {
                                         metric(ui, self.language.text("Erkannt", "Detected"), agents.total, TEXT, false);
                                         divider(ui);
@@ -2680,25 +2798,27 @@ impl eframe::App for LiveStatusApp {
                                         }
                                     });
                                     ui.spacing_mut().item_spacing.x = old_spacing;
-                                    if matches!(fourth, FourthTile::Attention { .. }) {
-                                        let lines = attention_tooltip_lines(
-                                            FleetCounts {
-                                                total: agents.total,
-                                                working: agents.working,
-                                                idle: agents.idle,
-                                                blocked: agents.blocked,
-                                                unknown: agents.unknown,
-                                            },
-                                            &agents.attention,
-                                            self.language,
-                                        );
-                                        let kpi_hover = ui.interact(
-                                            ui.min_rect(),
-                                            ui.id().with("kpi_attention_tooltip"),
-                                            egui::Sense::hover(),
-                                        );
-                                        let _ = kpi_hover.on_hover_text(lines.join("\n"));
-                                    }
+                                    let fleet = FleetCounts {
+                                        total: agents.total,
+                                        working: agents.working,
+                                        idle: agents.idle,
+                                        blocked: agents.blocked,
+                                        unknown: agents.unknown,
+                                    };
+                                    let lines = match &fourth {
+                                        FourthTile::Attention { .. } => {
+                                            attention_tooltip_lines(fleet, &agents.attention, self.language)
+                                        }
+                                        FourthTile::Finished { done } => {
+                                            finished_tooltip_lines(fleet, *done, self.language)
+                                        }
+                                    };
+                                    let kpi_hover = ui.interact(
+                                        ui.min_rect(),
+                                        ui.id().with("kpi_attention_tooltip"),
+                                        egui::Sense::hover(),
+                                    );
+                                    let _ = kpi_hover.on_hover_text(lines.join("\n"));
                                 } else if self.status_available {
                                     ui.colored_label(
                                         YELLOW,
@@ -2876,14 +2996,27 @@ impl eframe::App for LiveStatusApp {
         if self.quota_open {
             render_quota_satellite_window(self, ui.ctx());
         }
-        // Each repaint has a small random black-flash chance on the OpenGL
-        // surface (see window_settings::REPAINT_INTERVAL_MS_VALUES), so the
-        // cadence is a user setting instead of a constant.
-        let repaint_delay = if self.pomodoro_running {
-            Duration::from_millis(100)
+        // The single repaint authority. Each repaint has a small random
+        // black-flash chance on the OpenGL surface (see
+        // window_settings::REPAINT_INTERVAL_MS_VALUES), so the cadence is a
+        // user setting while the session is unlocked — and every rendered
+        // frame also grows the eframe host heap a little on a locked desktop,
+        // so a locked session switches to a calm interval that a countdown
+        // may still tighten (repaint_cadence).
+        let session_locked = self.session_locked.load(Ordering::Relaxed);
+        let base_interval_ms = if self.pomodoro_running {
+            repaint_cadence::POMODORO_REPAINT_INTERVAL_MS
         } else {
-            Duration::from_millis(u64::from(self.repaint_interval_ms))
+            self.repaint_interval_ms
         };
+        let has_active_countdown =
+            matches!(self.status, WatchStatus::ShutdownWarning { .. }) || self.pomodoro_running;
+        let effective_ms = repaint_cadence::effective_repaint_interval_ms(
+            base_interval_ms,
+            session_locked,
+            has_active_countdown,
+        );
+        let repaint_delay = Duration::from_millis(u64::from(effective_ms));
         if !self.first_frame_painted {
             self.first_frame_painted = true;
             ui.ctx().request_repaint();
@@ -3354,6 +3487,11 @@ const REPAINT_INTERVAL_CHOICES: [(u32, &str, &str); 3] = [
     (1000, "Sekündlich (1000 ms)", "Once per second (1000 ms)"),
 ];
 
+const FOURTH_TILE_MODE_CHOICES: [(FourthTileMode, &str, &str); 2] = [
+    (FourthTileMode::ManagersOnly, "Nur Manager (Für dich)", "Managers only (Attention)"),
+    (FourthTileMode::AllAgents, "Alle (Fertig)", "All agents (Finished)"),
+];
+
 fn context_menu_should_close_after_selection(
     reset_requested: bool,
     clock_visibility_changed: bool,
@@ -3607,6 +3745,7 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
     let mut clock_visibility_choice = None;
     let mut second_hand_choice = None;
     let mut repaint_interval_choice = None;
+    let mut fourth_tile_mode_choice = None;
     let mut quota_visibility_choice = None;
     let mut quota_docked_choice = None;
     let menu = egui::Area::new(egui::Id::new("live_status_context_menu"))
@@ -3779,6 +3918,24 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
                 ui.separator();
                 ui.label(
                     egui::RichText::new(
+                        app.language.text("Fertig-Zählung", "Finished count"),
+                    )
+                    .color(GRAY),
+                );
+                for (mode, text_de, text_en) in FOURTH_TILE_MODE_CHOICES {
+                    if ui
+                        .radio(
+                            app.fourth_tile_mode == mode,
+                            app.language.text(text_de, text_en),
+                        )
+                        .clicked()
+                    {
+                        fourth_tile_mode_choice = Some(mode);
+                    }
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
                         app.language.text("Eckenrundung", "Corner radius"),
                     )
                     .color(GRAY),
@@ -3814,7 +3971,8 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
         second_hand_choice.is_some(),
         repaint_interval_choice.is_some(),
     ) || quota_visibility_choice.is_some()
-        || quota_docked_choice.is_some();
+        || quota_docked_choice.is_some()
+        || fourth_tile_mode_choice.is_some();
     if let Some(show_clock) = clock_visibility_choice {
         match window_settings::set_clock_visible(show_clock) {
             Ok(()) => app.clock_visible = show_clock,
@@ -3844,6 +4002,13 @@ fn handle_context_menu(app: &mut LiveStatusApp, ui: &mut egui::Ui) {
             Ok(()) => app.repaint_interval_ms = interval,
             Err(error) => app.error = Some(error.to_string()),
         }
+    }
+    if let Some(mode) = fourth_tile_mode_choice {
+        match window_settings::set_live_status_fourth_tile_mode(mode) {
+            Ok(()) => app.fourth_tile_mode = mode,
+            Err(error) => app.error = Some(error.to_string()),
+        }
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
     if reset_requested {
         apply_live_status_scale(
@@ -6548,9 +6713,12 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
         // The main drag holds the docked satellite in place between frames,
         // so a still satellite frame during a main drag must not spend the
         // budget either; quota_drag_active alone only covers satellite drags.
+        // A locked session must not heal either (same reason as the main
+        // window: the monitor DPI can misread while the display sleeps).
         if !app.quota_drag_active
             && !app.window_drag_started
             && !sat_moved
+            && !app.session_locked.load(Ordering::Relaxed)
             && window_chrome::scale_mismatch(sat_native_ppp, sat_monitor_ppp)
         {
             let attempts_used = app.satellite_dpi_heal.map(|(_, count)| count).unwrap_or(0);
@@ -7587,6 +7755,40 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                                 }
                             }
                             sy += rate_card_h + 5.0;
+
+                            // 2b. Fertig-Zählung Card: welche Agenten die 4. KPI-Kachel zählt
+                            let count_card_h = 44.0;
+                            let count_card_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 8.0, sy),
+                                egui::vec2(card_w, count_card_h),
+                            );
+                            painter.rect_filled(count_card_rect, egui::CornerRadius::same(6), egui::Color32::from_rgba_unmultiplied(20, 28, 45, 140));
+                            painter.rect_stroke(count_card_rect, egui::CornerRadius::same(6), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 80)), egui::StrokeKind::Inside);
+
+                            let count_label = language.text("Fertig-Zählung:", "Finished count:");
+                            let count_galley = painter.layout_no_wrap(count_label.into(), egui::FontId::proportional(11.0), TEXT);
+                            painter.galley(egui::pos2(count_card_rect.left() + 10.0, count_card_rect.center().y - count_galley.size().y / 2.0), count_galley, TEXT);
+
+                            let count_choices = [
+                                (FourthTileMode::ManagersOnly, language.text("Nur Manager", "Managers")),
+                                (FourthTileMode::AllAgents, language.text("Alle", "All")),
+                            ];
+                            let count_gap = 5.0;
+                            let count_w = 90.0;
+                            let count_h = 20.0;
+                            for (ci, (mode, c_label)) in count_choices.iter().enumerate() {
+                                let cx = count_card_rect.right() - 10.0 - ((2 - ci) as f32) * (count_w + count_gap) + count_gap;
+                                let c_rect = egui::Rect::from_min_size(
+                                    egui::pos2(cx, count_card_rect.center().y - count_h / 2.0),
+                                    egui::vec2(count_w, count_h),
+                                );
+                                if render_option_pill(ui, painter, c_rect, c_label, app.fourth_tile_mode == *mode, &format!("sat_count_{ci}")) {
+                                    let _ = window_settings::set_live_status_fourth_tile_mode(*mode);
+                                    app.fourth_tile_mode = *mode;
+                                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                }
+                            }
+                            sy += count_card_h + 5.0;
 
                             // 3. Sprache Card
                             let lang_card_h = 44.0;

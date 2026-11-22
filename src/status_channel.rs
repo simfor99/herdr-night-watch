@@ -312,6 +312,42 @@ pub fn fourth_tile(attention: &AttentionPayload, raw_done: usize) -> FourthTile 
     }
 }
 
+/// Which finished agents the fourth KPI tile counts. Only the tile and its tooltip depend on this mode;
+/// the watcher's shutdown countdown checks the whole fleet and ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FourthTileMode {
+    /// Current default: only finished or blocked managers, shown as "Für dich".
+    #[default]
+    ManagersOnly,
+    /// Original mode: every finished agent, unfiltered, shown as "Fertig".
+    AllAgents,
+}
+
+/// Reads the stored mode. Only "all" (trimmed, case-insensitive) selects the unfiltered view. A missing or
+/// unknown value keeps the default, so a damaged registry entry never changes what the tile shows.
+pub fn parse_fourth_tile_mode(raw: Option<&str>) -> FourthTileMode {
+    match raw.map(|value| value.trim().eq_ignore_ascii_case("all")) {
+        Some(true) => FourthTileMode::AllAgents,
+        _ => FourthTileMode::ManagersOnly,
+    }
+}
+
+/// The token written to the registry. It round-trips through `parse_fourth_tile_mode`.
+pub fn fourth_tile_mode_token(mode: FourthTileMode) -> &'static str {
+    match mode {
+        FourthTileMode::ManagersOnly => "managers",
+        FourthTileMode::AllAgents => "all",
+    }
+}
+
+/// Picks the fourth tile for the chosen mode. `AllAgents` ignores the attention payload entirely.
+pub fn fourth_tile_for_mode(attention: &AttentionPayload, raw_done: usize, mode: FourthTileMode) -> FourthTile {
+    match mode {
+        FourthTileMode::AllAgents => FourthTile::Finished { done: raw_done },
+        FourthTileMode::ManagersOnly => fourth_tile(attention, raw_done),
+    }
+}
+
 /// Whole-fleet counts that the attention tooltip reconciles against.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FleetCounts {
@@ -378,6 +414,30 @@ pub fn attention_tooltip_lines(
     lines
 }
 
+/// Hover text of the tile in the "Alle" mode: the plain fleet arithmetic with the raw finished count.
+/// Blocked and unknown agents stay visible here, since this view has no attention list to show them in.
+pub fn finished_tooltip_lines(fleet: FleetCounts, done: usize, language: Language) -> Vec<String> {
+    let mut summary = format!(
+        "{} {}: {} {}, {} {}, {} {}",
+        fleet.total,
+        language.text("erkannt", "detected"),
+        fleet.working,
+        language.text("arbeiten", "working"),
+        fleet.idle,
+        language.text("bereit", "ready"),
+        done,
+        language.text("fertig", "finished"),
+    );
+    let unclear = fleet.blocked + fleet.unknown;
+    if unclear > 0 {
+        summary.push_str(&format!(
+            ", +{unclear} {}",
+            language.text("blockiert/unklar", "blocked/unclear")
+        ));
+    }
+    vec![summary]
+}
+
 #[cfg(test)]
 mod attention_tests {
     use super::*;
@@ -435,6 +495,60 @@ mod attention_tests {
         assert_eq!(
             fourth_tile(&attention, 17),
             FourthTile::Attention { total: 0, done: 0, blocked: 0, suppressed_blocked: 1 }
+        );
+    }
+
+    #[test]
+    fn fourth_tile_mode_parses_defensively_and_round_trips() {
+        assert_eq!(parse_fourth_tile_mode(Some("all")), FourthTileMode::AllAgents);
+        assert_eq!(parse_fourth_tile_mode(Some(" ALL ")), FourthTileMode::AllAgents);
+        assert_eq!(parse_fourth_tile_mode(Some("managers")), FourthTileMode::ManagersOnly);
+        assert_eq!(parse_fourth_tile_mode(Some("unknown")), FourthTileMode::ManagersOnly);
+        assert_eq!(parse_fourth_tile_mode(Some("")), FourthTileMode::ManagersOnly);
+        assert_eq!(parse_fourth_tile_mode(None), FourthTileMode::ManagersOnly);
+        for mode in [FourthTileMode::ManagersOnly, FourthTileMode::AllAgents] {
+            assert_eq!(parse_fourth_tile_mode(Some(fourth_tile_mode_token(mode))), mode);
+        }
+    }
+
+    #[test]
+    fn all_agents_mode_ignores_the_attention_payload() {
+        let attention: AttentionPayload = serde_json::from_str(NEW_PAYLOAD).expect("new payload");
+        assert_eq!(
+            fourth_tile_for_mode(&attention, 17, FourthTileMode::AllAgents),
+            FourthTile::Finished { done: 17 }
+        );
+    }
+
+    #[test]
+    fn managers_only_mode_uses_the_attention_view_and_keeps_the_fallback() {
+        let attention: AttentionPayload = serde_json::from_str(NEW_PAYLOAD).expect("new payload");
+        assert_eq!(
+            fourth_tile_for_mode(&attention, 17, FourthTileMode::ManagersOnly),
+            FourthTile::Attention { total: 1, done: 1, blocked: 0, suppressed_blocked: 1 }
+        );
+        let old: AttentionPayload = serde_json::from_str(OLD_PAYLOAD).expect("old payload");
+        assert_eq!(
+            fourth_tile_for_mode(&old, 17, FourthTileMode::ManagersOnly),
+            FourthTile::Finished { done: 17 }
+        );
+    }
+
+    #[test]
+    fn finished_tooltip_is_one_line_in_both_languages_and_names_unclear_agents() {
+        let fleet = FleetCounts { total: 35, working: 12, idle: 6, blocked: 2, unknown: 1 };
+        assert_eq!(
+            finished_tooltip_lines(fleet, 17, Language::German),
+            vec!["35 erkannt: 12 arbeiten, 6 bereit, 17 fertig, +3 blockiert/unklar".to_string()]
+        );
+        assert_eq!(
+            finished_tooltip_lines(fleet, 17, Language::English),
+            vec!["35 detected: 12 working, 6 ready, 17 finished, +3 blocked/unclear".to_string()]
+        );
+        let calm = FleetCounts { total: 35, working: 12, idle: 6, blocked: 0, unknown: 0 };
+        assert_eq!(
+            finished_tooltip_lines(calm, 17, Language::German),
+            vec!["35 erkannt: 12 arbeiten, 6 bereit, 17 fertig".to_string()]
         );
     }
 

@@ -6,6 +6,8 @@
 #[cfg(any(windows, test))]
 mod quota;
 #[cfg(any(windows, test))]
+mod repaint_cadence;
+#[cfg(any(windows, test))]
 mod status_channel;
 
 #[cfg(windows)]

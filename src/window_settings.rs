@@ -282,6 +282,24 @@ fn clamp_repaint_interval_ms(value: Option<u32>) -> u32 {
         .unwrap_or(DEFAULT_REPAINT_INTERVAL_MS)
 }
 
+const LIVE_STATUS_FOURTH_TILE_MODE_VALUE: &str = "LiveStatusFourthTileMode";
+
+/// Thin registry wrapper: the parsing and the token live in `status_channel` so they run on Linux too.
+pub fn live_status_fourth_tile_mode() -> crate::status_channel::FourthTileMode {
+    let raw = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .and_then(|key| key.get_value::<String, _>(LIVE_STATUS_FOURTH_TILE_MODE_VALUE))
+        .ok();
+    crate::status_channel::parse_fourth_tile_mode(raw.as_deref())
+}
+
+pub fn set_live_status_fourth_tile_mode(mode: crate::status_channel::FourthTileMode) -> anyhow::Result<()> {
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY)?;
+    let token = crate::status_channel::fourth_tile_mode_token(mode).to_string();
+    key.set_value(LIVE_STATUS_FOURTH_TILE_MODE_VALUE, &token)?;
+    Ok(())
+}
+
 pub fn set_clock_second_hand_visible(show: bool) -> anyhow::Result<()> {
     write_bool_setting(CLOCK_SECOND_HAND_VALUE, show)
 }
