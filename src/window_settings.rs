@@ -429,8 +429,13 @@ pub fn set_live_status_quota_show_claude(show: bool) -> anyhow::Result<()> {
     write_bool_setting(LIVE_STATUS_QUOTA_SHOW_CLAUDE_VALUE, show)
 }
 
+const DEFAULT_LIVE_STATUS_QUOTA_SHOW_QWEN: bool = false;
+
 pub fn live_status_quota_show_qwen() -> bool {
-    read_bool_setting(LIVE_STATUS_QUOTA_SHOW_QWEN_VALUE, true)
+    read_bool_setting(
+        LIVE_STATUS_QUOTA_SHOW_QWEN_VALUE,
+        DEFAULT_LIVE_STATUS_QUOTA_SHOW_QWEN,
+    )
 }
 
 pub fn set_live_status_quota_show_qwen(show: bool) -> anyhow::Result<()> {
@@ -530,6 +535,25 @@ mod tests {
         assert!(bool_setting_value(None, true));
         assert!(!bool_setting_value(Some(0), true));
         assert!(bool_setting_value(Some(1), true));
+    }
+
+    #[test]
+    fn qwen_quota_defaults_to_hidden_without_registry_override() {
+        const {
+            assert!(!DEFAULT_LIVE_STATUS_QUOTA_SHOW_QWEN);
+        }
+        assert!(!bool_setting_value(
+            None,
+            DEFAULT_LIVE_STATUS_QUOTA_SHOW_QWEN
+        ));
+        assert!(bool_setting_value(
+            Some(1),
+            DEFAULT_LIVE_STATUS_QUOTA_SHOW_QWEN
+        ));
+        assert!(!bool_setting_value(
+            Some(0),
+            DEFAULT_LIVE_STATUS_QUOTA_SHOW_QWEN
+        ));
     }
 
     #[test]
