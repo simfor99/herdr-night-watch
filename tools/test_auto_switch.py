@@ -679,15 +679,15 @@ def test_phase3_bounces_only_unfocused_idle_unprotected_panes_with_no_resume_pro
     })
     # Fünf stale Panes mit jeweils eigener Konversation:
     # p1 (bauer, idle, unfocused) -> soll gebounct werden
-    # p2 (focused=True) -> geskippt
+    # p2 (focused=True) -> im 1. Tick wegen Focus-Settle geskippt
     # p3 (working) -> geskippt
-    # p4 (architekt) -> geskippt
+    # p4 (architekt, idle, unfocused) -> soll beim Kontowechsel ebenfalls gebounct werden
     # p5 (vermarkter) -> geskippt
     add_agy(world.proc, 4101, "w1:p1", conv=_conv_uuid(1), start_epoch=BTIME + 100, cwd=world.cwd)
     add_agy(world.proc, 4102, "w1:p2", conv=_conv_uuid(2), start_epoch=BTIME + 200, cwd=world.cwd)
     add_agy(world.proc, 4103, "w1:p3", conv=_conv_uuid(3), start_epoch=BTIME + 300, cwd=world.cwd)
     add_agy(world.proc, 4104, "w1:p4", conv=_conv_uuid(4), start_epoch=BTIME + 400, cwd=world.cwd)
-    add_agy(world.proc, 4105, "w1:p5", conv=_conv_uuid(5), start_epoch=BTIME + 500, cwd=world.cwd)
+    add_agy(world.proc, 4105, "w1:p5", conv=_conv_uuid(5), start_epoch=BTIME + 350, cwd=world.cwd)
 
     panes = [
         {**pane(pane_id="w1:p1", conv=_conv_uuid(1), status="idle"), "tab_id": "t-bauer", "focused": False},
@@ -710,23 +710,29 @@ def test_phase3_bounces_only_unfocused_idle_unprotected_panes_with_no_resume_pro
 
         def run(self, pane_id, text):
             super().run(pane_id, text)
+            pid_map = {"w1:p1": ("4101", 4999, _conv_uuid(1)), "w1:p4": ("4104", 4998, _conv_uuid(4))}
+            old_pid, new_pid, conv = pid_map[pane_id]
             if text == "/exit":
-                # Alten PID 4101 entfernen
-                for sub in (world.proc / "4101").iterdir():
+                for sub in (world.proc / old_pid).iterdir():
                     sub.unlink()
-                (world.proc / "4101").rmdir()
+                (world.proc / old_pid).rmdir()
             elif "agy --conversation" in text:
-                add_agy(world.proc, 4999, pane_id, conv=_conv_uuid(1), start_epoch=int(time.time()), cwd=world.cwd)
+                add_agy(world.proc, new_pid, pane_id, conv=conv, start_epoch=int(time.time()), cwd=world.cwd)
 
     herdr = MultiHerdr(panes)
     out = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
 
     assert out["decision"] == "switched"
-    assert out["bounce_summary"]["executed"] == 1
+    assert out["bounce_summary"]["executed"] == 2
     bounced = [b for b in out["bounces"] if b["status"] == "ok"]
-    assert [b["pane_id"] for b in bounced] == ["w1:p1"]
-    assert bounced[0]["wakeup_status"] == "disabled"
-    assert [c[0] for c in herdr.calls] == ["w1:p1", "w1:p1"]
+    assert [b["pane_id"] for b in bounced] == ["w1:p1", "w1:p4"]
+    assert all(b["wakeup_status"] == "disabled" for b in bounced)
+    skipped = {b["pane_id"]: b for b in out["bounces"] if b["status"] == "skipped"}
+    assert set(skipped) == {"w1:p2", "w1:p3", "w1:p5"}
+    assert "pane_focused" in skipped["w1:p2"]["blockers"]
+    assert skipped["w1:p3"]["reason"] == "live_blockers"
+    assert "protected_human_tab" in skipped["w1:p5"]["blockers"]
+    assert [c[0] for c in herdr.calls] == ["w1:p1", "w1:p1", "w1:p4", "w1:p4"]
 
 
 def test_phase3_respects_max_bounces_and_start_epoch_order(world, monkeypatch):
@@ -799,9 +805,9 @@ def test_phase3_skips_when_bounce_lock_busy_and_isolates_wallclock_and_errors(wo
         os.close(lock_fd)
 
     # Test 2: CliError-Isolation + Wallclock-Budget
-    # monotonic wird je Pane zweimal geprüft (vor plan_bounce und vor execute_bounce):
-    # start=0.0, p1 plan=10.0, p1 execute=20.0 (ok), p2 plan=30.0 (ok), p2 execute=130.0 (> 120s Budget).
-    ticks = iter([0.0, 10.0, 20.0, 30.0, 130.0])
+    # monotonic wird vor Discovery (run_started), je Discovery-Pane (p1, p2) und je Kandidat zweimal geprüft:
+    # start=0.0, disc p1=1.0, disc p2=2.0, p1 plan=10.0, p1 execute=20.0 (ok), p2 plan=30.0 (ok), p2 execute=130.0 (> 120s Budget).
+    ticks = iter([0.0, 1.0, 2.0, 10.0, 20.0, 30.0, 130.0])
     monkeypatch.setattr(la.time, "monotonic", lambda: next(ticks))
 
     def fail_execute(adapter, plan, herdr, **kw):
@@ -843,8 +849,8 @@ def test_phase3_starts_no_bounce_when_budget_below_quiet_recheck_plus_margin(wor
         lambda adapter, plan, herdr, **kw: executed.append(plan["pane_id"])
         or {**plan, "status": "ok", "new_pid": 9001, "stage": "start", "wakeup_status": "disabled"},
     )
-    # run_started=0.0, p1 plan=10.0 (ok), p1 execute=20.0 -> Restbudget 100 s < 300 s Ruhe + 15 s Frist.
-    ticks = iter([0.0, 10.0, 20.0])
+    # run_started=0.0, disc p1=1.0, p1 plan=10.0 (ok), p1 execute=20.0 -> Restbudget 100 s < 300 s Ruhe + 15 s Frist.
+    ticks = iter([0.0, 1.0, 10.0, 20.0])
     monkeypatch.setattr(la.time, "monotonic", lambda: next(ticks))
 
     out = json.loads(la.cmd_auto_switch(
@@ -869,8 +875,8 @@ def test_phase3_stops_planning_once_wallclock_deadline_expired(world, monkeypatc
         lambda adapter, plan, herdr, **kw: executed.append(plan["pane_id"])
         or {**plan, "status": "ok", "new_pid": 9001, "stage": "start", "wakeup_status": "disabled"},
     )
-    # run_started=0.0, p1 plan=10.0, p1 execute=20.0 (Rest 100 s >= 45 s), p2 plan=130.0 -> Deadline vorbei.
-    ticks = iter([0.0, 10.0, 20.0, 130.0])
+    # run_started=0.0, disc p1=1.0, disc p2=2.0, p1 plan=10.0, p1 execute=20.0 (Rest 100 s >= 45 s), p2 plan=130.0 -> Deadline vorbei.
+    ticks = iter([0.0, 1.0, 2.0, 10.0, 20.0, 130.0])
     monkeypatch.setattr(la.time, "monotonic", lambda: next(ticks))
 
     out = json.loads(la.cmd_auto_switch(
@@ -1396,3 +1402,474 @@ def test_append_jsonl_locked_truncates_partial_write_on_error(tmp_path, monkeypa
     la._append_jsonl_locked(deltas_path, {"seq": 3})
     parsed = [json.loads(line) for line in deltas_path.read_text(encoding="utf-8").splitlines()]
     assert parsed == [{"seq": 1}, {"seq": 3}]
+
+
+# ---------------------------------------------------------------------------
+# 11. P0 Live-Rebind (iq-acd838c44a3d)
+# ---------------------------------------------------------------------------
+
+
+def _p0_switch_world(world, *, now_epoch: float | None = None):
+    now = time.time() if now_epoch is None else now_epoch
+    _setup_two_slots(world.env, active="acc2", switch_epoch=now - 600)
+    set_usage(world.env, {
+        "a@example.test": tsv(90, 90, 90, 90, resetw=RESET_LATER),
+        "b@example.test": tsv(50, 1, 50, 1, resetw=RESET_EARLIER),
+    })
+
+
+def _make_p0_herdr(world, panes, labels, *, screens=None, exit_pids=None, new_pid_base=4900):
+    import shutil
+
+    screens = screens or {}
+    exit_pids = exit_pids or {}
+    counter = {"n": 0}
+
+    class P0Herdr(FakeHerdr):
+        def tab_label(self, tab_id):
+            return labels.get(tab_id, self.tab)
+
+        def screen_text(self, pane_id):
+            return screens.get(pane_id, self.screen)
+
+        def run(self, pane_id, text):
+            super().run(pane_id, text)
+            if text == "/exit":
+                pid = exit_pids.get(pane_id)
+                if pid is not None and (world.proc / str(pid)).exists():
+                    shutil.rmtree(world.proc / str(pid))
+            elif "agy --conversation" in text:
+                counter["n"] += 1
+                conv = next((p.get("agent_session", {}).get("value") for p in self.panes if p["pane_id"] == pane_id), None)
+                add_agy(
+                    world.proc,
+                    new_pid_base + counter["n"],
+                    pane_id,
+                    conv=conv,
+                    model=None,
+                    start_epoch=int(time.time()),
+                    cwd=world.cwd,
+                )
+
+    return P0Herdr(panes)
+
+
+def test_p0_no_model_agy_process_rebinds_without_model_and_rejects_invalid_model(world):
+    import shlex
+
+    _p0_switch_world(world)
+    add_agy(world.proc, 4101, "w1:p1", conv=_conv_uuid(1), model=None, start_epoch=BTIME + 100, cwd=world.cwd)
+    add_agy(world.proc, 4102, "w1:p2", conv=_conv_uuid(2), model="gemini-4;rm -rf /", start_epoch=BTIME + 200, cwd=world.cwd)
+
+    panes = [
+        {**pane(pane_id="w1:p1", conv=_conv_uuid(1), status="idle"), "tab_id": "t1", "focused": False},
+        {**pane(pane_id="w1:p2", conv=_conv_uuid(2), status="idle"), "tab_id": "t2", "focused": False},
+    ]
+    herdr = _make_p0_herdr(world, panes, {"t1": "Nr1", "t2": "bauer"}, exit_pids={"w1:p1": 4101})
+
+    # Direkter plan_bounce mit allow_default_model=True baut Kommando ohne --model
+    direct_plan = la.plan_bounce(
+        world.env.adapter, "w1:p1", herdr, proc=world.proc, allow_default_model=True
+    )
+    assert direct_plan["blockers"] == []
+    assert direct_plan["model"] is None
+    assert direct_plan["resume_cmd"] == ["agy", "--conversation", _conv_uuid(1)]
+
+    out = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
+
+    assert out["decision"] == "switched"
+    by_pane = {b["pane_id"]: b for b in out["bounces"]}
+    assert by_pane["w1:p1"]["status"] == "ok"
+    restart_cmds = [c[1] for c in herdr.calls if c[0] == "w1:p1" and c[1].startswith("cd ")]
+    assert len(restart_cmds) == 1
+    assert shlex.split(restart_cmds[0]) == ["cd", world.cwd, "&&", "agy", "--conversation", _conv_uuid(1)]
+
+    assert by_pane["w1:p2"]["status"] == "skipped"
+    assert by_pane["w1:p2"]["recommended_action"] == "herdr-mutter-kind"
+    assert any("unzulässige Zeichen" in b for b in by_pane["w1:p2"]["blockers"])
+
+
+def test_p0_large_db_above_soft_threshold_bounces_with_warning_and_blocks_above_hard_cap(world, monkeypatch):
+    assert la.BOUNCE_HARD_MAX_BYTES == 1024 * 1024 * 1024
+    _p0_switch_world(world)
+    conv_dir = world.env.live / ".gemini/antigravity-cli/conversations"
+    (conv_dir / f"{_conv_uuid(1)}.pb").write_bytes(b"a" * 2000)
+    (conv_dir / f"{_conv_uuid(2)}.pb").write_bytes(b"b" * 6000)
+    monkeypatch.setattr(la, "BOUNCE_MAX_BYTES", 1000)
+    monkeypatch.setattr(la, "BOUNCE_HARD_MAX_BYTES", 5000)
+
+    add_agy(world.proc, 4101, "w1:p1", conv=_conv_uuid(1), model=None, start_epoch=BTIME + 100, cwd=world.cwd)
+    add_agy(world.proc, 4102, "w1:p2", conv=_conv_uuid(2), model=None, start_epoch=BTIME + 200, cwd=world.cwd)
+
+    panes = [
+        {**pane(pane_id="w1:p1", conv=_conv_uuid(1), status="idle"), "tab_id": "t1", "focused": False},
+        {**pane(pane_id="w1:p2", conv=_conv_uuid(2), status="idle"), "tab_id": "t2", "focused": False},
+    ]
+    herdr = _make_p0_herdr(world, panes, {"t1": "Nr1", "t2": "bauer"}, exit_pids={"w1:p1": 4101})
+
+    # Ohne allow_large_db bleibt conv1 blockiert
+    plan_strict = la.plan_bounce(
+        world.env.adapter, "w1:p1", herdr, proc=world.proc, allow_default_model=True
+    )
+    assert plan_strict["large_db_warning"] is True
+    assert any("Schwelle" in b for b in plan_strict["blockers"])
+
+    out = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
+    by_pane = {b["pane_id"]: b for b in out["bounces"]}
+    assert by_pane["w1:p1"]["status"] == "ok"
+    assert by_pane["w1:p1"]["large_db_warning"] is True
+    assert by_pane["w1:p2"]["status"] == "skipped"
+    assert by_pane["w1:p2"]["recommended_action"] == "herdr-mutter-kind"
+    assert any("Schwelle" in b for b in by_pane["w1:p2"]["blockers"])
+
+
+def test_p0_phase3_bounces_idle_architekt_tab_while_keeping_human_tabs_protected(world):
+    _p0_switch_world(world)
+    add_agy(world.proc, 4101, "w1:p1", conv=_conv_uuid(1), model=MODEL, start_epoch=BTIME + 100, cwd=world.cwd)
+    add_agy(world.proc, 4102, "w1:p2", conv=_conv_uuid(2), model=MODEL, start_epoch=BTIME + 200, cwd=world.cwd)
+    add_agy(world.proc, 4103, "w1:p3", conv=_conv_uuid(3), model=MODEL, start_epoch=BTIME + 300, cwd=world.cwd)
+
+    panes = [
+        {**pane(pane_id="w1:p1", conv=_conv_uuid(1), status="idle"), "tab_id": "t-arch", "focused": False},
+        {**pane(pane_id="w1:p2", conv=_conv_uuid(2), status="idle"), "tab_id": "t-verm", "focused": False},
+        {**pane(pane_id="w1:p3", conv=_conv_uuid(3), status="idle"), "tab_id": "t-ds", "focused": False},
+    ]
+    labels = {"t-arch": "🏗️ architekt-2", "t-verm": "vermarkter", "t-ds": "design studio"}
+    herdr = _make_p0_herdr(world, panes, labels, exit_pids={"w1:p1": 4101})
+
+    # Direkter plan_bounce ohne allow_architekt schützt weiter
+    assert "protected_architekt_tab" in la.plan_bounce(
+        world.env.adapter, "w1:p1", herdr, proc=world.proc
+    )["blockers"]
+
+    out = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
+    by_pane = {b["pane_id"]: b for b in out["bounces"]}
+    assert by_pane["w1:p1"]["status"] == "ok"
+    assert by_pane["w1:p2"]["status"] == "skipped"
+    assert "protected_human_tab" in by_pane["w1:p2"]["blockers"]
+    assert by_pane["w1:p3"]["status"] == "skipped"
+    assert "protected_human_tab" in by_pane["w1:p3"]["blockers"]
+
+
+def test_p0_quota_reached_upgrades_priority_skips_30s_sleep_and_wakes_session(world, fake_chat, monkeypatch):
+    _p0_switch_world(world)
+    add_agy(world.proc, 4101, "w1:p1", conv=_conv_uuid(1), model=MODEL, start_epoch=BTIME + 100, cwd=world.cwd)
+    add_agy(world.proc, 4102, "w1:p2", conv=_conv_uuid(2), model=MODEL, start_epoch=BTIME + 200, cwd=world.cwd)
+
+    panes = [
+        {**pane(pane_id="w1:p1", conv=_conv_uuid(1), status="idle"), "tab_id": "t1", "focused": False},
+        {**pane(pane_id="w1:p2", conv=_conv_uuid(2), status="idle"), "tab_id": "t2", "focused": False},
+    ]
+    quota_screen = EMPTY_SCREEN + "Individual quota reached. Please upgrade your subscription.\n"
+    herdr = _make_p0_herdr(
+        world,
+        panes,
+        {"t1": "bauer", "t2": "🏗️ architekt-2"},
+        screens={"w1:p1": EMPTY_SCREEN, "w1:p2": quota_screen},
+        exit_pids={"w1:p2": 4102},
+    )
+
+    sleeps = []
+    real_sleep = time.sleep
+    monkeypatch.setattr(la.time, "sleep", lambda s: sleeps.append(s) or real_sleep(min(s, 0.005)))
+
+    out = json.loads(
+        la.cmd_auto_switch(world.env.adapter, as_json=True, max_bounces=1, quiet_recheck=30.0, herdr=herdr)
+    )
+
+    assert out["bounce_summary"]["executed"] == 1
+    assert out["bounce_summary"]["stopped_reason"] == "max_bounces_reached"
+    assert len(out["bounces"]) == 1
+    entry = out["bounces"][0]
+    assert entry["pane_id"] == "w1:p2"
+    assert entry["status"] == "ok"
+    assert entry["wakeup_status"] == "working_seen"
+    assert 30.0 not in sleeps
+
+
+def test_p0_focused_idle_pane_settles_after_60s_resets_on_draft_or_working_and_rescues_quota(world, fake_chat, monkeypatch):
+    assert la.FOCUSED_IDLE_SETTLE_S == 60.0
+    base_now = 1_800_000_000.0
+    clock = [base_now]
+    monkeypatch.setattr(la.time, "time", lambda: clock[0])
+
+    _p0_switch_world(world, now_epoch=base_now)
+    # Cache frisch halten, damit nachfolgende Ticks ohne Live-Probe sauber Phase 3 durchlaufen
+    _write_quotas(
+        world.env,
+        active="acc1",
+        switch_epoch=base_now,
+        updated_epoch=base_now,
+        accounts=[
+            _acc_entry("acc1", weekly_pct=95, five_hour_pct=95, weekly_reset=RESET_LATER, is_active=True),
+            _acc_entry("acc2", weekly_pct=50, five_hour_pct=50, weekly_reset=RESET_EARLIER, is_active=False),
+        ],
+    )
+    reg_path = world.env.state / "accounts.json"
+    reg = json.loads(reg_path.read_text(encoding="utf-8"))
+    reg["providers"]["agy"]["active_account"] = "acc1"
+    reg["providers"]["agy"]["switch_epoch"] = base_now
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+    write_account(world.env.live, "a@example.test")
+
+    add_agy(world.proc, 4101, "w1NA:pQ", conv=_conv_uuid(1), model=None, start_epoch=BTIME + 100, cwd=world.cwd)
+    panes = [{**pane(pane_id="w1NA:pQ", conv=_conv_uuid(1), status="idle"), "tab_id": "t-nr1", "focused": True}]
+    screens = {"w1NA:pQ": EMPTY_SCREEN}
+    herdr = _make_p0_herdr(world, panes, {"t-nr1": "Nr1"}, screens=screens, exit_pids={"w1NA:pQ": 4101})
+
+    def _tick():
+        # Cache frisch halten (updated_epoch == clock[0])
+        q_path = world.env.state / "quotas.json"
+        q = json.loads(q_path.read_text(encoding="utf-8"))
+        q["updated_epoch"] = clock[0]
+        q_path.write_text(json.dumps(q), encoding="utf-8")
+        return json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
+
+    # Vorbestehenden Anti-Loop-Eintrag auf einer anderen Pane anlegen -> darf nicht gelöscht werden
+    la.record_bounce_attempt("w9:other", base_now - 100, now=base_now - 10)
+
+    # Tick 1 (t=0): focused idle -> noch nicht settled, startet Timer in _focused_idle
+    out1 = _tick()
+    assert out1["bounce_summary"]["executed"] == 0
+    assert out1["bounces"][0]["status"] == "skipped"
+    state1 = json.loads((world.env.state / "bounce-state.json").read_text(encoding="utf-8"))
+    assert "w9:other" in state1
+    assert "w1NA:pQ" in state1["_focused_idle"]
+    assert oct((world.env.state / "bounce-state.json").stat().st_mode & 0o777) == "0o600"
+
+    # Tick 2 (t=+30s): noch < 60s -> weiter geskippt
+    clock[0] = base_now + 30.0
+    out2 = _tick()
+    assert out2["bounce_summary"]["executed"] == 0
+
+    # Tick 3 (t=+61s, aber Composer-Entwurf!): NIEMALS bouncen, Settle gelöscht!
+    clock[0] = base_now + 61.0
+    screens["w1NA:pQ"] = "─" * 40 + "\n> hallo\n" + "─" * 40 + "\nauto · Gemini 4 Neon · high\n"
+    out3 = _tick()
+    assert out3["bounce_summary"]["executed"] == 0
+    assert out3["bounces"][0]["status"] == "skipped"
+    state3 = json.loads((world.env.state / "bounce-state.json").read_text(encoding="utf-8"))
+    assert "w1NA:pQ" not in state3.get("_focused_idle", {})
+
+    # Tick 4 (t=+62s, Composer wieder leer): startet Settle neu
+    clock[0] = base_now + 62.0
+    screens["w1NA:pQ"] = EMPTY_SCREEN
+    out4 = _tick()
+    assert out4["bounce_summary"]["executed"] == 0
+
+    # Tick 5 (t=+100s, status=working): NIEMALS bouncen, Settle gelöscht!
+    clock[0] = base_now + 100.0
+    panes[0]["agent_status"] = "working"
+    out5 = _tick()
+    assert out5["bounce_summary"]["executed"] == 0
+    state5 = json.loads((world.env.state / "bounce-state.json").read_text(encoding="utf-8"))
+    assert "w1NA:pQ" not in state5.get("_focused_idle", {})
+
+    # Tick 6 (t=+101s, wieder idle): Settle startet ab t=+101s
+    clock[0] = base_now + 101.0
+    panes[0]["agent_status"] = "idle"
+    out6 = _tick()
+    assert out6["bounce_summary"]["executed"] == 0
+
+    # Tick 7 (t=+162s, >= 60s unverändert idle + leerer Composer): wird sauber gebounct!
+    clock[0] = base_now + 162.0
+    out7 = _tick()
+    assert out7["bounce_summary"]["executed"] == 1
+    assert out7["bounces"][0]["status"] == "ok"
+    assert out7["bounces"][0]["wakeup_status"] == "disabled"
+    state7 = json.loads((world.env.state / "bounce-state.json").read_text(encoding="utf-8"))
+    assert "w9:other" in state7
+    assert "w1NA:pQ" not in state7.get("_focused_idle", {})
+
+    # Gegenprobe: Focused Pane mit "Individual quota reached" + leerem Composer wird SOFORT gerettet!
+    add_agy(world.proc, 4201, "w1:pQ2", conv=_conv_uuid(2), model=None, start_epoch=BTIME + 100, cwd=world.cwd)
+    panes2 = [{**pane(pane_id="w1:pQ2", conv=_conv_uuid(2), status="idle"), "tab_id": "t-nr2", "focused": True}]
+    herdr2 = _make_p0_herdr(
+        world,
+        panes2,
+        {"t-nr2": "Nr1"},
+        screens={"w1:pQ2": EMPTY_SCREEN + "Individual quota reached\n"},
+        exit_pids={"w1:pQ2": 4201},
+        new_pid_base=5000,
+    )
+    out_quota = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr2))
+    assert out_quota["bounce_summary"]["executed"] == 1
+    assert out_quota["bounces"][0]["pane_id"] == "w1:pQ2"
+    assert out_quota["bounces"][0]["status"] == "ok"
+    assert out_quota["bounces"][0]["wakeup_status"] == "working_seen"
+
+
+def test_p0_focused_idle_settle_race_in_plan_and_fresh_blockers(world, fake_chat, monkeypatch):
+    """CodeRabbit MAJOR: Fokus-Settle prüft Screen-Hash gegen plan_bounce und _fresh_blockers und startet bei Wechsel neu."""
+    base_now = 1_800_000_000.0
+    clock = [base_now]
+    monkeypatch.setattr(la.time, "time", lambda: clock[0])
+
+    _p0_switch_world(world, now_epoch=base_now)
+    _write_quotas(
+        world.env,
+        active="acc1",
+        switch_epoch=base_now,
+        updated_epoch=base_now,
+        accounts=[
+            _acc_entry("acc1", weekly_pct=95, five_hour_pct=95, weekly_reset=RESET_LATER, is_active=True),
+            _acc_entry("acc2", weekly_pct=50, five_hour_pct=50, weekly_reset=RESET_EARLIER, is_active=False),
+        ],
+    )
+    reg_path = world.env.state / "accounts.json"
+    reg = json.loads(reg_path.read_text(encoding="utf-8"))
+    reg["providers"]["agy"]["active_account"] = "acc1"
+    reg["providers"]["agy"]["switch_epoch"] = base_now
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+    write_account(world.env.live, "a@example.test")
+
+    screen_a = EMPTY_SCREEN + "idle output A\n"
+    screen_b = EMPTY_SCREEN + "idle output B\n"
+    sha_a = la._screen_sha256(screen_a)
+    sha_b = la._screen_sha256(screen_b)
+
+    add_agy(world.proc, 4101, "w1:p1", conv=_conv_uuid(1), model=None, start_epoch=BTIME + 100, cwd=world.cwd)
+    panes = [{**pane(pane_id="w1:p1", conv=_conv_uuid(1), status="idle"), "tab_id": "t-nr1", "focused": True}]
+    screen_seq = [screen_a]
+
+    class SeqHerdr(_make_p0_herdr(world, panes, {"t-nr1": "Nr1"}, exit_pids={"w1:p1": 4101}).__class__):
+        def screen_text(self, pane_id):
+            if len(screen_seq) > 1:
+                return screen_seq.pop(0)
+            return screen_seq[0]
+
+    herdr = SeqHerdr(panes)
+
+    def _refresh_quota():
+        q_path = world.env.state / "quotas.json"
+        q = json.loads(q_path.read_text(encoding="utf-8"))
+        q["updated_epoch"] = clock[0]
+        q_path.write_text(json.dumps(q), encoding="utf-8")
+
+    # 1) Tick 1 bei t=0 startet Settle auf Screen A
+    out1 = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
+    assert out1["bounce_summary"]["executed"] == 0
+    state1 = json.loads((world.env.state / "bounce-state.json").read_text(encoding="utf-8"))
+    assert state1["_focused_idle"]["w1:p1"]["screen_sha256"] == sha_a
+
+    # 2) Nach 65s: direkter plan_bounce mit expected_focused_screen_sha256=sha_a sieht Screen B -> blockiert
+    clock[0] = base_now + 65.0
+    _refresh_quota()
+    screen_seq[:] = [screen_b]
+    direct_plan = la.plan_bounce(
+        world.env.adapter,
+        "w1:p1",
+        herdr,
+        proc=world.proc,
+        allow_focused=True,
+        expected_focused_screen_sha256=sha_a,
+        allow_default_model=True,
+    )
+    assert "focused_screen_changed" in direct_plan["blockers"]
+    assert direct_plan["recommended_action"] == "herdr-mutter-kind"
+    assert direct_plan["screen_sha256"] == sha_b
+    assert direct_plan["expected_focused_screen_sha256"] == sha_a
+
+    # 3) Phase-3-Race: Discovery sieht gesettelten Screen A, plan_bounce sieht Screen B -> kein /exit, Settle auf B neu gestartet
+    screen_seq[:] = [screen_a, screen_b]
+    out_plan_race = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
+    assert out_plan_race["bounce_summary"]["executed"] == 0
+    assert out_plan_race["bounces"][0]["status"] == "skipped"
+    assert out_plan_race["bounces"][0]["detail"] == "focused_idle_settling"
+    assert "focused_screen_changed" in out_plan_race["bounces"][0]["blockers"]
+    assert not any(c[1] == "/exit" for c in herdr.calls)
+    state_b1 = json.loads((world.env.state / "bounce-state.json").read_text(encoding="utf-8"))
+    assert state_b1["_focused_idle"]["w1:p1"]["screen_sha256"] == sha_b
+
+    # 4) Settle auf Screen B nach weiteren 65s abgeschlossen; danach Race erst vor /exit in _fresh_blockers
+    clock[0] = base_now + 130.0
+    _refresh_quota()
+    # Discovery = B, plan_bounce = B (eligible), _fresh_blockers = A (anders!) -> fail-closed ohne /exit, Settle auf A
+    screen_seq[:] = [screen_b, screen_b, screen_a]
+    out_fresh_race = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
+    assert out_fresh_race["bounce_summary"]["executed"] == 0
+    assert out_fresh_race["bounces"][0] == {
+        "pane_id": "w1:p1",
+        "pid": 4101,
+        "status": "skipped",
+        "reason": "focused_screen_changed",
+        "detail": "focused_idle_settling",
+    }
+    assert not any(c[1] == "/exit" for c in herdr.calls)
+    state_a2 = json.loads((world.env.state / "bounce-state.json").read_text(encoding="utf-8"))
+    assert state_a2["_focused_idle"]["w1:p1"]["screen_sha256"] == sha_a
+
+    # Auch direktes execute_bounce bricht bei Hash-Wechsel fail-closed ohne /exit ab und startet Settle neu
+    clock[0] = base_now + 195.0
+    screen_seq[:] = [screen_a]
+    ok_plan = la.plan_bounce(
+        world.env.adapter,
+        "w1:p1",
+        herdr,
+        proc=world.proc,
+        allow_focused=True,
+        expected_focused_screen_sha256=sha_a,
+        allow_default_model=True,
+    )
+    assert ok_plan["recommended_action"] == "in_place_resume"
+    screen_seq[:] = [screen_b]
+    with pytest.raises(la.CliError, match="focused_screen_changed"):
+        la.execute_bounce(world.env.adapter, ok_plan, herdr, proc=world.proc, quiet_recheck_s=0.0)
+    assert not any(c[1] == "/exit" for c in herdr.calls)
+    state_b2 = json.loads((world.env.state / "bounce-state.json").read_text(encoding="utf-8"))
+    assert state_b2["_focused_idle"]["w1:p1"]["screen_sha256"] == sha_b
+
+    # 5) Gegenprobe: Bleibt Screen B nach >= 60s unverändert, bleibt die fokussierte Pane bounce-berechtigt!
+    clock[0] = base_now + 260.0
+    _refresh_quota()
+    screen_seq[:] = [screen_b]
+    out_ok = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
+    assert out_ok["bounce_summary"]["executed"] == 1
+    assert out_ok["bounces"][0]["status"] == "ok"
+    assert any(c[1] == "/exit" for c in herdr.calls)
+    state_done = json.loads((world.env.state / "bounce-state.json").read_text(encoding="utf-8"))
+    assert "w1:p1" not in state_done.get("_focused_idle", {})
+
+
+def test_phase3_discovery_stops_immediately_when_wallclock_budget_exhausted(world, monkeypatch):
+    """CodeRabbit MINOR: Erschöpft die Discovery-Schleife das 120s-Budget, bricht sie vor weiteren screen_text-Reads ab."""
+    _fresh_cache_world(world)
+    add_agy(world.proc, 4101, "w1:p1", conv=_conv_uuid(1), start_epoch=BTIME + 100, cwd=world.cwd)
+    add_agy(world.proc, 4102, "w1:p2", conv=_conv_uuid(2), start_epoch=BTIME + 200, cwd=world.cwd)
+    add_agy(world.proc, 4103, "w1:p3", conv=_conv_uuid(3), start_epoch=BTIME + 300, cwd=world.cwd)
+
+    screen_reads = []
+    executed = []
+    monkeypatch.setattr(
+        la,
+        "execute_bounce",
+        lambda adapter, plan, herdr, **kw: executed.append(plan["pane_id"])
+        or {**plan, "status": "ok", "new_pid": 9001, "stage": "start", "wakeup_status": "disabled"},
+    )
+
+    class TrackingHerdr(FakeHerdr):
+        def screen_text(self, pane_id):
+            screen_reads.append(pane_id)
+            return super().screen_text(pane_id)
+
+    # run_started=0.0, disc p1=10.0 (ok), disc p2=125.0 (> 120s Budget -> sofortiger Abbruch vor p2 screen_text)
+    ticks = iter([0.0, 10.0, 125.0])
+    monkeypatch.setattr(la.time, "monotonic", lambda: next(ticks))
+
+    out = json.loads(
+        la.cmd_auto_switch(
+            world.env.adapter,
+            as_json=True,
+            herdr=TrackingHerdr([
+                pane(pane_id="w1:p1", conv=_conv_uuid(1)),
+                pane(pane_id="w1:p2", conv=_conv_uuid(2)),
+                pane(pane_id="w1:p3", conv=_conv_uuid(3)),
+            ]),
+        )
+    )
+
+    assert screen_reads == ["w1:p1"]
+    assert executed == []
+    assert out["bounces"] == []
+    assert out["bounce_summary"]["executed"] == 0
+    assert out["bounce_summary"]["stopped_reason"] == "wallclock_budget_reached"

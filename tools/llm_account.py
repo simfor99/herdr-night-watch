@@ -17,6 +17,7 @@ import concurrent.futures
 import contextlib
 import copy
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -1176,6 +1177,7 @@ def find_stale_panes(root: Path, switch_epoch: int | None, clk_tck: int | None =
 # ---------------------------------------------------------------------------
 
 BOUNCE_MAX_BYTES = 150 * 1024 * 1024
+BOUNCE_HARD_MAX_BYTES = 1024 * 1024 * 1024
 BOUNCE_EXIT_TIMEOUT_S = 15.0
 BOUNCE_START_TIMEOUT_S = 60.0
 BOUNCE_SHELL_TIMEOUT_S = 10.0
@@ -1201,6 +1203,7 @@ BOUNCE_REASONS = ("switch_epoch", "auth_401", "quota_reached", "manual")
 QUOTA_SNAPSHOT_FILE = "quotas.json"
 QUOTA_MAX_AGE_S = 300.0
 ANTI_LOOP_COOLDOWN_S = 1800.0
+FOCUSED_IDLE_SETTLE_S = 60.0
 ANTI_LOOP_STATE_FILE = "bounce-state.json"
 ANTI_LOOP_LOCK_FILE = "bounce-state.lock"
 QUIET_RECHECK_S = 30.0
@@ -1450,6 +1453,115 @@ def record_bounce_attempt(pane_id: str, switch_epoch: float | None, now: float |
         os.close(fd)
 
 
+def _screen_sha256(screen: str) -> str:
+    """Berechnet den SHA-256-Hash eines Pane-Screen-Strings für die Focus-Settle-Prüfung."""
+    return hashlib.sha256(screen.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _is_focused_clean_idle(
+    status: str | None,
+    screen: str,
+    label: str | None,
+    active_descendants: list[dict[str, Any]],
+) -> bool:
+    """Prüft, ob eine fokussierte Pane ruhig, entwurfsfrei und nicht menschlich geschützt ist."""
+    return (
+        status in READY_PANE_STATUSES
+        and composer_draft(screen) is False
+        and not statusline_active(screen)
+        and not active_descendants
+        and label is not None
+        and not human_protected_tab(label)
+    )
+
+
+def _focused_idle_settled(
+    pane_id: str,
+    switch_epoch: float | None,
+    screen_sha256: str,
+    *,
+    is_clean_idle: bool,
+    now: float | None = None,
+    dry_run: bool = False,
+) -> tuple[bool, float]:
+    """Verfolgt die 60-s-Ruhefrist fokussierter Idle-Panes unter bounce-state.json['_focused_idle']."""
+    current = time.time() if now is None else now
+    if dry_run:
+        if not is_clean_idle:
+            return False, 0.0
+        data = _load_anti_loop_state()
+        focused_idle = data.get("_focused_idle")
+        entry = focused_idle.get(pane_id) if isinstance(focused_idle, dict) else None
+        if not isinstance(entry, dict):
+            return False, 0.0
+        first_seen = entry.get("first_seen")
+        if (
+            entry.get("screen_sha256") != screen_sha256
+            or entry.get("switch_epoch") != switch_epoch
+            or isinstance(first_seen, bool)
+            or not isinstance(first_seen, (int, float))
+            or not math.isfinite(first_seen)
+            or current < float(first_seen)
+        ):
+            return False, 0.0
+        elapsed = current - float(first_seen)
+        return elapsed >= FOCUSED_IDLE_SETTLE_S, elapsed
+
+    if not is_clean_idle and not (state_dir() / ANTI_LOOP_STATE_FILE).exists():
+        return False, 0.0
+
+    root = ensure_state()
+    fd = os.open(root / ANTI_LOOP_LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = _load_anti_loop_state()
+        focused_idle = data.get("_focused_idle")
+        if not isinstance(focused_idle, dict):
+            focused_idle = {}
+        if not is_clean_idle:
+            if pane_id in focused_idle:
+                del focused_idle[pane_id]
+                if focused_idle:
+                    data["_focused_idle"] = focused_idle
+                else:
+                    data.pop("_focused_idle", None)
+                atomic_write(
+                    root / ANTI_LOOP_STATE_FILE,
+                    (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+                    owner_only=True,
+                )
+            return False, 0.0
+        entry = focused_idle.get(pane_id)
+        first_seen = entry.get("first_seen") if isinstance(entry, dict) else None
+        matches = (
+            isinstance(entry, dict)
+            and entry.get("screen_sha256") == screen_sha256
+            and entry.get("switch_epoch") == switch_epoch
+            and not isinstance(first_seen, bool)
+            and isinstance(first_seen, (int, float))
+            and math.isfinite(first_seen)
+            and current >= float(first_seen)
+        )
+        if not matches:
+            focused_idle[pane_id] = {
+                "first_seen": current,
+                "screen_sha256": screen_sha256,
+                "switch_epoch": switch_epoch,
+            }
+            data["_focused_idle"] = focused_idle
+            atomic_write(
+                root / ANTI_LOOP_STATE_FILE,
+                (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+                owner_only=True,
+            )
+            return False, 0.0
+        elapsed = current - float(first_seen)
+        return elapsed >= FOCUSED_IDLE_SETTLE_S, elapsed
+    finally:
+        os.close(fd)
+
+
 HEAL_PREVIEWS_HEALTHY = frozenset({"would_sync_or_current", "would_recover_clobber"})
 
 
@@ -1577,6 +1689,7 @@ def guard_blockers(
     reason: str,
     allow_focused: bool,
     source: str | None,
+    allow_architekt: bool = False,
 ) -> tuple[list[str], dict[str, Any]]:
     """Gemeinsame Sieben-Bedingungen-Prüfung für Dry-Run, --yes und die Frischprüfung vor /exit."""
     blockers: list[str] = []
@@ -1585,7 +1698,7 @@ def guard_blockers(
         blockers.append("tab_schutz_unbekannt")
     if human_protected_tab(label):
         blockers.append("protected_human_tab")
-    elif architekt_tab(label) and reason not in {"auth_401", "quota_reached"}:
+    elif architekt_tab(label) and not allow_architekt and reason not in {"auth_401", "quota_reached"}:
         blockers.append("protected_architekt_tab")
     if reason in {"auth_401", "quota_reached"} and not source:
         blockers.append("zielbindung_quelle_fehlt")
@@ -1671,8 +1784,12 @@ def plan_bounce(
     proc: Path | None = None,
     reason: str = "switch_epoch",
     allow_focused: bool = False,
+    expected_focused_screen_sha256: str | None = None,
     source: str | None = None,
     replay_msg_ids: list[str] | None = None,
+    allow_default_model: bool = False,
+    allow_large_db: bool = False,
+    allow_architekt: bool = False,
 ) -> dict[str, Any]:
     if reason not in BOUNCE_REASONS:
         raise CliError(f"Unbekannter --reason {reason!r}; erlaubt: {', '.join(BOUNCE_REASONS)}.", 2)
@@ -1702,6 +1819,7 @@ def plan_bounce(
     conv = conversation or proc_conv or pane_session
     work_dir = cwd or rec["cwd"]
     use_model = model or rec["model"]
+    default_model_mode = allow_default_model and model is None and rec["model"] is None
 
     blockers: list[str] = []
     conv_ok = bool(conv) and CONVERSATION_UUID_RE.fullmatch(conv or "") is not None
@@ -1715,26 +1833,44 @@ def plan_bounce(
         # Ein fehlendes Verzeichnis lässt den Neustart nach /exit scheitern, die alte Sitzung wäre dann beendet.
         blockers.append("cwd_ungueltig")
     if not use_model:
-        blockers.append("Modell nicht ermittelbar")
+        if not default_model_mode:
+            blockers.append("Modell nicht ermittelbar")
     elif not MODEL_RE.fullmatch(use_model):
         blockers.append("Modell enthält unzulässige Zeichen")
     db_bytes, brain_bytes = conversation_sizes(conv) if conv_ok else (0, 0)
-    if db_bytes > BOUNCE_MAX_BYTES:
-        blockers.append(f"Konversations-DB {db_bytes} Byte über Schwelle {BOUNCE_MAX_BYTES}")
+    if db_bytes > BOUNCE_MAX_BYTES and (not allow_large_db or db_bytes > BOUNCE_HARD_MAX_BYTES):
+        if db_bytes > BOUNCE_HARD_MAX_BYTES:
+            blockers.append(f"Konversations-DB {db_bytes} Byte über harter Schwelle {BOUNCE_HARD_MAX_BYTES}")
+        else:
+            blockers.append(f"Konversations-DB {db_bytes} Byte über Schwelle {BOUNCE_MAX_BYTES}")
 
     tab_id = pane.get("tab_id") or rec["tab_id"]
     label = herdr.tab_label(tab_id) if tab_id else None
     screen = herdr.screen_text(pane_id)
+    screen_sha256 = _screen_sha256(screen)
     draft = composer_draft(screen)
     blockers_live = live_blockers(pane.get("agent_status"), draft)
     guard, details = guard_blockers(
         adapter, pane, root=root, pid=rec["pid"], conversation=conv if conv_ok else None, label=label,
         screen=screen, switch_epoch=switch_epoch, reason=reason, allow_focused=allow_focused, source=source,
+        allow_architekt=allow_architekt,
     )
     blockers += guard
+    if (
+        pane.get("focused") is True
+        and allow_focused
+        and expected_focused_screen_sha256
+        and screen_sha256 != expected_focused_screen_sha256
+    ):
+        blockers.append("focused_screen_changed")
 
     # Live-Blocker bleiben separat ausgewiesen; execute_bounce prüft sie unmittelbar vor /exit erneut.
     resumable = not blockers
+    resume_cmd = (
+        (["agy", "--conversation", conv] if default_model_mode else ["agy", "--conversation", conv, "--model", use_model])
+        if resumable
+        else None
+    )
     return {
         "dry_run": False,
         "provider": adapter.name,
@@ -1745,6 +1881,11 @@ def plan_bounce(
         "reason": reason,
         "source": source,
         "allow_focused": allow_focused,
+        "expected_focused_screen_sha256": expected_focused_screen_sha256,
+        "screen_sha256": screen_sha256,
+        "allow_default_model": allow_default_model,
+        "allow_large_db": allow_large_db,
+        "allow_architekt": allow_architekt,
         "replay_msg_ids": replay_ids,
         "focused": pane.get("focused"),
         "active_descendants": details["active_descendants"],
@@ -1761,11 +1902,13 @@ def plan_bounce(
         "db_bytes": db_bytes,
         "brain_bytes": brain_bytes,
         "limit_bytes": BOUNCE_MAX_BYTES,
+        "hard_limit_bytes": BOUNCE_HARD_MAX_BYTES,
+        "large_db_warning": bool(db_bytes > BOUNCE_MAX_BYTES),
         "composer_draft": draft,
         "live_blockers": blockers_live,
         "heal_preview": heal_preview(adapter),
         "action": "in_place_resume" if resumable else None,
-        "resume_cmd": (["agy", "--conversation", conv, "--model", use_model] if resumable else None),
+        "resume_cmd": resume_cmd,
         "recommended_action": "in_place_resume" if resumable else "herdr-mutter-kind",
         "to_model": use_model,
         "blockers": blockers,
@@ -1849,8 +1992,42 @@ def _fresh_blockers(adapter: AgyAdapter, plan: dict[str, Any], herdr: Any, root:
         adapter, pane, root=root, pid=plan["pid"], conversation=plan["conversation_id"], label=fresh_label,
         screen=screen, switch_epoch=plan["switch_epoch"], reason=plan["reason"],
         allow_focused=plan["allow_focused"], source=plan["source"],
+        allow_architekt=bool(plan.get("allow_architekt", False)),
     )
     blockers += guard
+    expected_sha = plan.get("expected_focused_screen_sha256")
+    if pane.get("focused") is True and plan.get("allow_focused") and expected_sha:
+        fresh_sha = _screen_sha256(screen)
+        if fresh_sha != expected_sha:
+            fresh_clean_idle = _is_focused_clean_idle(
+                pane.get("agent_status"),
+                screen,
+                fresh_label,
+                _details["active_descendants"],
+            )
+            _focused_idle_settled(
+                plan["pane_id"],
+                plan["switch_epoch"],
+                fresh_sha if fresh_clean_idle else "",
+                is_clean_idle=fresh_clean_idle,
+                dry_run=False,
+            )
+            blockers.append("focused_screen_changed")
+    planned_model = plan.get("model")
+    allow_default_model = bool(plan.get("allow_default_model", False))
+    if not planned_model:
+        if not allow_default_model:
+            blockers.append("Modell nicht ermittelbar")
+    elif not MODEL_RE.fullmatch(str(planned_model)):
+        blockers.append("Modell enthält unzulässige Zeichen")
+    allow_large_db = bool(plan.get("allow_large_db", False))
+    if plan.get("conversation_id"):
+        db_bytes, _ = conversation_sizes(plan["conversation_id"])
+        if db_bytes > BOUNCE_MAX_BYTES and (not allow_large_db or db_bytes > BOUNCE_HARD_MAX_BYTES):
+            if db_bytes > BOUNCE_HARD_MAX_BYTES:
+                blockers.append(f"Konversations-DB {db_bytes} Byte über harter Schwelle {BOUNCE_HARD_MAX_BYTES}")
+            else:
+                blockers.append(f"Konversations-DB {db_bytes} Byte über Schwelle {BOUNCE_MAX_BYTES}")
     # Derselbe Prozess mit derselben Startzeit und Konversation muss noch allein auf dieser Pane laufen.
     on_pane = [r for r in scan_agy_processes(root) if r["pane_id"] == plan["pane_id"]]
     if len(on_pane) != 1 or (on_pane[0]["pid"], on_pane[0]["start_epoch"]) != (plan["pid"], plan["start_epoch"]):
@@ -1949,7 +2126,10 @@ def _bounce_steps(herdr, root, plan, heal_result, exit_timeout_s, start_timeout_
         time.sleep(poll_s)
 
     try:
-        herdr.run(pane_id, f"cd {_shell_quote(plan['cwd'])} && agy --conversation {_shell_quote(conv)} --model {_shell_quote(plan['model'])}")
+        restart_cmd = f"cd {_shell_quote(plan['cwd'])} && agy --conversation {_shell_quote(conv)}"
+        if plan.get("model"):
+            restart_cmd += f" --model {_shell_quote(plan['model'])}"
+        herdr.run(pane_id, restart_cmd)
     except CliError as exc:
         # Der alte Prozess ist bereits beendet. Ein Fehler beim Senden wird als Ergebnis gemeldet, nicht erneut gesendet:
         # herdr kann den Befehl trotz Fehlers angenommen haben.
@@ -2581,29 +2761,127 @@ def _run_autoswitch_phase3_bounces(
     stopped_reason: str | None = None
     try:
         herdr_cli = herdr or HerdrCli()
+        try:
+            panes_by_id = {p["pane_id"]: p for p in herdr_cli.pane_list() if p.get("pane_id")}
+        except CliError:
+            panes_by_id = {}
+
         run_started = time.monotonic()
 
         def _remaining_s() -> float:
             return AUTO_SWITCH_WALLCLOCK_BUDGET_S - (time.monotonic() - run_started)
 
-        # Ein Bounce braucht die Ruhephase plus Start-/Resume-Frist; ohne dieses Restbudget läuft er nicht an.
-        min_execute_budget_s = quiet_recheck + 15.0 if quiet_recheck > 0 else 1.0
+        candidates: list[tuple[int, float, int, dict[str, Any], str, str]] = []
         for stale in sorted_panes:
+            pane_id = stale.get("pane_id")
+            if not pane_id:
+                bounces.append({"pane_id": None, "pid": stale.get("pid"), "status": "skipped", "reason": "missing_pane_id"})
+                continue
+            if _remaining_s() <= 0:
+                stopped_reason = "wallclock_budget_reached"
+                break
+            try:
+                screen = herdr_cli.screen_text(pane_id)
+            except CliError as exc:
+                bounces.append({"pane_id": pane_id, "pid": stale.get("pid"), "status": "error", "error": str(exc)})
+                continue
+            if quota_reached_evidence(screen):
+                priority, detected_reason = 0, "quota_reached"
+            elif auth_401_evidence(screen):
+                priority, detected_reason = 1, "auth_401"
+            else:
+                priority, detected_reason = 2, "switch_epoch"
+            candidates.append((
+                priority,
+                float(stale.get("start_epoch") or 0.0),
+                int(stale.get("pid") or 0),
+                stale,
+                screen,
+                detected_reason,
+            ))
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+
+        proc = proc_root()
+        for _prio, _start, _pid, stale, screen, detected_reason in (candidates if stopped_reason is None else ()):
             if not dry_run and max_bounces > 0 and executed >= max_bounces:
                 stopped_reason = "max_bounces_reached"
                 break
             if _remaining_s() <= 0:
                 stopped_reason = "wallclock_budget_reached"
                 break
-            pane_id = stale.get("pane_id")
-            if not pane_id:
-                bounces.append({"pane_id": None, "pid": stale.get("pid"), "status": "skipped", "reason": "missing_pane_id"})
-                continue
+            pane_id = stale["pane_id"]
+            pane_info = panes_by_id.get(pane_id)
+            allow_focused = False
+            focused_settling = False
+            expected_focused_screen_sha256: str | None = None
+            plan_source = "auto_switch" if detected_reason in {"quota_reached", "auth_401"} else None
             try:
-                plan = plan_bounce(adapter, pane_id, herdr_cli, reason="switch_epoch", allow_focused=False)
+                if pane_info is not None:
+                    if pane_info.get("focused") is True:
+                        tab_id = pane_info.get("tab_id") or stale.get("tab_id")
+                        try:
+                            label = herdr_cli.tab_label(tab_id) if tab_id else None
+                        except CliError:
+                            label = None
+                        is_clean_idle = _is_focused_clean_idle(
+                            pane_info.get("agent_status"),
+                            screen,
+                            label,
+                            find_active_descendants(proc, int(stale["pid"])),
+                        )
+                        if not is_clean_idle:
+                            _focused_idle_settled(
+                                pane_id, current_switch_epoch, "", is_clean_idle=False, dry_run=dry_run
+                            )
+                            allow_focused = False
+                        elif detected_reason in {"quota_reached", "auth_401"}:
+                            allow_focused = True
+                        else:
+                            screen_sha = _screen_sha256(screen)
+                            settled, _elapsed = _focused_idle_settled(
+                                pane_id, current_switch_epoch, screen_sha, is_clean_idle=True, dry_run=dry_run
+                            )
+                            allow_focused = settled
+                            focused_settling = not settled
+                            if allow_focused:
+                                expected_focused_screen_sha256 = screen_sha
+                    elif pane_info.get("focused") is False and not dry_run:
+                        _focused_idle_settled(
+                            pane_id, current_switch_epoch, "", is_clean_idle=False, dry_run=False
+                        )
+
+                plan = plan_bounce(
+                    adapter,
+                    pane_id,
+                    herdr_cli,
+                    reason=detected_reason,
+                    allow_focused=allow_focused,
+                    expected_focused_screen_sha256=expected_focused_screen_sha256,
+                    source=plan_source,
+                    allow_default_model=True,
+                    allow_large_db=True,
+                    allow_architekt=True,
+                )
             except CliError as exc:
                 bounces.append({"pane_id": pane_id, "pid": stale.get("pid"), "status": "error", "error": str(exc)})
                 continue
+            if "focused_screen_changed" in plan["blockers"]:
+                if not dry_run:
+                    new_clean_idle = (
+                        not plan.get("live_blockers")
+                        and plan.get("tab_label") is not None
+                        and not plan.get("protected_human_tab")
+                        and not plan.get("active_descendants")
+                        and "active_statusline" not in plan["blockers"]
+                    )
+                    _focused_idle_settled(
+                        pane_id,
+                        current_switch_epoch,
+                        plan["screen_sha256"] if new_clean_idle else "",
+                        is_clean_idle=new_clean_idle,
+                        dry_run=False,
+                    )
+                focused_settling = True
             if dry_run or max_bounces == 0:
                 bounces.append({
                     "pane_id": pane_id,
@@ -2611,6 +2889,7 @@ def _run_autoswitch_phase3_bounces(
                     "status": "planned",
                     "recommended_action": plan["recommended_action"],
                     "blockers": plan["blockers"],
+                    "large_db_warning": plan["large_db_warning"],
                 })
                 continue
             if plan.get("live_blockers"):
@@ -2624,24 +2903,48 @@ def _run_autoswitch_phase3_bounces(
                 })
                 continue
             if plan["recommended_action"] != "in_place_resume":
-                bounces.append({
+                skip_entry: dict[str, Any] = {
                     "pane_id": pane_id,
                     "pid": stale.get("pid"),
                     "status": "skipped",
                     "recommended_action": plan["recommended_action"],
                     "blockers": plan["blockers"],
-                })
+                }
+                if focused_settling:
+                    skip_entry["detail"] = "focused_idle_settling"
+                bounces.append(skip_entry)
                 continue
+            # Ein Bounce braucht die Ruhephase plus Start-/Resume-Frist; ohne dieses Restbudget läuft er nicht an.
+            min_execute_budget_s = (
+                (15.0 if quiet_recheck > 0 else 1.0)
+                if detected_reason in {"quota_reached", "auth_401"}
+                else (quiet_recheck + 15.0 if quiet_recheck > 0 else 1.0)
+            )
             if _remaining_s() < min_execute_budget_s:
                 stopped_reason = "wallclock_budget_reached"
                 break
             try:
                 res = execute_bounce(
-                    adapter, plan, herdr_cli, resume_prompt=False, quiet_recheck_s=quiet_recheck
+                    adapter,
+                    plan,
+                    herdr_cli,
+                    resume_prompt=(detected_reason in {"quota_reached", "auth_401"}),
+                    quiet_recheck_s=quiet_recheck,
                 )
             except CliError as exc:
+                if "focused_screen_changed" in str(exc):
+                    bounces.append({
+                        "pane_id": pane_id,
+                        "pid": stale.get("pid"),
+                        "status": "skipped",
+                        "reason": "focused_screen_changed",
+                        "detail": "focused_idle_settling",
+                    })
+                    continue
                 bounces.append({"pane_id": pane_id, "pid": stale.get("pid"), "status": "error", "error": str(exc)})
                 continue
+            if res.get("status") == "ok":
+                _focused_idle_settled(pane_id, current_switch_epoch, "", is_clean_idle=False, dry_run=False)
             executed += 1
             bounces.append({
                 "pane_id": pane_id,
@@ -2650,6 +2953,7 @@ def _run_autoswitch_phase3_bounces(
                 "new_pid": res.get("new_pid"),
                 "stage": res.get("stage"),
                 "wakeup_status": res.get("wakeup_status"),
+                "large_db_warning": bool(plan.get("large_db_warning")),
             })
     finally:
         if bounce_lock_fd >= 0:
@@ -3243,6 +3547,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Grund des Eingriffs; auth_401/quota_reached erlauben Bounce auch auf Architekten-Tabs")
     p.add_argument("--quelle", help="Zielbindung: Nachrichten-ID oder Vertragsname (Pflicht bei auth_401/quota_reached)")
     p.add_argument("--allow-focused", action="store_true", help="nur ausdrücklich benannte fokussierte Pane")
+    p.add_argument("--allow-default-model", action="store_true", help="Restart ohne --model erlauben, wenn im Prozess keins gesetzt war")
+    p.add_argument("--allow-large-db", action="store_true", help="Große Konversations-DB über 150 MiB (bis 1 GiB) mit Warnung bouncen")
     p.add_argument("--replay-msg-id", action="append", default=[], dest="replay_msg_ids",
                    help="abgebrochene Briefkasten-Nachricht im Weckruf nennen (wiederholbar)")
     return parser
@@ -3311,6 +3617,8 @@ def cmd_bounce_stale(adapter: AgyAdapter, args: argparse.Namespace, herdr: Any =
         allow_focused=getattr(args, "allow_focused", False),
         source=getattr(args, "quelle", None),
         replay_msg_ids=getattr(args, "replay_msg_ids", None),
+        allow_default_model=getattr(args, "allow_default_model", False),
+        allow_large_db=getattr(args, "allow_large_db", False),
     )
     if args.dry_run:
         plan["dry_run"] = True
