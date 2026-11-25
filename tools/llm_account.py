@@ -451,12 +451,15 @@ def heal_locked(adapter: AgyAdapter) -> str:
         copy_present(live_home(), qdir, tuple(r for r in adapter.swap_rels if r != adapter.token_rel), owner_only=True)
         quarantined = True
     install_profile_to_live(adapter, pdir)
+    # Solange das fremde Token live war, haben quota-axi und Resolver das falsche Konto gemessen und gecacht.
+    removed = invalidate_caches()
     log_event(
         "clobber_recovered",
         provider=adapter.name,
         active=active_id,
         rescued_to=rescued_to,
         quarantined=quarantined,
+        caches_removed=len(removed),
     )
     return "clobber_recovered"
 
