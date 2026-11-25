@@ -101,6 +101,7 @@ def env(tmp_path, monkeypatch):
 
     monkeypatch.setenv("LLM_ACCOUNTS_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("LLM_ACCOUNTS_HOME", str(tmp_path / "live"))
+    monkeypatch.setenv("MOTHR_AGY_SWITCH_DELTAS_FILE", str(tmp_path / "mothr" / "agy-account-switch-deltas.jsonl"))
     monkeypatch.setenv("AGY_REAL_BIN", str(fake))
     monkeypatch.setenv("FAKE_AGY_USAGE_FILE", str(usage))
     monkeypatch.setenv("FAKE_AGY_LOG", str(log))

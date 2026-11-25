@@ -1226,3 +1226,111 @@ def test_symlink_quotas_json_and_symlink_lockfile_are_rejected_fail_closed(env, 
     with pytest.raises(la.CliError) as exc:
         la.cmd_auto_switch(env.adapter, as_json=True, herdr=FakeHerdr([pane()]))
     assert exc.value.exit_code == 3
+
+
+# ---------------------------------------------------------------------------
+# 10. Delta-Protokollierung (agy-account-switch-deltas.jsonl)
+# ---------------------------------------------------------------------------
+
+
+def test_auto_switch_writes_delta_jsonl_after_post_bounce_reprobe_without_secrets(world, tmp_path, monkeypatch):
+    _setup_two_slots(world.env, active="acc2", switch_epoch=SWITCH_EPOCH)
+    set_usage(world.env, {
+        "a@example.test": tsv(90, 90, 90, 90, resetw=RESET_LATER),
+        "b@example.test": tsv(50, 5, 50, 5, resetw=RESET_EARLIER),
+    })
+    add_agy(world.proc, 4101, "w1:p1", conv=_conv_uuid(1), start_epoch=BTIME + 100, cwd=world.cwd)
+    deltas_path = tmp_path / "mothr-deltas" / "agy-account-switch-deltas.jsonl"
+    monkeypatch.setenv("MOTHR_AGY_SWITCH_DELTAS_FILE", str(deltas_path))
+
+    class DeltaHerdr(FakeHerdr):
+        def tab_label(self, tab_id):
+            return "bauer"
+
+        def run(self, pane_id, text):
+            super().run(pane_id, text)
+            if text == "/exit":
+                for sub in (world.proc / "4101").iterdir():
+                    sub.unlink()
+                (world.proc / "4101").rmdir()
+            elif "agy --conversation" in text:
+                add_agy(world.proc, 4999, pane_id, conv=_conv_uuid(1), start_epoch=int(time.time()), cwd=world.cwd)
+                # Alt-Konto hat während des Bounces weiter Quota verbraucht (5% -> 3% weekly, 50% -> 46% 5h).
+                set_usage(world.env, {
+                    "a@example.test": tsv(90, 90, 90, 90, resetw=RESET_LATER),
+                    "b@example.test": tsv(46, 3, 46, 3, resetw=RESET_EARLIER),
+                })
+
+    herdr = DeltaHerdr([{**pane(pane_id="w1:p1", conv=_conv_uuid(1), status="idle"), "tab_id": "t-b", "focused": False}])
+    out = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
+
+    assert out["decision"] == "switched"
+    assert out["bounce_summary"]["executed"] == 1
+    assert deltas_path.exists()
+    assert oct(deltas_path.parent.stat().st_mode & 0o777) == "0o700"
+    assert oct(deltas_path.stat().st_mode & 0o777) == "0o600"
+
+    raw = deltas_path.read_text(encoding="utf-8")
+    lines = [line for line in raw.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert "SECRET-" not in raw
+    assert "a@example.test" not in raw
+    assert "b@example.test" not in raw
+    assert "oauth" not in raw.lower()
+    assert "refresh_token" not in raw
+    assert "access_token" not in raw
+
+    entry = json.loads(lines[0])
+    assert entry["schema"] == "agy-account-switch-delta-v1"
+    assert entry["provider"] == "agy"
+    assert entry["from_slot"] == "acc2"
+    assert entry["to_slot"] == "acc1"
+    assert entry["reason"] == "weekly_exhausted"
+    assert entry["threshold_pct"] == 5
+    assert entry["old_weekly_pct_before"] == 5
+    assert entry["old_five_hour_pct_before"] == 50
+    assert entry["old_weekly_pct_after"] == 3
+    assert entry["old_five_hour_pct_after"] == 46
+    assert entry["weekly_delta_pct"] == 2
+    assert entry["five_hour_delta_pct"] == 4
+    assert entry["stale_sessions_bounced"] == 1
+    assert entry["total_duration_seconds"] >= 0.0
+    assert entry["post_bounce_measured"] is True
+    assert entry["ts_utc"]
+    assert entry["started_at_utc"]
+    assert entry["completed_at_utc"]
+
+
+def test_dry_run_never_writes_delta_jsonl(env, tmp_path, monkeypatch):
+    _setup_two_slots(env, active="acc2", switch_epoch=time.time() - 600)
+    set_usage(env, {
+        "a@example.test": tsv(90, 90, 90, 90, resetw=RESET_LATER),
+        "b@example.test": tsv(50, 5, 50, 5, resetw=RESET_EARLIER),
+    })
+    deltas_path = tmp_path / "mothr-dry" / "agy-account-switch-deltas.jsonl"
+    monkeypatch.setenv("MOTHR_AGY_SWITCH_DELTAS_FILE", str(deltas_path))
+
+    out = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, dry_run=True, no_bounce=True))
+
+    assert out["decision"] == "dry_run_would_switch"
+    assert not deltas_path.exists()
+
+
+def test_delta_log_write_error_does_not_fail_auto_switch(env, tmp_path, monkeypatch):
+    _setup_two_slots(env, active="acc2", switch_epoch=time.time() - 600)
+    set_usage(env, {
+        "a@example.test": tsv(90, 90, 90, 90, resetw=RESET_LATER),
+        "b@example.test": tsv(50, 5, 50, 5, resetw=RESET_EARLIER),
+    })
+    decoy = tmp_path / "decoy.jsonl"
+    decoy.write_text("do-not-touch\n", encoding="utf-8")
+    symlink_deltas = tmp_path / "symlink-deltas.jsonl"
+    symlink_deltas.symlink_to(decoy)
+    monkeypatch.setenv("MOTHR_AGY_SWITCH_DELTAS_FILE", str(symlink_deltas))
+
+    out = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, no_bounce=True))
+
+    assert out["decision"] == "switched"
+    assert out["active_account"] == "acc1"
+    assert _read_registry_block(env)["active_account"] == "acc1"
+    assert decoy.read_text(encoding="utf-8") == "do-not-touch\n"
