@@ -39,7 +39,7 @@ AUTH_UNAVAILABLE = "unavailable"
 
 FLOOR_PCT = 15
 FEFO_FIVE_HOUR_MIN_PCT = 10
-DRAIN_ZERO_THRESHOLD_PCT = 5
+DRAIN_ZERO_THRESHOLD_PCT = 2
 FEFO_RETURN_FIVE_HOUR_MIN_PCT = 20
 AUTO_SWITCH_WALLCLOCK_BUDGET_S = 120.0
 AUTO_SWITCH_STALE_CACHE_MAX_AGE_S = 120.0
@@ -2446,7 +2446,7 @@ def _evaluate_auto_switch_decision(
             return _result("switch", target=best, trigger_reason=trigger)
 
         # Kein besserer Slot im Drain-Pfad: die FEFO-Rückwechselregeln (Pfad B) tragen die Hysterese
-        # über ihr 15-Punkte-Band (Rückkehr erst ab 20 %, Drain-Schwelle bei 5 %).
+        # über ihr 18-Punkte-Band (Rückkehr erst ab 20 %, Drain-Schwelle bei 2 %).
         return _result("no_better_slot", trigger_reason=trigger)
 
     # Pfad B: Aktives Konto ist nicht leer -> smarter FEFO-Rückwechsel auf früher verfallendes Konto.
