@@ -2546,6 +2546,8 @@ fn agy_account_card(item: &serde_json::Value) -> Option<ProviderQuota> {
 /// `pooled_count`, `pool_next_refill_epoch`, `accounts`). The AGY cards are
 /// replaced as a whole, so a pool that shrinks from two accounts to one leaves
 /// no ghost card. `null`, invalid JSON or an empty account list change nothing.
+/// A transient per-slot `unavailable` probe keeps the last known numbers for
+/// that slot so one slow `/usage` probe does not flash "Keine aktuellen Daten".
 pub fn update_snapshot_with_agy_json(snapshot: &mut QuotaSnapshot, json_str: &str) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
         return;
@@ -2553,7 +2555,31 @@ pub fn update_snapshot_with_agy_json(snapshot: &mut QuotaSnapshot, json_str: &st
     let Some(accounts) = value.get("accounts").and_then(|items| items.as_array()) else {
         return;
     };
-    let mut cards: Vec<ProviderQuota> = accounts.iter().filter_map(agy_account_card).collect();
+    let mut cards: Vec<ProviderQuota> = Vec::with_capacity(accounts.len());
+    for item in accounts {
+        let Some(mut card) = agy_account_card(item) else {
+            continue;
+        };
+        let is_transient_unavailable = item
+            .get("auth_state")
+            .and_then(|value| value.as_str())
+            == Some("unavailable")
+            && card.five_hour_percent.is_none()
+            && card.week_percent.is_none();
+        if is_transient_unavailable {
+            if let Some(prev) = snapshot.get_card(ProviderId::Agy, card.account_id.as_deref()) {
+                if prev.five_hour_percent.is_some() || prev.week_percent.is_some() {
+                    card.five_hour_percent = prev.five_hour_percent;
+                    card.five_hour_reset = prev.five_hour_reset.clone();
+                    card.week_percent = prev.week_percent;
+                    card.week_reset = prev.week_reset.clone();
+                    card.week_reset_epoch = prev.week_reset_epoch;
+                    card.auth_error = None;
+                }
+            }
+        }
+        cards.push(card);
+    }
     if cards.is_empty() {
         return;
     }
@@ -4416,6 +4442,58 @@ mod tests {
         let mut snapshot = QuotaSnapshot::measured_baseline();
         update_snapshot_with_agy_json(&mut snapshot, &json);
         assert_eq!(snapshot.get_card(ProviderId::Agy, Some("acc2")).expect("acc2 card").auth_error, None);
+    }
+
+    #[test]
+    fn transient_unavailable_keeps_previous_slot_quota_instead_of_blanking_card() {
+        let healthy = agy_pool_json(
+            &[
+                agy_account_json("acc2", "leipzig", false, 0, 0, "2026-11-30T20:03:01Z"),
+                agy_account_json("acc1", "privat", true, 88, 97, "2026-12-02T11:12:28Z"),
+            ],
+            2,
+            Some(1_796_068_981),
+        );
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_agy_json(&mut snapshot, &healthy);
+
+        let flaky = agy_pool_json(
+            &[
+                agy_account_json("acc2", "leipzig", false, 0, 0, "2026-11-30T20:03:01Z"),
+                r#"{"id":"acc1","label":"privat","email":"privat@example.invalid","is_active":true,"auth_state":"unavailable","auth_error":"Abruf fehlgeschlagen","five_hour_pct":null,"five_hour_reset":null,"week_pct":null,"week_reset":null}"#.to_string(),
+            ],
+            1,
+            None,
+        );
+        update_snapshot_with_agy_json(&mut snapshot, &flaky);
+
+        let privat = snapshot.get_card(ProviderId::Agy, Some("acc1")).expect("acc1 card");
+        assert_eq!(privat.five_hour_percent, Some(88));
+        assert_eq!(privat.week_percent, Some(97));
+        assert_eq!(privat.auth_error, None);
+    }
+
+    #[test]
+    fn relogin_required_is_not_masked_by_previous_slot_quota() {
+        let healthy = agy_pool_json(
+            &[agy_account_json("acc1", "privat", true, 88, 97, "2026-12-02T11:12:28Z")],
+            1,
+            None,
+        );
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_agy_json(&mut snapshot, &healthy);
+
+        let relogin = agy_pool_json(
+            &[r#"{"id":"acc1","label":"privat","email":"privat@example.invalid","is_active":true,"auth_state":"relogin_required","auth_error":"Login erneuern","five_hour_pct":null,"five_hour_reset":null,"week_pct":null,"week_reset":null}"#.to_string()],
+            0,
+            None,
+        );
+        update_snapshot_with_agy_json(&mut snapshot, &relogin);
+
+        let privat = snapshot.get_card(ProviderId::Agy, Some("acc1")).expect("acc1 card");
+        assert_eq!(privat.five_hour_percent, None);
+        assert_eq!(privat.week_percent, None);
+        assert_eq!(privat.auth_error.as_deref(), Some("Login erneuern"));
     }
 
     #[test]

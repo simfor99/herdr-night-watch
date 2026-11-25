@@ -7927,7 +7927,14 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                         let card_id = card_widget_id(quota.id, quota.account_id.as_deref());
                         let card_response = ui.interact(row_rect, card_id, egui::Sense::drag());
                         let card_response = match (multi_account, quota.account_email.as_deref()) {
-                            (true, Some(email)) => card_response.on_hover_text(email),
+                            (true, Some(email)) => {
+                                let role = if quota.is_active_account {
+                                    language.text("Aktiv", "Active")
+                                } else {
+                                    language.text("Standby", "Standby")
+                                };
+                                card_response.on_hover_text(format!("{email} ({role})"))
+                            }
                             _ => card_response,
                         };
                         if card_response.drag_started() {

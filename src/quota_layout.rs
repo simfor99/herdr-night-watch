@@ -15,13 +15,19 @@ pub(crate) fn provider_slot(provider: ProviderId) -> u8 {
 }
 
 /// Sort visible quota cards into the persisted display order. Providers
-/// missing from the order keep their snapshot order at the end.
+/// missing from the order keep their snapshot order at the end. Within a
+/// multi-account provider group, usable cards stay above throttled/minimized
+/// ones, and the active account stays above standby slots.
 pub(crate) fn apply_quota_order(providers: &mut [ProviderQuota], order: &[ProviderId]) {
     providers.sort_by_key(|quota| {
-        order
-            .iter()
-            .position(|provider| *provider == quota.id)
-            .unwrap_or(order.len())
+        (
+            order
+                .iter()
+                .position(|provider| *provider == quota.id)
+                .unwrap_or(order.len()),
+            quota.provider_is_throttled(),
+            !quota.is_active_account,
+        )
     });
 }
 
@@ -129,6 +135,54 @@ mod tests {
             providers.iter().map(|quota| quota.id).collect::<Vec<_>>(),
             vec![ProviderId::Codex, ProviderId::Glm, ProviderId::Agy]
         );
+    }
+
+    #[test]
+    fn apply_quota_order_places_drained_multi_account_card_below_active_card() {
+        let mut leipzig = ProviderQuota::new(
+            ProviderId::Agy,
+            "AGY",
+            "Antigravity",
+            None,
+            None,
+            Some(0),
+            Some("30.11. (21:03)".into()),
+        );
+        leipzig.account_id = Some("acc2".into());
+        leipzig.account_label = Some("leipzig".into());
+        leipzig.is_active_account = false;
+
+        let mut privat = ProviderQuota::new(
+            ProviderId::Agy,
+            "AGY",
+            "Antigravity",
+            Some(85),
+            Some("17:12".into()),
+            Some(96),
+            Some("02.12. (12:12)".into()),
+        );
+        privat.account_id = Some("acc1".into());
+        privat.account_label = Some("privat".into());
+        privat.is_active_account = true;
+
+        let glm = ProviderQuota::new(
+            ProviderId::Glm,
+            "GLM",
+            "Z.ai",
+            Some(54),
+            Some("16:32".into()),
+            Some(98),
+            Some("01.12. (16:34)".into()),
+        );
+
+        let mut providers = vec![leipzig, privat, glm];
+        apply_quota_order(&mut providers, &[ProviderId::Agy, ProviderId::Glm]);
+
+        let labels: Vec<Option<&str>> = providers
+            .iter()
+            .map(|quota| quota.account_label.as_deref())
+            .collect();
+        assert_eq!(labels, vec![Some("privat"), Some("leipzig"), None]);
     }
 
     #[test]
