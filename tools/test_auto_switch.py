@@ -137,11 +137,13 @@ def test_drain_to_zero_stays_on_active_at_14_pct_weekly_and_50_pct_5h(env, monke
 
 
 @pytest.mark.parametrize("g5,gw,expected_reason", [
+    (50, 5, "weekly_exhausted"),
     (50, 1, "weekly_exhausted"),
+    (5, 60, "five_hour_exhausted"),
     (1, 60, "five_hour_exhausted"),
     (0, 60, "five_hour_exhausted"),
 ])
-def test_drain_to_zero_switches_only_at_or_below_1_pct(env, g5, gw, expected_reason):
+def test_drain_to_zero_switches_at_or_below_5_pct(env, g5, gw, expected_reason):
     _setup_two_slots(env, active="acc2", switch_epoch=time.time() - 600)
     set_usage(env, {
         "a@example.test": tsv(80, 90, 80, 90, resetw=RESET_LATER),
@@ -156,6 +158,49 @@ def test_drain_to_zero_switches_only_at_or_below_1_pct(env, g5, gw, expected_rea
     assert out["active_account"] == "acc1"
     assert out["trigger_reason"] == expected_reason
     assert _read_registry_block(env)["active_account"] == "acc1"
+
+
+def test_drain_to_zero_stays_healthy_at_6_pct_weekly_and_healthy_5h(env):
+    _setup_two_slots(env, active="acc2", switch_epoch=time.time() - 600)
+    set_usage(env, {
+        "a@example.test": tsv(90, 90, 90, 90, resetw=RESET_LATER),
+        "b@example.test": tsv(50, 6, 50, 6, resetw=RESET_EARLIER),
+    })
+
+    out = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, no_bounce=True))
+
+    assert out["decision"] == "stay_healthy"
+    assert out["active_account"] == "acc2"
+    assert out["target_slot"] is None
+    assert _read_registry_block(env)["active_account"] == "acc2"
+
+
+def test_drain_to_zero_switches_at_5_pct_weekly_or_5_pct_5h(env):
+    _setup_two_slots(env, active="acc2", switch_epoch=time.time() - 600)
+    set_usage(env, {
+        "a@example.test": tsv(90, 90, 90, 90, resetw=RESET_LATER),
+        "b@example.test": tsv(50, 5, 50, 5, resetw=RESET_EARLIER),
+    })
+
+    out_weekly = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, no_bounce=True))
+    assert out_weekly["decision"] == "switched"
+    assert out_weekly["trigger_reason"] == "weekly_exhausted"
+    assert out_weekly["active_account"] == "acc1"
+
+    assert la.main(["use", "agy", "acc2"]) == 0
+    reg_path = env.state / "accounts.json"
+    reg = json.loads(reg_path.read_text(encoding="utf-8"))
+    reg["providers"]["agy"]["switch_epoch"] = time.time() - 600
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+    set_usage(env, {
+        "a@example.test": tsv(90, 90, 90, 90, resetw=RESET_LATER),
+        "b@example.test": tsv(5, 60, 5, 60, resetw=RESET_EARLIER),
+    })
+
+    out_5h = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, force_probe=True, no_bounce=True))
+    assert out_5h["decision"] == "switched"
+    assert out_5h["trigger_reason"] == "five_hour_exhausted"
+    assert out_5h["active_account"] == "acc1"
 
 
 def test_drain_to_zero_switches_on_auth_error_or_reactive_exhausted(env):
@@ -195,7 +240,7 @@ def test_drain_to_zero_switches_on_auth_error_or_reactive_exhausted(env):
 def test_fefo_return_switch_flow_and_guards(env):
     _setup_two_slots(env, active="acc2", switch_epoch=time.time() - 1000)
 
-    # Schritt 1: acc2 5h erschöpft (weekly 68% > 1%) -> Wechsel acc2 -> acc1
+    # Schritt 1: acc2 5h erschöpft (weekly 68% > 5%) -> Wechsel acc2 -> acc1
     set_usage(env, {
         "a@example.test": tsv(95, 90, 95, 90, resetw=RESET_LATER),
         "b@example.test": tsv(1, 68, 1, 68, resetw=RESET_EARLIER),
@@ -219,7 +264,7 @@ def test_fefo_return_switch_flow_and_guards(env):
     assert step2["decision"] == "stay_healthy"
     assert step2["active_account"] == "acc1"
 
-    # Schritt 3: acc2 hat 5h=20% (>= 20%), weekly=68% (> 1%) und früheres weekly_reset -> Rückwechsel acc1 -> acc2
+    # Schritt 3: acc2 hat 5h=20% (>= 20%), weekly=68% (> 5%) und früheres weekly_reset -> Rückwechsel acc1 -> acc2
     set_usage(env, {
         "a@example.test": tsv(80, 85, 80, 85, resetw=RESET_LATER),
         "b@example.test": tsv(20, 68, 20, 68, resetw=RESET_EARLIER),
@@ -231,17 +276,69 @@ def test_fefo_return_switch_flow_and_guards(env):
     assert step3["trigger_reason"] == "fefo_earlier_reset_ready"
 
 
-def test_fefo_does_not_return_when_earlier_slot_weekly_is_at_or_below_1_pct(env):
+@pytest.mark.parametrize("earlier_weekly", [1, 5])
+def test_fefo_does_not_return_when_earlier_slot_weekly_is_at_or_below_5_pct(env, earlier_weekly):
     _setup_two_slots(env, active="acc1", switch_epoch=time.time() - 600)
     set_usage(env, {
         "a@example.test": tsv(80, 85, 80, 85, resetw=RESET_LATER),
-        "b@example.test": tsv(100, 1, 100, 1, resetw=RESET_EARLIER),
+        "b@example.test": tsv(100, earlier_weekly, 100, earlier_weekly, resetw=RESET_EARLIER),
     })
 
     out = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, no_bounce=True))
 
     assert out["decision"] == "stay_healthy"
     assert out["active_account"] == "acc1"
+
+
+def test_fefo_anti_ping_pong_ignores_5_pct_and_returns_only_above_5_pct_and_20_pct_5h(env):
+    _setup_two_slots(env, active="acc2", switch_epoch=time.time() - 1000)
+
+    # Schritt 1: acc2 bei weekly=5% (5h=80%) -> Drain-Switch auf acc1
+    set_usage(env, {
+        "a@example.test": tsv(80, 85, 80, 85, resetw=RESET_LATER),
+        "b@example.test": tsv(80, 5, 80, 5, resetw=RESET_EARLIER),
+    })
+    step1 = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, no_bounce=True))
+    assert step1["decision"] == "switched"
+    assert step1["active_account"] == "acc1"
+    assert step1["trigger_reason"] == "weekly_exhausted"
+
+    # Cooldown abgelaufen, acc2 immer noch bei weekly=5% -> KEIN Rückwechsel (Anti-Ping-Pong)
+    reg_path = env.state / "accounts.json"
+    reg = json.loads(reg_path.read_text(encoding="utf-8"))
+    reg["providers"]["agy"]["switch_epoch"] = time.time() - 600
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+
+    step2 = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, force_probe=True, no_bounce=True))
+    assert step2["decision"] == "stay_healthy"
+    assert step2["active_account"] == "acc1"
+
+    # acc2 hat weekly=6% (> 5%), aber 5h=19% (< 20%) -> bleibt auf acc1
+    set_usage(env, {
+        "a@example.test": tsv(80, 85, 80, 85, resetw=RESET_LATER),
+        "b@example.test": tsv(19, 6, 19, 6, resetw=RESET_EARLIER),
+    })
+    step3 = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, force_probe=True, no_bounce=True))
+    assert step3["decision"] == "stay_healthy"
+    assert step3["active_account"] == "acc1"
+
+    # acc2 hat weekly=6% (> 5%) und 5h=20% (>= 20%) -> FEFO-Rückwechsel acc1 -> acc2
+    set_usage(env, {
+        "a@example.test": tsv(80, 85, 80, 85, resetw=RESET_LATER),
+        "b@example.test": tsv(20, 6, 20, 6, resetw=RESET_EARLIER),
+    })
+    step4 = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, force_probe=True, no_bounce=True))
+    assert step4["decision"] == "switched"
+    assert step4["active_account"] == "acc2"
+    assert step4["trigger_reason"] == "fefo_earlier_reset_ready"
+
+    # Nach Rückwechsel bleibt acc2 bei weekly=6%, 5h=20% stabil aktiv (kein Ping-Pong zurück auf acc1)
+    reg = json.loads(reg_path.read_text(encoding="utf-8"))
+    reg["providers"]["agy"]["switch_epoch"] = time.time() - 600
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+    step5 = json.loads(la.cmd_auto_switch(env.adapter, as_json=True, force_probe=True, no_bounce=True))
+    assert step5["decision"] == "stay_healthy"
+    assert step5["active_account"] == "acc2"
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +362,7 @@ def test_cooldown_prevents_ping_pong_switch(env):
 
 
 def test_sub_floor_accounts_do_not_ping_pong(env):
-    # Beide unter Floor (15/10), aber > 1%: stay_healthy, kein Hin-und-Her-Wechseln
+    # Beide unter Floor (15/10), aber > 5%: stay_healthy, kein Hin-und-Her-Wechseln
     accounts = [
         _acc_entry("acc1", weekly_pct=12, five_hour_pct=9, weekly_reset=RESET_LATER, is_active=False),
         _acc_entry("acc2", weekly_pct=10, five_hour_pct=7, weekly_reset=RESET_EARLIER, is_active=True),
@@ -273,13 +370,14 @@ def test_sub_floor_accounts_do_not_ping_pong(env):
     res = la._evaluate_auto_switch_decision(accounts, "acc2", "gemini")
     assert res["action"] == "stay_healthy"
 
-    # Bei vollständiger Erschöpfung aller Slots -> all_slots_exhausted
-    exhausted = [
-        _acc_entry("acc1", weekly_pct=1, five_hour_pct=50, weekly_reset=RESET_LATER, is_active=False),
-        _acc_entry("acc2", weekly_pct=50, five_hour_pct=1, weekly_reset=RESET_EARLIER, is_active=True),
-    ]
-    res_ex = la._evaluate_auto_switch_decision(exhausted, "acc2", "gemini")
-    assert res_ex["action"] == "all_slots_exhausted"
+    # Bei vollständiger Erschöpfung aller Slots (<= 5%) -> all_slots_exhausted
+    for pct in (1, 5):
+        exhausted = [
+            _acc_entry("acc1", weekly_pct=pct, five_hour_pct=50, weekly_reset=RESET_LATER, is_active=False),
+            _acc_entry("acc2", weekly_pct=50, five_hour_pct=pct, weekly_reset=RESET_EARLIER, is_active=True),
+        ]
+        res_ex = la._evaluate_auto_switch_decision(exhausted, "acc2", "gemini")
+        assert res_ex["action"] == "all_slots_exhausted"
 
 
 def test_all_slots_exhausted_cli_returns_exit_0_without_switching(env):
