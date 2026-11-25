@@ -1334,3 +1334,60 @@ def test_delta_log_write_error_does_not_fail_auto_switch(env, tmp_path, monkeypa
     assert out["active_account"] == "acc1"
     assert _read_registry_block(env)["active_account"] == "acc1"
     assert decoy.read_text(encoding="utf-8") == "do-not-touch\n"
+
+
+def test_failed_bounce_is_not_counted_in_stale_sessions_bounced(world, tmp_path, monkeypatch):
+    _setup_two_slots(world.env, active="acc2", switch_epoch=SWITCH_EPOCH)
+    set_usage(world.env, {
+        "a@example.test": tsv(90, 90, 90, 90, resetw=RESET_LATER),
+        "b@example.test": tsv(50, 5, 50, 5, resetw=RESET_EARLIER),
+    })
+    add_agy(world.proc, 4101, "w1:p1", conv=_conv_uuid(1), start_epoch=BTIME + 100, cwd=world.cwd)
+    deltas_path = tmp_path / "mothr-failed-bounce" / "agy-account-switch-deltas.jsonl"
+    monkeypatch.setenv("MOTHR_AGY_SWITCH_DELTAS_FILE", str(deltas_path))
+    monkeypatch.setattr(
+        la,
+        "execute_bounce",
+        lambda adapter, plan, herdr, **kw: {**plan, "status": "failed", "stage": "exit"},
+    )
+
+    class TabHerdr(FakeHerdr):
+        def tab_label(self, tab_id):
+            return "bauer"
+
+    herdr = TabHerdr([{**pane(pane_id="w1:p1", conv=_conv_uuid(1), status="idle"), "tab_id": "t-b", "focused": False}])
+    out = json.loads(la.cmd_auto_switch(world.env.adapter, as_json=True, quiet_recheck=0.0, herdr=herdr))
+
+    assert out["decision"] == "switched"
+    assert out["bounce_summary"]["executed"] == 1
+    assert out["bounces"][0]["status"] == "failed"
+
+    entry = json.loads(deltas_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["stale_sessions_bounced"] == 0
+
+
+def test_append_jsonl_locked_truncates_partial_write_on_error(tmp_path, monkeypatch):
+    deltas_path = tmp_path / "mothr-partial" / "agy-account-switch-deltas.jsonl"
+    la._append_jsonl_locked(deltas_path, {"seq": 1})
+    baseline = deltas_path.read_text(encoding="utf-8")
+
+    real_write = os.write
+    calls = 0
+
+    def flaky_write(fd, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(fd, bytes(data[:5]))
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(la.os, "write", flaky_write)
+    with pytest.raises(OSError):
+        la._append_jsonl_locked(deltas_path, {"seq": 2})
+
+    assert deltas_path.read_text(encoding="utf-8") == baseline
+
+    monkeypatch.setattr(la.os, "write", real_write)
+    la._append_jsonl_locked(deltas_path, {"seq": 3})
+    parsed = [json.loads(line) for line in deltas_path.read_text(encoding="utf-8").splitlines()]
+    assert parsed == [{"seq": 1}, {"seq": 3}]

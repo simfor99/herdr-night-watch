@@ -2742,11 +2742,20 @@ def _append_jsonl_locked(path: Path, record: dict[str, Any]) -> None:
             raise OSError(f"Delta-Log ist keine reguläre Datei: {path}")
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
-        view = memoryview(payload)
-        written = 0
-        while written < len(payload):
-            written += os.write(fd, view[written:])
-        os.fsync(fd)
+        orig_size = os.fstat(fd).st_size
+        try:
+            view = memoryview(payload)
+            written = 0
+            while written < len(payload):
+                chunk = os.write(fd, view[written:])
+                if chunk <= 0:
+                    raise OSError("Kurzer/leerer Schreibvorgang beim Delta-Log")
+                written += chunk
+            os.fsync(fd)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.ftruncate(fd, orig_size)
+            raise
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -3025,7 +3034,7 @@ def cmd_auto_switch(
             reason=trigger_reason,
             old_weekly_before=old_weekly_before,
             old_five_hour_before=old_five_hour_before,
-            stale_sessions_bounced=int(bounce_summary.get("executed") or 0),
+            stale_sessions_bounced=sum(1 for b in bounces if b.get("status") == "ok"),
             t_switch_start=t_switch_start,
             started_at_utc=started_at_utc,
             deltas_path=deltas_path,
