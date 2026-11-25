@@ -687,6 +687,87 @@ def test_invalidate_caches_tolerates_files_vanishing_between_check_and_unlink(en
     assert not quota.exists()
 
 
+def poisoned_caches(env) -> tuple[Path, Path]:
+    """quota-axi hat im Clobber-Fenster das falsche Konto gemessen; der Resolver hat danach gecacht."""
+    quota = env.live / ".cache/quota-axi/quotas.json"
+    quota.parent.mkdir(parents=True)
+    quota.write_text(json.dumps({"providers": [{"provider": "agy", "windows": [{"remaining": 2}]}]}), encoding="utf-8")
+    resolver = env.live / ".local/state/herdr/dispatch-resolve-cache"
+    resolver.mkdir(parents=True)
+    (resolver / "route.json").write_text("{}", encoding="utf-8")
+    (resolver / "quota-axi-refresh.state.json").write_text("{}", encoding="utf-8")
+    return quota, resolver
+
+
+def clobber_live_token(env, email: str) -> None:
+    """Ein Alt-Prozess hat das Token eines anderen Kontos in die Live-Datei geschrieben."""
+    live_token(env).write_text(
+        json.dumps({"auth_method": "oauth", "id_token_email": email, "token": {}}), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize("clobber_email", ["a@example.test", "unknown@example.test"])
+def test_heal_after_clobber_recovery_drops_poisoned_caches(env, clobber_email):
+    """Die im Clobber-Fenster gemessene 2 %-Zeile darf nach der Wiederherstellung nicht im Cache bleiben."""
+    two_accounts_saved(env)  # aktiv acc2 (B)
+    quota, resolver = poisoned_caches(env)
+    clobber_live_token(env, clobber_email)
+
+    assert la.main(["heal", "agy"]) == 0
+
+    assert not quota.exists()
+    assert not (resolver / "route.json").exists()
+    assert (resolver / "quota-axi-refresh.state.json").exists()  # nur Caches, keine Zustandsdateien
+    assert "b@example.test" in live_token(env).read_text()
+
+
+def test_clobber_recovered_event_records_removed_caches(env):
+    two_accounts_saved(env)  # aktiv acc2 (B)
+    poisoned_caches(env)
+    clobber_live_token(env, "a@example.test")
+
+    assert la.main(["heal", "agy"]) == 0
+
+    record = events(env)[-1]
+    assert record["event"] == "clobber_recovered"
+    assert record["caches_removed"] >= 1
+
+
+def test_heal_after_clobber_recovery_unlinks_only_the_symlink_not_its_target(env):
+    two_accounts_saved(env)  # aktiv acc2 (B)
+    quota, _ = poisoned_caches(env)
+    decoy_dir = env.state / "decoy"
+    decoy_dir.mkdir(parents=True)
+    decoy = decoy_dir / "quotas.json"
+    decoy.write_text("{}", encoding="utf-8")
+    quota.unlink()
+    quota.symlink_to(decoy)
+    clobber_live_token(env, "a@example.test")
+
+    assert la.main(["heal", "agy"]) == 0
+
+    assert not quota.is_symlink() and not quota.exists()
+    assert decoy.read_text() == "{}"
+
+
+@pytest.mark.parametrize("outcome", ["current", "synced"])
+def test_heal_without_clobber_keeps_quota_cache(env, outcome):
+    """Ohne Clobber wurde nichts am Konto geändert; eine gültige Messung bleibt verwendbar."""
+    two_accounts_saved(env)  # aktiv acc2 (B)
+    quota, resolver = poisoned_caches(env)
+    if outcome == "synced":
+        token = live_token(env)
+        newer = token.stat().st_mtime_ns + 1_000_000_000
+        os.utime(token, ns=(newer, newer))
+
+    with la.switch_lock():
+        assert la.heal_locked(env.adapter) == outcome
+
+    assert quota.exists()
+    assert (resolver / "route.json").exists()
+    assert not any(e.get("event") == "clobber_recovered" for e in events(env))
+
+
 def test_use_on_the_already_active_slot_keeps_switch_epoch(env):
     two_accounts_saved(env)  # aktiv acc2, Live-Dateien = B
     reg = json.loads((env.state / "accounts.json").read_text(encoding="utf-8"))
