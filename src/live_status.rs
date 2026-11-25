@@ -1585,7 +1585,9 @@ fn is_multi_account_card(visible: &[ProviderQuota], quota: &ProviderQuota) -> bo
 }
 
 use crate::quota_layout::{
-    apply_quota_order, card_widget_id, fit_reset_text, provider_slot, reorder_quota_order,
+    apply_quota_order, card_is_minimized, card_widget_id, fit_reset_text, is_replaced_agy_account,
+    provider_slot, prune_expanded_replaced, reorder_quota_order, replaced_badge_label,
+    toggle_replaced_account_expanded,
 };
 
 struct LiveStatusApp {
@@ -1657,6 +1659,7 @@ struct LiveStatusApp {
     quota_show_qwen: bool,
     quota_order: Vec<ProviderId>,
     quota_drag: Option<QuotaCardDrag>,
+    quota_expanded_replaced: std::collections::HashSet<String>,
     quota_color_glm: u8,
     quota_color_agi: u8,
     quota_color_codex: u8,
@@ -1887,6 +1890,7 @@ impl LiveStatusApp {
             quota_show_qwen: window_settings::live_status_quota_show_qwen(),
             quota_order: window_settings::live_status_quota_order(),
             quota_drag: None,
+            quota_expanded_replaced: std::collections::HashSet::new(),
             quota_color_glm: window_settings::live_status_quota_color_glm(),
             quota_color_agi: window_settings::live_status_quota_color_agi(),
             quota_color_codex: window_settings::live_status_quota_color_codex(),
@@ -1943,6 +1947,7 @@ impl LiveStatusApp {
                     &[],
                     self.quota_settings_open,
                     self.quota_minimize_depleted,
+                    &self.quota_expanded_replaced,
                 )
             });
             window_chrome::sync_satellite_size(sat_hwnd, sat_h, self.main_hwnd, r, is_docked);
@@ -3093,8 +3098,12 @@ fn persist_window_position(app: &mut LiveStatusApp, ctx: &egui::Context) {
     }
 }
 
-fn provider_card_height(quota: &ProviderQuota, minimize_depleted: bool) -> f32 {
-    if minimize_depleted && quota.provider_is_throttled() {
+fn provider_card_height(
+    quota: &ProviderQuota,
+    minimize_depleted: bool,
+    expanded_replaced: &std::collections::HashSet<String>,
+) -> f32 {
+    if card_is_minimized(quota, minimize_depleted, expanded_replaced) {
         // Header row only: badge, subtitle, LED and the reset hint.
         return 30.0;
     }
@@ -3125,6 +3134,7 @@ fn quota_satellite_design_height(
     visible_providers: &[ProviderQuota],
     settings_open: bool,
     minimize_depleted: bool,
+    expanded_replaced: &std::collections::HashSet<String>,
 ) -> f32 {
     if settings_open {
         // The ⚡-Limits tab always lists every configured provider, hidden
@@ -3137,7 +3147,7 @@ fn quota_satellite_design_height(
     }
     let total_cards: f32 = visible_providers
         .iter()
-        .map(|quota| provider_card_height(quota, minimize_depleted))
+        .map(|quota| provider_card_height(quota, minimize_depleted, expanded_replaced))
         .sum::<f32>();
     let gaps = (visible_providers.len() - 1) as f32 * 6.0;
     38.0 + total_cards + gaps + 8.0
@@ -3179,6 +3189,7 @@ fn apply_live_status_scale(
             &visible_providers,
             app.quota_settings_open,
             app.quota_minimize_depleted,
+            &app.quota_expanded_replaced,
         );
         app.last_synced_sat_height = Some(sat_height);
         ctx.send_viewport_cmd_to(
@@ -6628,11 +6639,13 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
         .cloned()
         .collect();
     apply_quota_order(&mut visible_providers, &app.quota_order);
+    prune_expanded_replaced(&mut app.quota_expanded_replaced, &visible_providers);
 
     let sat_design_height = quota_satellite_design_height(
             &visible_providers,
             app.quota_settings_open,
             app.quota_minimize_depleted,
+            &app.quota_expanded_replaced,
         );
     if app.last_synced_sat_height != Some(sat_design_height) {
         app.last_synced_sat_height = Some(sat_design_height);
@@ -7897,9 +7910,16 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                     let mut drop_requested: Option<(ProviderId, egui::Pos2)> = None;
                     let pointer = ui.input(|i| i.pointer.latest_pos());
                     for quota in &visible_providers {
-                        let card_minimized =
-                            app.quota_minimize_depleted && quota.provider_is_throttled();
-                        let card_h = provider_card_height(quota, app.quota_minimize_depleted);
+                        let card_minimized = card_is_minimized(
+                            quota,
+                            app.quota_minimize_depleted,
+                            &app.quota_expanded_replaced,
+                        );
+                        let card_h = provider_card_height(
+                            quota,
+                            app.quota_minimize_depleted,
+                            &app.quota_expanded_replaced,
+                        );
                         let row_rect = egui::Rect::from_min_size(
                             egui::pos2(rect.left() + 8.0, current_y),
                             egui::vec2(rect.width() - 16.0, card_h),
@@ -7925,11 +7945,26 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             );
                         }
                         let card_id = card_widget_id(quota.id, quota.account_id.as_deref());
-                        let card_response = ui.interact(row_rect, card_id, egui::Sense::drag());
+                        let is_replaced = is_replaced_agy_account(quota);
+                        let card_sense = if is_replaced {
+                            egui::Sense::click_and_drag()
+                        } else {
+                            egui::Sense::drag()
+                        };
+                        let card_response = ui.interact(row_rect, card_id, card_sense);
+                        let card_response = if is_replaced {
+                            card_response.on_hover_cursor(egui::CursorIcon::PointingHand)
+                        } else {
+                            card_response
+                        };
                         let card_response = match (multi_account, quota.account_email.as_deref()) {
                             (true, Some(email)) => card_response.on_hover_text(email),
                             _ => card_response,
                         };
+                        if is_replaced && card_response.clicked() {
+                            toggle_replaced_account_expanded(&mut app.quota_expanded_replaced, quota);
+                            ui.ctx().request_repaint();
+                        }
                         if card_response.drag_started() {
                             if let Some(pointer) = pointer {
                                 app.quota_drag = Some(QuotaCardDrag {
@@ -7981,8 +8016,11 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             .get_card(drag.provider, drag.account_id.as_deref())
                             .or_else(|| app.quota_snapshot.get(drag.provider))
                         {
-                            let card_h =
-                                provider_card_height(quota, app.quota_minimize_depleted);
+                            let card_h = provider_card_height(
+                                quota,
+                                app.quota_minimize_depleted,
+                                &app.quota_expanded_replaced,
+                            );
                             let ghost_top = (pointer.y - drag.grab_offset_y).max(rows_top);
                             let ghost_rect = egui::Rect::from_min_size(
                                 egui::pos2(rect.left() + 8.0, ghost_top),
@@ -7995,8 +8033,11 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             );
                             let forecast = quota.pacing_forecast();
                             let card_color = app.provider_color(drag.provider);
-                            let ghost_minimized =
-                                app.quota_minimize_depleted && quota.provider_is_throttled();
+                            let ghost_minimized = card_is_minimized(
+                                quota,
+                                app.quota_minimize_depleted,
+                                &app.quota_expanded_replaced,
+                            );
                             let ghost_multi = is_multi_account_card(&visible_providers, quota);
                             draw_provider_card(
                                 painter, ghost_rect, quota, &forecast, language, card_color,
@@ -8262,6 +8303,7 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
             &visible_providers,
             app.quota_settings_open,
             app.quota_minimize_depleted,
+            &app.quota_expanded_replaced,
         );
         app.last_synced_sat_height = Some(new_sat_h);
         if let Some(sat_hwnd) = app.satellite_hwnd {
@@ -8587,42 +8629,98 @@ fn draw_provider_card(
         (Some(label), true) => format!("{company} · {label}"),
         _ => company.to_string(),
     };
+    let is_replaced = is_replaced_agy_account(quota);
+    let name_color = if is_replaced {
+        egui::Color32::from_rgb(148, 163, 184)
+    } else {
+        egui::Color32::from_rgb(226, 232, 240)
+    };
     let name_galley = painter.layout_no_wrap(
         full_name,
         egui::FontId::proportional(11.5),
-        egui::Color32::from_rgb(226, 232, 240),
+        name_color,
     );
     let name_width = name_galley.size().x;
     painter.galley(
         egui::pos2(badge_rect.right() + 8.0, header_y + 1.0),
         name_galley,
-        egui::Color32::from_rgb(226, 232, 240),
+        name_color,
     );
 
-    // The reset hint of a minimized card starts right behind the name.
-    let text_left = badge_rect.right() + 8.0 + name_width + 8.0;
+    // The reset hint of a minimized card starts right behind the name (or behind the replaced badge).
+    let mut text_left = badge_rect.right() + 8.0 + name_width + 8.0;
 
-    // Right: Pure status LED light without text clutter (per Simon's request)
-    let led_health = if quota.provider_is_throttled() {
-        PacingHealth::Throttled
-    } else {
-        forecast.health
-    };
-    let (led_color, halo_color) = match led_health {
-        PacingHealth::Surplus | PacingHealth::OnTrack => (
-            egui::Color32::from_rgb(34, 197, 94),
-            egui::Color32::from_rgba_unmultiplied(34, 197, 94, 70),
-        ),
-        PacingHealth::Tight => (
-            egui::Color32::from_rgb(253, 224, 71),
-            egui::Color32::from_rgba_unmultiplied(253, 224, 71, 75),
-        ),
-        PacingHealth::Throttled => (
-            egui::Color32::from_rgb(239, 68, 68),
-            egui::Color32::from_rgba_unmultiplied(239, 68, 68, 80),
-        ),
-    };
+    // Right: Pure status LED light without text clutter (per Simon's request).
+    // Replaced AGY accounts show a calm muted slate LED instead of alarm red.
     let led_pos = egui::pos2(card_rect.right() - 14.0, header_y + 9.0);
+    if is_replaced {
+        let chevron = if minimized { "▸" } else { "▾" };
+        let replaced_text = format!("{} {}", replaced_badge_label(language), chevron);
+        let replaced_fg = egui::Color32::from_rgb(148, 163, 184);
+        let replaced_galley = painter.layout_no_wrap(
+            replaced_text,
+            egui::FontId::proportional(9.0),
+            replaced_fg,
+        );
+        let pill_w = replaced_galley.size().x + 8.0;
+        let max_pill_right = (led_pos.x - 10.0).max(text_left);
+        if text_left + pill_w <= max_pill_right {
+            let replaced_rect = egui::Rect::from_min_size(
+                egui::pos2(text_left, header_y + 1.0),
+                egui::vec2(pill_w, 16.0),
+            );
+            painter.rect_filled(
+                replaced_rect,
+                egui::CornerRadius::same(3),
+                egui::Color32::from_rgba_unmultiplied(100, 116, 139, 36),
+            );
+            painter.rect_stroke(
+                replaced_rect,
+                egui::CornerRadius::same(3),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(148, 163, 184, 110),
+                ),
+                egui::StrokeKind::Inside,
+            );
+            painter.galley(
+                egui::pos2(
+                    replaced_rect.center().x - replaced_galley.size().x / 2.0,
+                    replaced_rect.center().y - replaced_galley.size().y / 2.0,
+                ),
+                replaced_galley,
+                replaced_fg,
+            );
+            text_left = replaced_rect.right() + 4.0;
+        }
+    }
+
+    let (led_color, halo_color) = if is_replaced {
+        (
+            egui::Color32::from_rgb(100, 116, 139),
+            egui::Color32::from_rgba_unmultiplied(100, 116, 139, 50),
+        )
+    } else {
+        let led_health = if quota.provider_is_throttled() {
+            PacingHealth::Throttled
+        } else {
+            forecast.health
+        };
+        match led_health {
+            PacingHealth::Surplus | PacingHealth::OnTrack => (
+                egui::Color32::from_rgb(34, 197, 94),
+                egui::Color32::from_rgba_unmultiplied(34, 197, 94, 70),
+            ),
+            PacingHealth::Tight => (
+                egui::Color32::from_rgb(253, 224, 71),
+                egui::Color32::from_rgba_unmultiplied(253, 224, 71, 75),
+            ),
+            PacingHealth::Throttled => (
+                egui::Color32::from_rgb(239, 68, 68),
+                egui::Color32::from_rgba_unmultiplied(239, 68, 68, 80),
+            ),
+        }
+    };
     painter.circle_filled(led_pos, 5.0, halo_color);
     painter.circle_filled(led_pos, 2.5, led_color);
     painter.circle_filled(
@@ -10777,25 +10875,26 @@ mod tests {
 
     #[test]
     fn test_quota_satellite_design_height() {
+        let empty = std::collections::HashSet::new();
         // Settings tab grows with the configured provider count:
         // 106 base + 5 rows * 61 (row 56 + gap 5) = 411.
-        assert_eq!(quota_satellite_design_height(&[], true, false), 411.0);
-        assert_eq!(quota_satellite_design_height(&[], false, false), 88.0);
-        assert_eq!(quota_satellite_design_height(&[], true, true), 411.0);
+        assert_eq!(quota_satellite_design_height(&[], true, false, &empty), 411.0);
+        assert_eq!(quota_satellite_design_height(&[], false, false, &empty), 88.0);
+        assert_eq!(quota_satellite_design_height(&[], true, true, &empty), 411.0);
 
         let glm = ProviderQuota::new(ProviderId::Glm, "GLM", "Z.ai", None, None, Some(90), Some("01.10.".into()));
-        assert_eq!(provider_card_height(&glm, false), 68.0);
+        assert_eq!(provider_card_height(&glm, false, &empty), 68.0);
         // A healthy card keeps its full height even with minimizing on.
-        assert_eq!(provider_card_height(&glm, true), 68.0);
+        assert_eq!(provider_card_height(&glm, true, &empty), 68.0);
         assert_eq!(
-            quota_satellite_design_height(&[glm.clone()], false, false),
+            quota_satellite_design_height(&[glm.clone()], false, false, &empty),
             38.0 + 68.0 + 8.0
         );
 
         let agy = ProviderQuota::new(ProviderId::Agy, "AGY", "Google", Some(73), Some("19:45".into()), Some(85), Some("137h".into()));
-        assert_eq!(provider_card_height(&agy, false), 104.0);
+        assert_eq!(provider_card_height(&agy, false, &empty), 104.0);
         assert_eq!(
-            quota_satellite_design_height(&[glm.clone(), agy], false, false),
+            quota_satellite_design_height(&[glm.clone(), agy], false, false, &empty),
             38.0 + 68.0 + 104.0 + 6.0 + 8.0
         );
 
@@ -10809,12 +10908,30 @@ mod tests {
             Some(0),
             Some("31.10. (02:08)".into()),
         );
-        assert_eq!(provider_card_height(&claude, false), 104.0);
-        assert_eq!(provider_card_height(&claude, true), 30.0);
+        assert_eq!(provider_card_height(&claude, false, &empty), 104.0);
+        assert_eq!(provider_card_height(&claude, true, &empty), 30.0);
         assert_eq!(
-            quota_satellite_design_height(&[glm, claude], false, true),
+            quota_satellite_design_height(&[glm, claude], false, true, &empty),
             38.0 + 68.0 + 30.0 + 6.0 + 8.0
         );
+
+        // Replaced AGY account collapses to 30.0 by default even when minimize_depleted is false,
+        // and expands to 104.0 when toggled in expanded_replaced.
+        let mut replaced_agy = ProviderQuota::new(
+            ProviderId::Agy,
+            "AGY",
+            "Google",
+            Some(100),
+            Some("19:00".into()),
+            Some(2),
+            Some("30.11.".into()),
+        );
+        replaced_agy.account_id = Some("acc_leipzig".into());
+        replaced_agy.is_active_account = false;
+        assert_eq!(provider_card_height(&replaced_agy, false, &empty), 30.0);
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert("acc_leipzig".to_string());
+        assert_eq!(provider_card_height(&replaced_agy, false, &expanded), 104.0);
     }
 
     #[test]

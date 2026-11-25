@@ -1,7 +1,94 @@
 //! Pure ordering logic for the quota cards, kept platform-neutral so its
 //! regression tests run on every development machine.
+use crate::language::Language;
 use crate::quota::{ProviderId, ProviderQuota};
 use eframe::egui;
+use std::collections::HashSet;
+
+/// Threshold at or below which an inactive AGY account counts as replaced/drained
+/// (matches the 2% AGY auto-switch drain threshold).
+pub(crate) const REPLACED_AGY_WEEKLY_THRESHOLD_PCT: u8 = 2;
+
+/// Returns true when `quota` is an inactive AGY account whose weekly budget is
+/// drained to `<= 2%`, i.e. an already replaced/standby-exhausted account card.
+pub(crate) fn is_replaced_agy_account(quota: &ProviderQuota) -> bool {
+    quota.id == ProviderId::Agy
+        && !quota.is_active_account
+        && quota
+            .week_percent
+            .is_some_and(|pct| pct <= REPLACED_AGY_WEEKLY_THRESHOLD_PCT)
+}
+
+/// Stable toggle key for manually expanding a collapsed replaced AGY card.
+pub(crate) fn replaced_account_toggle_key(quota: &ProviderQuota) -> Option<String> {
+    if !is_replaced_agy_account(quota) {
+        return None;
+    }
+    Some(
+        quota
+            .account_id
+            .clone()
+            .or_else(|| quota.account_label.clone())
+            .unwrap_or_else(|| "agy_replaced_default".to_string()),
+    )
+}
+
+/// Toggle manual expansion state for a replaced AGY account card.
+/// Returns `true` if the card is now expanded, `false` if collapsed.
+pub(crate) fn toggle_replaced_account_expanded(
+    expanded: &mut HashSet<String>,
+    quota: &ProviderQuota,
+) -> bool {
+    let Some(key) = replaced_account_toggle_key(quota) else {
+        return false;
+    };
+    if expanded.contains(&key) {
+        expanded.remove(&key);
+        false
+    } else {
+        expanded.insert(key);
+        true
+    }
+}
+
+/// Effective minimized state of a quota card:
+/// - Replaced AGY accounts (`!is_active_account && week_percent <= 2`) are
+///   collapsed by default (even if `minimize_depleted` is false), and expand
+///   when their key is present in `expanded_replaced`.
+/// - All other cards follow the existing `minimize_depleted && provider_is_throttled()` rule.
+pub(crate) fn card_is_minimized(
+    quota: &ProviderQuota,
+    minimize_depleted: bool,
+    expanded_replaced: &HashSet<String>,
+) -> bool {
+    if is_replaced_agy_account(quota) {
+        return !replaced_account_toggle_key(quota)
+            .is_some_and(|key| expanded_replaced.contains(&key));
+    }
+    minimize_depleted && quota.provider_is_throttled()
+}
+
+/// Localized badge label for a replaced AGY account card.
+pub(crate) fn replaced_badge_label(language: Language) -> &'static str {
+    language.text("Abgelöst", "Replaced")
+}
+
+/// Remove keys from `expanded` for accounts that are no longer replaced (e.g.
+/// after a weekly refill and FEFO switch-back), so a future replacement starts
+/// collapsed again by default.
+pub(crate) fn prune_expanded_replaced(
+    expanded: &mut HashSet<String>,
+    providers: &[ProviderQuota],
+) {
+    if expanded.is_empty() {
+        return;
+    }
+    let active_replaced: HashSet<String> = providers
+        .iter()
+        .filter_map(replaced_account_toggle_key)
+        .collect();
+    expanded.retain(|key| active_replaced.contains(key));
+}
 
 /// Stable per-provider slot for egui widget ids (ProviderId is not Hash).
 pub(crate) fn provider_slot(provider: ProviderId) -> u8 {
@@ -73,7 +160,16 @@ pub(crate) fn reorder_quota_order(
 
 /// The reset that ends a provider's depletion, for the minimized card row:
 /// a drained weekly budget is the real blocker, otherwise the session reset.
+/// Replaced AGY accounts (`week_percent <= 2%`) also surface their weekly reset
+/// even when `week_percent` is 1–2% rather than 0%.
 pub(crate) fn minimized_reset(quota: &ProviderQuota) -> Option<(&str, bool)> {
+    if is_replaced_agy_account(quota) {
+        return quota
+            .week_reset
+            .as_deref()
+            .map(|reset| (reset, false))
+            .or_else(|| quota.five_hour_reset.as_deref().map(|reset| (reset, true)));
+    }
     if !quota.provider_is_throttled() {
         return None;
     }
@@ -330,5 +426,81 @@ mod tests {
         for (index, slot) in slots.iter().enumerate() {
             assert_eq!(*slot, index as u8);
         }
+    }
+
+    #[test]
+    fn replaced_agy_account_collapses_by_default_and_toggles_on_click() {
+        let mut replaced = ProviderQuota::new(
+            ProviderId::Agy,
+            "AGY",
+            "Google",
+            Some(100),
+            Some("19:00".into()),
+            Some(2),
+            Some("30.11. (08:00)".into()),
+        );
+        replaced.account_id = Some("acc_leipzig".into());
+        replaced.account_label = Some("leipzig".into());
+        replaced.is_active_account = false;
+
+        let mut expanded = HashSet::new();
+        assert!(is_replaced_agy_account(&replaced));
+        assert!(card_is_minimized(&replaced, false, &expanded));
+        assert!(card_is_minimized(&replaced, true, &expanded));
+        assert_eq!(minimized_reset(&replaced), Some(("30.11. (08:00)", false)));
+        assert_eq!(replaced_badge_label(Language::German), "Abgelöst");
+        assert_eq!(replaced_badge_label(Language::English), "Replaced");
+
+        // Click expands the replaced card
+        assert!(toggle_replaced_account_expanded(&mut expanded, &replaced));
+        assert!(!card_is_minimized(&replaced, false, &expanded));
+        assert!(!card_is_minimized(&replaced, true, &expanded));
+
+        // Second click collapses it again
+        assert!(!toggle_replaced_account_expanded(&mut expanded, &replaced));
+        assert!(card_is_minimized(&replaced, false, &expanded));
+
+        // Expand again, then simulate FEFO switch-back (active + refilled):
+        // prune_expanded_replaced drops the stale key so a later replacement starts collapsed.
+        assert!(toggle_replaced_account_expanded(&mut expanded, &replaced));
+        let mut reactivated = replaced.clone();
+        reactivated.is_active_account = true;
+        reactivated.week_percent = Some(100);
+        prune_expanded_replaced(&mut expanded, &[reactivated]);
+        assert!(expanded.is_empty());
+        assert!(card_is_minimized(&replaced, false, &expanded));
+    }
+
+    #[test]
+    fn active_or_healthy_standby_agy_account_stays_expanded() {
+        let mut active_low = ProviderQuota::new(
+            ProviderId::Agy,
+            "AGY",
+            "Google",
+            Some(20),
+            Some("19:00".into()),
+            Some(1),
+            Some("30.11.".into()),
+        );
+        active_low.account_id = Some("acc_privat".into());
+        active_low.is_active_account = true;
+
+        let mut standby_healthy = ProviderQuota::new(
+            ProviderId::Agy,
+            "AGY",
+            "Google",
+            Some(100),
+            Some("19:00".into()),
+            Some(95),
+            Some("01.12.".into()),
+        );
+        standby_healthy.account_id = Some("acc_backup".into());
+        standby_healthy.is_active_account = false;
+
+        let expanded = HashSet::new();
+        assert!(!is_replaced_agy_account(&active_low));
+        assert!(!card_is_minimized(&active_low, false, &expanded));
+        assert!(!is_replaced_agy_account(&standby_healthy));
+        assert!(!card_is_minimized(&standby_healthy, false, &expanded));
     }
 }
