@@ -39,7 +39,7 @@ AUTH_UNAVAILABLE = "unavailable"
 
 FLOOR_PCT = 15
 FEFO_FIVE_HOUR_MIN_PCT = 10
-DRAIN_ZERO_THRESHOLD_PCT = 1
+DRAIN_ZERO_THRESHOLD_PCT = 5
 FEFO_RETURN_FIVE_HOUR_MIN_PCT = 20
 AUTO_SWITCH_WALLCLOCK_BUDGET_S = 120.0
 AUTO_SWITCH_STALE_CACHE_MAX_AGE_S = 120.0
@@ -47,6 +47,7 @@ AUTO_SWITCH_BOUNCE_LOCK_FILE = "auto-switch-bounce.lock"
 USAGE_TIMEOUT_S = 12
 DEFAULT_AGY_BIN = str(Path.home() / ".local" / "bin" / "agy")
 DEFAULT_STATE_DIR = "~/.local/state/llm-accounts"
+DEFAULT_SWITCH_DELTAS_FILE = "~/.local/state/mothr/agy-account-switch-deltas.jsonl"
 DEFAULT_LIVE_HOME = "~"
 DEFAULT_PROC_ROOT = "/proc"
 DEFAULT_UNIT_DIR = "~/.config/systemd/user"
@@ -67,6 +68,10 @@ class CliError(Exception):
 
 def state_dir() -> Path:
     return Path(os.environ.get("LLM_ACCOUNTS_DIR") or DEFAULT_STATE_DIR).expanduser()
+
+
+def switch_deltas_file() -> Path:
+    return Path(os.environ.get("MOTHR_AGY_SWITCH_DELTAS_FILE") or DEFAULT_SWITCH_DELTAS_FILE).expanduser()
 
 
 def live_home() -> Path:
@@ -2441,7 +2446,7 @@ def _evaluate_auto_switch_decision(
             return _result("switch", target=best, trigger_reason=trigger)
 
         # Kein besserer Slot im Drain-Pfad: die FEFO-Rückwechselregeln (Pfad B) tragen die Hysterese
-        # über ihr 19-Punkte-Band (Rückkehr erst ab 20 %, Drain-Schwelle bei 1 %).
+        # über ihr 15-Punkte-Band (Rückkehr erst ab 20 %, Drain-Schwelle bei 5 %).
         return _result("no_better_slot", trigger_reason=trigger)
 
     # Pfad B: Aktives Konto ist nicht leer -> smarter FEFO-Rückwechsel auf früher verfallendes Konto.
@@ -2682,6 +2687,126 @@ def _format_autoswitch_result(result: dict[str, Any], as_json: bool) -> str:
     return base
 
 
+def _finite_pct(value: Any) -> int | float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return value
+    return None
+
+
+def _pct_delta(before: int | float | None, after: int | float | None) -> int | float | None:
+    if before is None or after is None:
+        return None
+    diff = before - after
+    if isinstance(before, int) and isinstance(after, int):
+        return diff
+    return round(float(diff), 3)
+
+
+def _measure_post_bounce_slot_pcts(
+    adapter: AgyAdapter,
+    slot_id: str | None,
+) -> tuple[int | float | None, int | float | None, bool]:
+    if not slot_id:
+        return None, None, False
+    try:
+        probe = probe_slot(adapter, slot_id)
+    except Exception as exc:
+        print(f"llm-account: Warnung: Post-Bounce-Probe für {slot_id} fehlgeschlagen: {exc}", file=sys.stderr)
+        return None, None, False
+    if not isinstance(probe, dict) or probe.get("auth_state") != AUTH_OK:
+        return None, None, False
+    lanes = probe.get("lanes")
+    lane_data = lanes.get(adapter.primary_lane) if isinstance(lanes, dict) else None
+    if not isinstance(lane_data, dict):
+        return None, None, False
+    w_after = _finite_pct(lane_data.get("weekly_pct"))
+    h_after = _finite_pct(lane_data.get("five_hour_pct"))
+    return w_after, h_after, (w_after is not None or h_after is not None)
+
+
+def _ensure_safe_dir_0700(directory: Path) -> None:
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise OSError(f"Unsicheres Zielverzeichnis für Delta-Log: {directory}")
+    directory.mkdir(parents=True, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        raise OSError(f"Unsicheres Zielverzeichnis für Delta-Log: {directory}")
+    os.chmod(directory, 0o700)
+
+
+def _append_jsonl_locked(path: Path, record: dict[str, Any]) -> None:
+    _ensure_safe_dir_0700(path.parent)
+    payload = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"Delta-Log ist keine reguläre Datei: {path}")
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        orig_size = os.fstat(fd).st_size
+        try:
+            view = memoryview(payload)
+            written = 0
+            while written < len(payload):
+                chunk = os.write(fd, view[written:])
+                if chunk <= 0:
+                    raise OSError("Kurzer/leerer Schreibvorgang beim Delta-Log")
+                written += chunk
+            os.fsync(fd)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.ftruncate(fd, orig_size)
+            raise
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _record_auto_switch_delta(
+    adapter: AgyAdapter,
+    *,
+    from_slot: str | None,
+    to_slot: str | None,
+    reason: str | None,
+    old_weekly_before: int | float | None,
+    old_five_hour_before: int | float | None,
+    stale_sessions_bounced: int,
+    t_switch_start: float,
+    started_at_utc: str,
+    deltas_path: Path | None = None,
+) -> None:
+    try:
+        old_weekly_after, old_five_hour_after, post_bounce_measured = _measure_post_bounce_slot_pcts(
+            adapter, from_slot
+        )
+        completed_at_utc = utc_iso()
+        total_duration_seconds = round(max(0.0, time.monotonic() - t_switch_start), 3)
+        record = {
+            "schema": "agy-account-switch-delta-v1",
+            "ts_utc": completed_at_utc,
+            "started_at_utc": started_at_utc,
+            "completed_at_utc": completed_at_utc,
+            "provider": adapter.name,
+            "from_slot": from_slot,
+            "to_slot": to_slot,
+            "reason": reason,
+            "threshold_pct": DRAIN_ZERO_THRESHOLD_PCT,
+            "old_weekly_pct_before": old_weekly_before,
+            "old_five_hour_pct_before": old_five_hour_before,
+            "old_weekly_pct_after": old_weekly_after,
+            "old_five_hour_pct_after": old_five_hour_after,
+            "weekly_delta_pct": _pct_delta(old_weekly_before, old_weekly_after),
+            "five_hour_delta_pct": _pct_delta(old_five_hour_before, old_five_hour_after),
+            "stale_sessions_bounced": stale_sessions_bounced,
+            "total_duration_seconds": total_duration_seconds,
+            "post_bounce_measured": post_bounce_measured,
+        }
+        _append_jsonl_locked(deltas_path or switch_deltas_file(), record)
+    except Exception as exc:
+        print(f"llm-account: Warnung: Delta-Log konnte nicht geschrieben werden: {exc}", file=sys.stderr)
+
+
 def cmd_auto_switch(
     adapter: AgyAdapter,
     *,
@@ -2695,6 +2820,7 @@ def cmd_auto_switch(
     max_bounces: int = 2,
     quiet_recheck: float = QUIET_RECHECK_S,
     herdr: Any = None,
+    deltas_path: Path | None = None,
 ) -> str:
     max_quota_age, cooldown, max_bounces, quiet_recheck = _validate_auto_switch_args(
         max_quota_age, cooldown, max_bounces, quiet_recheck
@@ -2766,6 +2892,10 @@ def cmd_auto_switch(
     skip_phase3 = False
     skip_phase3_reason = "registry_changed"
     quota_sync_error: str | None = None
+    t_switch_start: float | None = None
+    started_at_utc: str | None = None
+    old_weekly_before: int | float | None = None
+    old_five_hour_before: int | float | None = None
 
     cache_recheck_pending = not probe_used
     while True:
@@ -2811,6 +2941,10 @@ def cmd_auto_switch(
                     elif dry_run:
                         decision = "dry_run_would_switch"
                     else:
+                        t_switch_start = time.monotonic()
+                        started_at_utc = utc_iso()
+                        old_weekly_before = _finite_pct(eval_res.get("active_weekly_pct"))
+                        old_five_hour_before = _finite_pct(eval_res.get("active_five_hour_pct"))
                         info = _switch_slot_locked(adapter, target_slot)  # type: ignore[arg-type]
                         previous_account = info["previous"]
                         active_account = target_slot
@@ -2890,6 +3024,20 @@ def cmd_auto_switch(
             max_bounces=max_bounces,
             quiet_recheck=quiet_recheck,
             herdr=herdr,
+        )
+
+    if decision == "switched" and not dry_run and t_switch_start is not None and started_at_utc is not None:
+        _record_auto_switch_delta(
+            adapter,
+            from_slot=previous_account,
+            to_slot=target_slot,
+            reason=trigger_reason,
+            old_weekly_before=old_weekly_before,
+            old_five_hour_before=old_five_hour_before,
+            stale_sessions_bounced=sum(1 for b in bounces if b.get("status") == "ok"),
+            t_switch_start=t_switch_start,
+            started_at_utc=started_at_utc,
+            deltas_path=deltas_path,
         )
 
     result = {
