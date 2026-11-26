@@ -1586,8 +1586,8 @@ fn is_multi_account_card(visible: &[ProviderQuota], quota: &ProviderQuota) -> bo
 
 use crate::quota_layout::{
     apply_quota_order, card_is_minimized, card_widget_id, fit_reset_text, is_replaced_agy_account,
-    provider_slot, prune_expanded_replaced, reorder_quota_order, replaced_badge_label,
-    toggle_replaced_account_expanded,
+    is_standby_agy_account, provider_slot, prune_expanded_replaced, reorder_quota_order,
+    standby_badge_label, toggle_replaced_account_expanded,
 };
 
 struct LiveStatusApp {
@@ -3098,13 +3098,17 @@ fn persist_window_position(app: &mut LiveStatusApp, ctx: &egui::Context) {
     }
 }
 
+fn active_card_shows_pool_block(quota: &ProviderQuota) -> bool {
+    quota.is_active_account && quota.pool_reach.is_some()
+}
+
 fn provider_card_height(
     quota: &ProviderQuota,
     minimize_depleted: bool,
     expanded_replaced: &std::collections::HashSet<String>,
 ) -> f32 {
     if card_is_minimized(quota, minimize_depleted, expanded_replaced) {
-        // Header row only: badge, subtitle, LED and the reset hint.
+        // Header row only: badge, subtitle, LED and the reset/reserve hint.
         return 30.0;
     }
     let (five_hour_percent, five_hour_reset) = quota.current_five_hour_window();
@@ -3115,10 +3119,11 @@ fn provider_card_height(
         (false, false) => 1,
         _ => 1,
     };
-    if count == 2 {
-        104.0
+    let base = if count == 2 { 104.0 } else { 68.0 };
+    if active_card_shows_pool_block(quota) {
+        base + 36.0
     } else {
-        68.0
+        base
     }
 }
 
@@ -7945,14 +7950,14 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             );
                         }
                         let card_id = card_widget_id(quota.id, quota.account_id.as_deref());
-                        let is_replaced = is_replaced_agy_account(quota);
-                        let card_sense = if is_replaced {
+                        let is_standby = is_standby_agy_account(quota);
+                        let card_sense = if is_standby {
                             egui::Sense::click_and_drag()
                         } else {
                             egui::Sense::drag()
                         };
                         let card_response = ui.interact(row_rect, card_id, card_sense);
-                        let card_response = if is_replaced {
+                        let card_response = if is_standby {
                             card_response.on_hover_cursor(egui::CursorIcon::PointingHand)
                         } else {
                             card_response
@@ -7961,14 +7966,16 @@ fn render_quota_satellite_window(app: &mut LiveStatusApp, ctx: &egui::Context) {
                             (true, Some(email)) => {
                                 let role = if quota.is_active_account {
                                     language.text("Aktiv", "Active")
+                                } else if is_replaced_agy_account(quota) {
+                                    language.text("Abgelöst", "Replaced")
                                 } else {
-                                    language.text("Standby", "Standby")
+                                    language.text("Reserve", "Standby")
                                 };
                                 card_response.on_hover_text(format!("{email} ({role})"))
                             }
                             _ => card_response,
                         };
-                        if is_replaced && card_response.clicked() {
+                        if is_standby && card_response.clicked() {
                             toggle_replaced_account_expanded(&mut app.quota_expanded_replaced, quota);
                             ui.ctx().request_repaint();
                         }
@@ -8568,6 +8575,107 @@ fn draw_smooth_limit_block(
     }
 }
 
+fn draw_pool_limit_block(
+    painter: &egui::Painter,
+    top_left: egui::Pos2,
+    width: f32,
+    reach: &crate::quota::PoolReach,
+    language: Language,
+) {
+    // Subtle separator above the shared group pool summary
+    painter.line_segment(
+        [
+            egui::pos2(top_left.x, top_left.y - 3.0),
+            egui::pos2(top_left.x + width, top_left.y - 3.0),
+        ],
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(65, 82, 115, 40)),
+    );
+
+    let title_color = egui::Color32::from_rgb(203, 213, 225);
+    let title_text = format!("{}: {}%", reach.title_text(language), reach.combined_pct);
+    let title_galley = painter.layout_no_wrap(
+        title_text.into(),
+        egui::FontId::monospace(10.5),
+        title_color,
+    );
+    painter.galley(top_left, title_galley, title_color);
+
+    let tone_color = pool_tone_color(reach.tone());
+    let runway_text = reach.runway_text(language);
+    let runway_galley = painter.layout_no_wrap(
+        runway_text.into(),
+        egui::FontId::monospace(10.0),
+        tone_color,
+    );
+    let runway_x = top_left.x + width - runway_galley.size().x;
+    painter.galley(
+        egui::pos2(runway_x, top_left.y),
+        runway_galley,
+        tone_color,
+    );
+
+    // Line 2: Micro-dots bar for combined group pool capacity
+    let track_y = top_left.y + 14.0;
+    let dot_step = 3.6;
+    let dot_radius = 1.1;
+    let dot_count = ((width - 2.0) / dot_step).floor() as usize;
+    let active_count = ((dot_count as f32) * (reach.combined_pct as f32 / 100.0)).round() as usize;
+    let dot_active_color = match reach.tone() {
+        crate::quota::PoolTone::Covered | crate::quota::PoolTone::Estimate => {
+            egui::Color32::from_rgb(157, 196, 118)
+        }
+        crate::quota::PoolTone::Tight => egui::Color32::from_rgb(251, 191, 36),
+        crate::quota::PoolTone::Critical => egui::Color32::from_rgb(248, 113, 113),
+    };
+    let dot_unfilled_color = egui::Color32::from_rgba_unmultiplied(51, 65, 85, 130);
+
+    for i in 0..dot_count {
+        let dot_x = top_left.x + 1.1 + (i as f32) * dot_step;
+        let dot_pos = egui::pos2(dot_x, track_y);
+        if i < active_count {
+            if i + 1 == active_count {
+                painter.circle_filled(dot_pos, 2.4, dot_active_color.gamma_multiply(0.4));
+                painter.circle_filled(dot_pos, dot_radius, egui::Color32::from_rgb(255, 255, 255));
+            } else {
+                painter.circle_filled(dot_pos, dot_radius, dot_active_color);
+            }
+        } else {
+            painter.circle_filled(dot_pos, dot_radius, dot_unfilled_color);
+        }
+    }
+
+    // Line 3: Earliest pool refill on the left, Pool-Pace on the right
+    let refill_raw = reach.refill_reset_raw();
+    let reset_phrase = format_reset_phrase(Some(&refill_raw), false, language);
+    let footer_left = format!("Reset {reset_phrase}");
+    let footer_left_galley = painter.layout_no_wrap(
+        footer_left.into(),
+        egui::FontId::monospace(9.5),
+        egui::Color32::from_rgb(148, 163, 184),
+    );
+    let footer_y = track_y + 5.0;
+    painter.galley(
+        egui::pos2(top_left.x, footer_y),
+        footer_left_galley,
+        egui::Color32::from_rgb(148, 163, 184),
+    );
+
+    let pace_text = reach.pace_text(language);
+    if !pace_text.is_empty() {
+        let footer_right_galley = painter.layout_no_wrap(
+            pace_text.into(),
+            egui::FontId::monospace(9.5),
+            tone_color,
+        );
+        let right_x = top_left.x + width - footer_right_galley.size().x;
+        painter.galley(
+            egui::pos2(right_x, footer_y),
+            footer_right_galley,
+            tone_color,
+        );
+    }
+}
+
 fn quota_unavailable_label(language: Language) -> &'static str {
     language.text("Keine aktuellen Daten", "No current data")
 }
@@ -8636,6 +8744,7 @@ fn draw_provider_card(
         (Some(label), true) => format!("{company} · {label}"),
         _ => company.to_string(),
     };
+    let is_standby = is_standby_agy_account(quota);
     let is_replaced = is_replaced_agy_account(quota);
     let name_color = if is_replaced {
         egui::Color32::from_rgb(148, 163, 184)
@@ -8654,51 +8763,57 @@ fn draw_provider_card(
         name_color,
     );
 
-    // The reset hint of a minimized card starts right behind the name (or behind the replaced badge).
+    // The reset/reserve hint of a minimized card starts right behind the name (or behind the standby badge).
     let mut text_left = badge_rect.right() + 8.0 + name_width + 8.0;
 
     // Right: Pure status LED light without text clutter (per Simon's request).
     // Replaced AGY accounts show a calm muted slate LED instead of alarm red.
     let led_pos = egui::pos2(card_rect.right() - 14.0, header_y + 9.0);
-    if is_replaced {
-        let chevron = if minimized { "▸" } else { "▾" };
-        let replaced_text = format!("{} {}", replaced_badge_label(language), chevron);
-        let replaced_fg = egui::Color32::from_rgb(148, 163, 184);
-        let replaced_galley = painter.layout_no_wrap(
-            replaced_text,
+    if is_standby {
+        // ASCII +/- avoids missing-glyph tofu boxes in egui's default font on Windows.
+        let chevron = if minimized { "+" } else { "-" };
+        let standby_text = format!("{} {}", standby_badge_label(quota, language), chevron);
+        let (pill_fg, pill_bg_c, pill_stroke_c) = if is_replaced {
+            (
+                egui::Color32::from_rgb(148, 163, 184),
+                egui::Color32::from_rgba_unmultiplied(100, 116, 139, 36),
+                egui::Color32::from_rgba_unmultiplied(148, 163, 184, 110),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(120, 184, 134),
+                egui::Color32::from_rgba_unmultiplied(120, 184, 134, 30),
+                egui::Color32::from_rgba_unmultiplied(120, 184, 134, 110),
+            )
+        };
+        let standby_galley = painter.layout_no_wrap(
+            standby_text,
             egui::FontId::proportional(9.0),
-            replaced_fg,
+            pill_fg,
         );
-        let pill_w = replaced_galley.size().x + 8.0;
+        let pill_w = standby_galley.size().x + 8.0;
         let max_pill_right = (led_pos.x - 10.0).max(text_left);
         if text_left + pill_w <= max_pill_right {
-            let replaced_rect = egui::Rect::from_min_size(
+            let standby_rect = egui::Rect::from_min_size(
                 egui::pos2(text_left, header_y + 1.0),
                 egui::vec2(pill_w, 16.0),
             );
-            painter.rect_filled(
-                replaced_rect,
-                egui::CornerRadius::same(3),
-                egui::Color32::from_rgba_unmultiplied(100, 116, 139, 36),
-            );
+            painter.rect_filled(standby_rect, egui::CornerRadius::same(3), pill_bg_c);
             painter.rect_stroke(
-                replaced_rect,
+                standby_rect,
                 egui::CornerRadius::same(3),
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(148, 163, 184, 110),
-                ),
+                egui::Stroke::new(1.0, pill_stroke_c),
                 egui::StrokeKind::Inside,
             );
             painter.galley(
                 egui::pos2(
-                    replaced_rect.center().x - replaced_galley.size().x / 2.0,
-                    replaced_rect.center().y - replaced_galley.size().y / 2.0,
+                    standby_rect.center().x - standby_galley.size().x / 2.0,
+                    standby_rect.center().y - standby_galley.size().y / 2.0,
                 ),
-                replaced_galley,
-                replaced_fg,
+                standby_galley,
+                pill_fg,
             );
-            text_left = replaced_rect.right() + 4.0;
+            text_left = standby_rect.right() + 4.0;
         }
     }
 
@@ -8737,19 +8852,40 @@ fn draw_provider_card(
     );
 
     if minimized {
-        // Header-only row: name plus the reset that ends the depletion,
-        // formatted like the reset footer of the full cards.
-        if let Some((raw, is_five_hour)) = crate::quota_layout::minimized_reset(quota) {
-            let font = egui::FontId::monospace(9.0);
-            let full_text = format!(
-                "Reset {}",
-                format_reset_phrase(Some(raw), is_five_hour, language)
-            );
+        // Header-only row: name plus the reserve capacity / reset hint.
+        let font = egui::FontId::monospace(9.0);
+        let meta_text = if is_standby && !is_replaced {
+            match (quota.week_percent, crate::quota_layout::minimized_reset(quota)) {
+                (Some(pct), Some((raw, is_five_hour))) => Some(format!(
+                    "{pct}% · Reset {}",
+                    format_reset_phrase(Some(raw), is_five_hour, language)
+                )),
+                (Some(pct), None) => Some(format!("{pct}%")),
+                (None, Some((raw, is_five_hour))) => Some(format!(
+                    "Reset {}",
+                    format_reset_phrase(Some(raw), is_five_hour, language)
+                )),
+                (None, None) => None,
+            }
+        } else {
+            crate::quota_layout::minimized_reset(quota).map(|(raw, is_five_hour)| {
+                format!(
+                    "Reset {}",
+                    format_reset_phrase(Some(raw), is_five_hour, language)
+                )
+            })
+        };
+        if let Some(full_text) = meta_text {
+            let meta_color = if is_standby && !is_replaced {
+                egui::Color32::from_rgb(148, 163, 184)
+            } else {
+                GRAY
+            };
             let avail_w = (led_pos.x - 10.0 - text_left).max(0.0);
             let shown = fit_reset_text(&full_text, avail_w, |text| {
-                painter.layout_no_wrap(text.to_string(), font.clone(), GRAY).size().x
+                painter.layout_no_wrap(text.to_string(), font.clone(), meta_color).size().x
             });
-            let reset_galley = painter.layout_no_wrap(shown, font, GRAY);
+            let reset_galley = painter.layout_no_wrap(shown, font, meta_color);
             let reset_x = (led_pos.x - 10.0 - reset_galley.size().x).max(text_left);
             // Clip to the free span so a long account label never reaches the LED.
             let reset_clip = egui::Rect::from_min_max(
@@ -8759,7 +8895,7 @@ fn draw_provider_card(
             painter.with_clip_rect(reset_clip).galley(
                 egui::pos2(reset_x, header_y + 3.0),
                 reset_galley,
-                GRAY,
+                meta_color,
             );
         }
         return;
@@ -8828,6 +8964,15 @@ fn draw_provider_card(
             quota.is_active_account,
             language,
         );
+        if let Some(reach) = quota.pool_reach.as_ref().filter(|_| quota.is_active_account) {
+            draw_pool_limit_block(
+                painter,
+                egui::pos2(inner_left, div_y + 77.0),
+                inner_w,
+                reach,
+                language,
+            );
+        }
     } else if has_5h {
         let title_5h = if quota.id == ProviderId::Claude {
             language.text("Session-Limit", "Session Limit")
@@ -8849,6 +8994,15 @@ fn draw_provider_card(
             quota.is_active_account,
             language,
         );
+        if let Some(reach) = quota.pool_reach.as_ref().filter(|_| quota.is_active_account) {
+            draw_pool_limit_block(
+                painter,
+                egui::pos2(inner_left, div_y + 41.0),
+                inner_w,
+                reach,
+                language,
+            );
+        }
     } else if has_wk {
         let title_wk = if quota.cycle_label() == "Mo" {
             language.text("Monats-Limit", "Monthly Limit")
@@ -8870,6 +9024,15 @@ fn draw_provider_card(
             quota.is_active_account,
             language,
         );
+        if let Some(reach) = quota.pool_reach.as_ref().filter(|_| quota.is_active_account) {
+            draw_pool_limit_block(
+                painter,
+                egui::pos2(inner_left, div_y + 41.0),
+                inner_w,
+                reach,
+                language,
+            );
+        }
     } else {
         let empty_label = quota_unavailable_label(language);
         let none_galley = painter.layout_no_wrap(
@@ -10939,6 +11102,46 @@ mod tests {
         let mut expanded = std::collections::HashSet::new();
         expanded.insert("acc_leipzig".to_string());
         assert_eq!(provider_card_height(&replaced_agy, false, &expanded), 104.0);
+
+        // Healthy reserve AGY account also collapses to 30.0 by default and expands to 104.0 on click.
+        let mut reserve_agy = ProviderQuota::new(
+            ProviderId::Agy,
+            "AGY",
+            "Google",
+            Some(100),
+            Some("18:12".into()),
+            Some(100),
+            Some("03.12.".into()),
+        );
+        reserve_agy.account_id = Some("acc_leipzig".into());
+        reserve_agy.is_active_account = false;
+        assert_eq!(provider_card_height(&reserve_agy, false, &empty), 30.0);
+        assert_eq!(provider_card_height(&reserve_agy, false, &expanded), 104.0);
+
+        // Active pooled AGY account adds the 36px Gruppen-Limit / Pool-Pacing block (140.0 total).
+        let mut active_pooled = ProviderQuota::new(
+            ProviderId::Agy,
+            "AGY",
+            "Google",
+            Some(95),
+            Some("18:02".into()),
+            Some(84),
+            Some("03.12.".into()),
+        );
+        active_pooled.account_id = Some("acc_privat".into());
+        active_pooled.is_active_account = true;
+        active_pooled.pool_reach = Some(crate::quota::PoolReach {
+            runway_days: 2.2,
+            days_to_refill: 6.8,
+            refill_epoch: 1_796_281_374,
+            computed_at_epoch: 1_795_695_712,
+            covered: false,
+            active_label: Some("privat".into()),
+            member_count: 2,
+            combined_pct: 92,
+            is_estimate: false,
+        });
+        assert_eq!(provider_card_height(&active_pooled, false, &empty), 140.0);
     }
 
     #[test]
@@ -10992,6 +11195,7 @@ mod tests {
 fn pool_tone_color(tone: crate::quota::PoolTone) -> egui::Color32 {
     match tone {
         crate::quota::PoolTone::Covered => egui::Color32::from_rgb(120, 184, 134),
+        crate::quota::PoolTone::Estimate => egui::Color32::from_rgb(148, 163, 184),
         crate::quota::PoolTone::Tight => egui::Color32::from_rgb(253, 224, 71),
         crate::quota::PoolTone::Critical => egui::Color32::from_rgb(252, 165, 165),
     }
