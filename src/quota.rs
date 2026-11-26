@@ -134,7 +134,10 @@ fn pool_reach_from_members(members: &[PoolMember], now_epoch: i64, fallback_refi
         .or_else(|| fallback_refill.filter(|epoch| *epoch > now_epoch))?;
     let days_to_refill = (refill_epoch - now_epoch) as f32 / 86_400.0;
     let active_label = members.iter().find(|m| m.is_active).and_then(|m| m.label.clone());
-    let is_estimate = members.iter().any(|m| m.burn_pct_per_day > 1e-6 && m.is_estimate);
+    // Tag-1-Schätzung gilt auch, wenn mangels Verbrauchsdaten (frisches Fenster) gar keine Burnrate vorliegt.
+    let is_estimate = members
+        .iter()
+        .any(|m| (m.burn_pct_per_day > 1e-6 || burn <= 1e-6) && m.is_estimate);
     Some(PoolReach {
         runway_days,
         days_to_refill,
@@ -454,7 +457,8 @@ impl ProviderQuota {
         fc
     }
 
-    /// Verbrauchte Wochenrate in Prozentpunkten pro Tag sowie Flag, ob das Konto noch im Tag-1-Schätzfenster (< 24 h) liegt.
+    /// Verbrauchte Wochenrate in Prozentpunkten pro Tag sowie Flag, ob das Konto noch im Tag-1-Schätzfenster (< 24 h)
+    /// oder im frischen Telemetrie-Gate ohne belastbare Verbrauchsdaten liegt.
     fn pool_burn_and_estimate(&self) -> (f32, bool) {
         let remaining = self.week_percent.unwrap_or(0) as f32;
         let fc = self.pacing_forecast();
@@ -462,7 +466,8 @@ impl ProviderQuota {
             Some(days) if days > 0.0 && remaining > 0.0 => remaining / days,
             _ => 0.0,
         };
-        (burn, fc.week_is_estimate)
+        let is_estimate = fc.week_is_estimate || fc.runway_days.is_none();
+        (burn, is_estimate)
     }
 
     #[cfg(test)]
@@ -3061,12 +3066,17 @@ pub fn update_snapshot_with_codex_json(snapshot: &mut QuotaSnapshot, json_str: &
 /// Applies a Codex fetcher output only when the subprocess succeeded with
 /// non-empty stdout. A failed or empty `wsl.exe` invocation (`None` / `""`)
 /// preserves the last known observation instead of flashing "Keine aktuellen
-/// Daten", while an explicit `"null"` from a healthy fetcher still clears
-/// expired data.
+/// Daten", while recomputing expiry-aware throttle state so an elapsed reset
+/// never leaves the global alarm stuck.
 pub fn apply_codex_fetch_output(snapshot: &mut QuotaSnapshot, stdout: Option<&str>) {
     if let Some(json) = stdout.map(str::trim).filter(|text| !text.is_empty()) {
         update_snapshot_with_codex_json(snapshot, json);
+        return;
     }
+    if let Some(codex) = snapshot.providers.iter_mut().find(|p| p.id == ProviderId::Codex) {
+        codex.is_throttled = codex.provider_is_throttled();
+    }
+    snapshot.has_throttle = snapshot.alarm_throttle();
 }
 
 pub fn update_snapshot_with_claude_json(snapshot: &mut QuotaSnapshot, json_str: &str) {
@@ -3080,20 +3090,25 @@ pub fn update_snapshot_with_claude_json(snapshot: &mut QuotaSnapshot, json_str: 
     // A missing or stale capture must not leave an older quota looking current.
     claude.five_hour_percent = None;
     claude.five_hour_reset = None;
+    claude.five_hour_reset_epoch = None;
     claude.week_percent = None;
     claude.week_reset = None;
+    claude.week_reset_epoch = None;
 
-    let now_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default();
-    for (key, percent, reset) in [
+    let now_epoch = current_utc_epoch();
+    for (key, percent, reset, reset_epoch) in [
         (
             "five_hour",
             &mut claude.five_hour_percent,
             &mut claude.five_hour_reset,
+            &mut claude.five_hour_reset_epoch,
         ),
-        ("week", &mut claude.week_percent, &mut claude.week_reset),
+        (
+            "week",
+            &mut claude.week_percent,
+            &mut claude.week_reset,
+            &mut claude.week_reset_epoch,
+        ),
     ] {
         let Some(window) = value.as_ref().and_then(|value| value.get(key)) else {
             continue;
@@ -3103,25 +3118,44 @@ pub fn update_snapshot_with_claude_json(snapshot: &mut QuotaSnapshot, json_str: 
             .and_then(serde_json::Value::as_f64)
             .filter(|used| (0.0..=100.0).contains(used))
             .map(|used| (100.0 - used.round()).clamp(0.0, 100.0) as u8);
-        *reset = window
+        let valid_epoch = window
             .get("resets_at")
             .and_then(serde_json::Value::as_i64)
-            .filter(|epoch| *epoch > now_epoch)
-            .map(|epoch| codex_reset_epoch_to_local(epoch, key));
+            .filter(|epoch| *epoch > now_epoch);
+        *reset_epoch = valid_epoch;
+        *reset = valid_epoch.map(|epoch| codex_reset_epoch_to_local(epoch, key));
     }
     claude.is_throttled = claude.week_percent == Some(0) || claude.five_hour_percent == Some(0);
     snapshot.has_throttle = snapshot.alarm_throttle();
     snapshot.last_updated = Some(Instant::now());
 }
 
+fn expire_retained_claude_at(snapshot: &mut QuotaSnapshot, now_epoch: i64) {
+    if let Some(claude) = snapshot.providers.iter_mut().find(|p| p.id == ProviderId::Claude) {
+        if claude.five_hour_reset_epoch.is_some_and(|epoch| now_epoch >= epoch) {
+            claude.five_hour_percent = None;
+            claude.five_hour_reset = None;
+            claude.five_hour_reset_epoch = None;
+        }
+        if claude.week_reset_epoch.is_some_and(|epoch| now_epoch >= epoch) {
+            claude.week_percent = None;
+            claude.week_reset = None;
+            claude.week_reset_epoch = None;
+        }
+        claude.is_throttled = claude.week_percent == Some(0) || claude.five_hour_percent == Some(0);
+    }
+    snapshot.has_throttle = snapshot.alarm_throttle();
+}
+
 /// Applies a Claude fetcher output only when the subprocess succeeded with
-/// non-empty stdout. Prevents transient `wsl.exe` failures from wiping the
-/// card to "Keine aktuellen Daten" while still allowing explicit `"null"` to
-/// clear expired captures.
+/// non-empty stdout. Prevents transient `wsl.exe` failures from wiping fresh
+/// captures while still expiring any window whose reset epoch has elapsed.
 pub fn apply_claude_fetch_output(snapshot: &mut QuotaSnapshot, stdout: Option<&str>) {
     if let Some(json) = stdout.map(str::trim).filter(|text| !text.is_empty()) {
         update_snapshot_with_claude_json(snapshot, json);
+        return;
     }
+    expire_retained_claude_at(snapshot, current_utc_epoch());
 }
 
 /// Qwen payloads already carry remaining percentages (the fetcher converts
@@ -5874,5 +5908,67 @@ mod track56_pool_pacing_tests {
         apply_claude_fetch_output(&mut snapshot, Some("null"));
         assert_eq!(snapshot.get_card(ProviderId::Codex, None).unwrap().week_percent, None);
         assert_eq!(snapshot.get_card(ProviderId::Claude, None).unwrap().week_percent, None);
+    }
+
+    #[test]
+    fn retained_codex_and_claude_throttles_expire_past_reset_even_when_fetch_fails() {
+        let now = current_utc_epoch();
+        let future_reset = now + 3_600;
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+
+        // Exhausted Claude window retained before reset, then cleared once time advances past reset.
+        apply_claude_fetch_output(
+            &mut snapshot,
+            Some(&format!(r#"{{"week":{{"used_percentage":100.0,"resets_at":{future_reset}}}}}"#)),
+        );
+        assert!(snapshot.get_card(ProviderId::Claude, None).unwrap().is_throttled);
+        assert!(snapshot.has_throttle);
+        expire_retained_claude_at(&mut snapshot, future_reset - 10);
+        assert!(snapshot.get_card(ProviderId::Claude, None).unwrap().is_throttled);
+        expire_retained_claude_at(&mut snapshot, future_reset + 1);
+        let claude = snapshot.get_card(ProviderId::Claude, None).unwrap();
+        assert_eq!(claude.week_percent, None);
+        assert!(!claude.is_throttled);
+        assert!(!snapshot.has_throttle);
+
+        // Exhausted Codex window whose reset has elapsed clears global alarm on failed fetch.
+        apply_codex_fetch_output(
+            &mut snapshot,
+            Some(&format!(
+                r#"{{"week_throttled":true,"week":{{"remaining_percent":0,"consumed_percent":100.0,"reset_epoch":{future_reset},"observed_epoch":{now},"source":"app_server","window_minutes":10080}}}}"#
+            )),
+        );
+        assert!(snapshot.has_throttle);
+        snapshot
+            .providers
+            .iter_mut()
+            .find(|p| p.id == ProviderId::Codex)
+            .unwrap()
+            .week_reset_epoch = Some(now - 60);
+        apply_codex_fetch_output(&mut snapshot, None);
+        assert!(!snapshot.get_card(ProviderId::Codex, None).unwrap().is_throttled);
+        assert!(!snapshot.has_throttle);
+    }
+
+    #[test]
+    fn fresh_cycles_without_burn_history_use_estimate_instead_of_confirmed_green_coverage() {
+        let now = current_utc_epoch();
+        let reset_in = |days: f32| iso_for_test(now + (days * 86_400.0) as i64);
+        // Both accounts ~4h into their 7d cycle at 99% and 100% -> fresh-cycle gate yields no runway.
+        let json = format!(
+            r#"{{"version":1,"active_account":"acc1","pooled_count":2,"pool_next_refill_epoch":null,"accounts":[
+              {{"id":"acc2","label":"leipzig","email":null,"is_active":false,"five_hour_pct":100,"week_pct":100,"week_reset":"{}","auth_state":"ok","auth_error":null}},
+              {{"id":"acc1","label":"privat","email":null,"is_active":true,"five_hour_pct":99,"week_pct":99,"week_reset":"{}","auth_state":"ok","auth_error":null}}
+            ]}}"#,
+            reset_in(6.85),
+            reset_in(6.85),
+        );
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_agy_json(&mut snapshot, &json);
+        let active = snapshot.get_card(ProviderId::Agy, Some("acc1")).expect("privat");
+        let reach = active.pool_reach.as_ref().expect("pool");
+        assert!(reach.is_estimate);
+        assert!(!reach.covered, "fehlende Burn-Historie darf kein bestätigtes Grün liefern");
+        assert_eq!(reach.tone(), PoolTone::Estimate);
     }
 }
