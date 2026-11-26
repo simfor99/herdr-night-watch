@@ -188,6 +188,8 @@ def latest_quota(sessions: Path, now: dt.datetime) -> dict | None:
         try:
             with path.open(encoding="utf-8") as handle:
                 for line in handle:
+                    if '"rate_limits"' not in line:
+                        continue
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:

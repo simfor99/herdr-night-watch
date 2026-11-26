@@ -82,12 +82,19 @@ pub struct PoolReach {
     pub covered: bool,
     /// Konto-Label des aktiven Kontos, für den Standby-Hinweis bei 5-h-Erschöpfung.
     pub active_label: Option<String>,
+    /// Anzahl der gesunden Konten im Pool (mindestens 2).
+    pub member_count: usize,
+    /// Kombinierte Restkapazität des Pools in Prozent (Durchschnitt über alle gesunden Pool-Konten, 0..=100).
+    pub combined_pct: u8,
+    /// True, wenn mindestens ein brennendes Pool-Konto am ersten Zyklustag (< 24 h) steht (Tag-1-Schätzung).
+    pub is_estimate: bool,
 }
 
-/// Ampelstufe des Pool-Hinweises: Covered (grün), Tight (gelb), Critical (rot).
+/// Ampelstufe des Pool-Hinweises: Covered (grün), Estimate (Tag-1-Schätzung: grüner Balken, grauer ~-Text), Tight (gelb), Critical (rot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolTone {
     Covered,
+    Estimate,
     Tight,
     Critical,
 }
@@ -100,6 +107,7 @@ struct PoolMember {
     reset_epoch: Option<i64>,
     label: Option<String>,
     is_active: bool,
+    is_estimate: bool,
 }
 
 /// Notreserve in Prozentpunkten, die erst auf dem letzten Konto der Kette angefasst wird.
@@ -110,7 +118,11 @@ fn pool_reach_from_members(members: &[PoolMember], now_epoch: i64, fallback_refi
     if members.len() < 2 {
         return None;
     }
+    let member_count = members.len();
     let total_remaining: f32 = members.iter().map(|m| m.remaining_pct).sum();
+    let combined_pct = (total_remaining / member_count as f32)
+        .round()
+        .clamp(0.0, 100.0) as u8;
     let usable_pool_pct = (total_remaining - POOL_EMERGENCY_RESERVE_PCT).max(0.0);
     let burn: f32 = members.iter().map(|m| m.burn_pct_per_day.max(0.0)).sum();
     let runway_days = if burn > 1e-6 { usable_pool_pct / burn } else { f32::INFINITY };
@@ -122,21 +134,43 @@ fn pool_reach_from_members(members: &[PoolMember], now_epoch: i64, fallback_refi
         .or_else(|| fallback_refill.filter(|epoch| *epoch > now_epoch))?;
     let days_to_refill = (refill_epoch - now_epoch) as f32 / 86_400.0;
     let active_label = members.iter().find(|m| m.is_active).and_then(|m| m.label.clone());
+    let is_estimate = members.iter().any(|m| m.burn_pct_per_day > 1e-6 && m.is_estimate);
     Some(PoolReach {
         runway_days,
         days_to_refill,
         refill_epoch,
         computed_at_epoch: now_epoch,
-        covered: runway_days >= days_to_refill,
+        // Am Tag 1 (< 24 h) keine vorschnelle grüne „Pool deckt sicher“-Freigabe, sondern Estimate.
+        covered: runway_days >= days_to_refill && !is_estimate,
         active_label,
+        member_count,
+        combined_pct,
+        is_estimate,
     })
 }
 
 impl PoolReach {
-    /// Ampelstufe: Covered, wenn der Pool bis zum Reset trägt. Tight, wenn er mindestens die halbe Restzeit trägt, sonst Critical.
+    /// Titel für die Gruppenlimit-Zeile auf der aktiven AGY-Karte.
+    pub fn title_text(&self, language: Language) -> String {
+        match language {
+            Language::German => format!("Gruppen-Limit ({} Konten)", self.member_count),
+            Language::English => format!("Pool Limit ({} accts)", self.member_count),
+        }
+    }
+
+    /// Frühester kommender Wochen-Reset im Pool im Format `D.M. (HH:MM)` für `format_reset_phrase`.
+    #[allow(dead_code)]
+    pub fn refill_reset_raw(&self) -> String {
+        let (month, day, hour, minute) = utc_epoch_to_local_month_day_hm(self.refill_epoch);
+        format!("{day}.{month}. ({hour:02}:{minute:02})")
+    }
+    /// Ampelstufe: Covered (grün) bei belastbarer Abdeckung, Estimate (Tag-1-Schätzung ohne Lücke),
+    /// Tight (gelb) ab halber Restzeit, sonst Critical (rot).
     pub fn tone(&self) -> PoolTone {
         if self.covered {
             PoolTone::Covered
+        } else if self.is_estimate && self.runway_days >= self.days_to_refill {
+            PoolTone::Estimate
         } else if self.runway_days >= 0.5 * self.days_to_refill {
             PoolTone::Tight
         } else {
@@ -184,6 +218,11 @@ impl PoolReach {
             Some(days) => (self.days_to_refill / days, days - self.days_to_refill),
             None => (0.0, f32::INFINITY),
         };
+        if self.tone() == PoolTone::Estimate {
+            // Tag-1-Schätzung ohne Lücke: Tilde statt voreiligem „+Xd Puffer“-Versprechen.
+            return format!("Pool-Pace: ~{pace:.2}x");
+        }
+        let tilde = if self.is_estimate { "~" } else { "" };
         let (german, english) = if buffer.is_infinite() || buffer >= 30.0 {
             ("+>30d Puffer".to_string(), "+>30d buffer".to_string())
         } else if buffer >= 0.0 {
@@ -203,8 +242,8 @@ impl PoolReach {
             }
         };
         match language {
-            Language::German => format!("Pool-Pace: {pace:.2}x · {german}"),
-            Language::English => format!("Pool pace: {pace:.2}x · {english}"),
+            Language::German => format!("Pool-Pace: {tilde}{pace:.2}x · {german}"),
+            Language::English => format!("Pool pace: {tilde}{pace:.2}x · {english}"),
         }
     }
 
@@ -415,13 +454,20 @@ impl ProviderQuota {
         fc
     }
 
-    /// Verbrauchte Wochenrate in Prozentpunkten pro Tag, aus Restanteil und eigener Reichweite. Ohne Reichweite 0.
-    fn pool_burn_pct_per_day(&self) -> f32 {
+    /// Verbrauchte Wochenrate in Prozentpunkten pro Tag sowie Flag, ob das Konto noch im Tag-1-Schätzfenster (< 24 h) liegt.
+    fn pool_burn_and_estimate(&self) -> (f32, bool) {
         let remaining = self.week_percent.unwrap_or(0) as f32;
-        match self.pacing_forecast().runway_days {
+        let fc = self.pacing_forecast();
+        let burn = match fc.runway_days {
             Some(days) if days > 0.0 && remaining > 0.0 => remaining / days,
             _ => 0.0,
-        }
+        };
+        (burn, fc.week_is_estimate)
+    }
+
+    #[cfg(test)]
+    fn pool_burn_pct_per_day(&self) -> f32 {
+        self.pool_burn_and_estimate().0
     }
 
     /// Whether this card may raise the global throttle alarm. An inactive
@@ -1858,8 +1904,13 @@ pub fn pacing_forecast_with_cycle_days(
         return fc;
     }
 
+    // Option 1b: In den ersten 24h nach Zyklusbeginn verhindert der Tagesboden
+    // `max(elapsed_days, 1.0)` eine 24/7-Hochrechnung aus wenigen Vormittagsstunden.
+    // Die Zahl ist bei 1.0 stetig; `~` markiert die Tag-1-Schätzung.
+    let is_day_one = elapsed_days < 1.0;
+    let effective_elapsed = elapsed_days.max(1.0);
     let allowed_rate = 100.0 / total_days;
-    let burn_rate = consumed_pct / elapsed_days;
+    let burn_rate = consumed_pct / effective_elapsed;
     let pace_ratio = burn_rate / allowed_rate;
 
     let five_h_tight = five_hour_forecast
@@ -1910,8 +1961,12 @@ pub fn pacing_forecast_with_cycle_days(
             week_exhaustion_date,
             reset_str: saved_reset,
             today,
-            week_state: WeekForecastState::Active,
-            week_is_estimate: false,
+            week_state: if is_day_one {
+                WeekForecastState::EstimateNeutral
+            } else {
+                WeekForecastState::Active
+            },
+            week_is_estimate: is_day_one,
             projected_week_reserve: None,
             pool_covered: false,
         };
@@ -1941,6 +1996,14 @@ pub fn pacing_forecast_with_cycle_days(
         PacingHealth::OnTrack
     };
 
+    // Bedingte Dämpfung am Tag 1: neutrales Grau nur, solange schon die gedämpfte
+    // Reichweite bis zum Reset reicht. Bei echtem Tag-1-Defizit greifen die Ampelfarben.
+    let week_state = if is_day_one && runway_days >= remaining_days {
+        WeekForecastState::EstimateNeutral
+    } else {
+        WeekForecastState::Active
+    };
+
     let mut fc = PacingForecast {
         pace_ratio: Some(pace_ratio),
         runway_days: Some(runway_days),
@@ -1953,8 +2016,8 @@ pub fn pacing_forecast_with_cycle_days(
         week_exhaustion_date,
         reset_str: saved_reset,
         today,
-        week_state: WeekForecastState::Active,
-        week_is_estimate: false,
+        week_state,
+        week_is_estimate: is_day_one,
         projected_week_reserve: None,
         pool_covered: false,
     };
@@ -2370,6 +2433,9 @@ fn apply_pool_reach_cap(fc: &mut PacingForecast, reach: &PoolReach, now_epoch: i
     {
         return;
     }
+    if !reach.covered {
+        return;
+    }
     let elapsed_days = (now_epoch - reach.computed_at_epoch) as f32 / 86_400.0;
     let runway_now = reach.runway_days - elapsed_days;
     let days_to_refill = (reach.refill_epoch - now_epoch) as f32 / 86_400.0;
@@ -2584,29 +2650,31 @@ pub fn update_snapshot_with_agy_json(snapshot: &mut QuotaSnapshot, json_str: &st
         return;
     }
 
+    let healthy: Vec<usize> = cards
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| card.auth_error.is_none() && card.week_percent.is_some())
+        .map(|(index, _)| index)
+        .collect();
     let pooled_count = value
         .get("pooled_count")
         .and_then(|count| count.as_i64())
-        .unwrap_or(cards.len() as i64);
-    if pooled_count >= 2 {
+        .unwrap_or(healthy.len() as i64);
+    if pooled_count >= 2 || healthy.len() >= 2 {
         let now = current_utc_epoch();
         let fallback_refill = value.get("pool_next_refill_epoch").and_then(|epoch| epoch.as_i64());
-        let healthy: Vec<usize> = cards
-            .iter()
-            .enumerate()
-            .filter(|(_, card)| card.auth_error.is_none() && card.week_percent.is_some())
-            .map(|(index, _)| index)
-            .collect();
         let members: Vec<PoolMember> = healthy
             .iter()
             .map(|&index| {
                 let card = &cards[index];
+                let (burn_pct_per_day, is_estimate) = card.pool_burn_and_estimate();
                 PoolMember {
                     remaining_pct: card.week_percent.unwrap_or(0) as f32,
-                    burn_pct_per_day: card.pool_burn_pct_per_day(),
+                    burn_pct_per_day,
                     reset_epoch: card.week_reset_epoch,
                     label: card.account_label.clone(),
                     is_active: card.is_active_account,
+                    is_estimate,
                 }
             })
             .collect();
@@ -2990,6 +3058,17 @@ pub fn update_snapshot_with_codex_json(snapshot: &mut QuotaSnapshot, json_str: &
     snapshot.last_updated = Some(Instant::now());
 }
 
+/// Applies a Codex fetcher output only when the subprocess succeeded with
+/// non-empty stdout. A failed or empty `wsl.exe` invocation (`None` / `""`)
+/// preserves the last known observation instead of flashing "Keine aktuellen
+/// Daten", while an explicit `"null"` from a healthy fetcher still clears
+/// expired data.
+pub fn apply_codex_fetch_output(snapshot: &mut QuotaSnapshot, stdout: Option<&str>) {
+    if let Some(json) = stdout.map(str::trim).filter(|text| !text.is_empty()) {
+        update_snapshot_with_codex_json(snapshot, json);
+    }
+}
+
 pub fn update_snapshot_with_claude_json(snapshot: &mut QuotaSnapshot, json_str: &str) {
     let value = serde_json::from_str::<serde_json::Value>(json_str).ok();
     let claude = snapshot
@@ -3033,6 +3112,16 @@ pub fn update_snapshot_with_claude_json(snapshot: &mut QuotaSnapshot, json_str: 
     claude.is_throttled = claude.week_percent == Some(0) || claude.five_hour_percent == Some(0);
     snapshot.has_throttle = snapshot.alarm_throttle();
     snapshot.last_updated = Some(Instant::now());
+}
+
+/// Applies a Claude fetcher output only when the subprocess succeeded with
+/// non-empty stdout. Prevents transient `wsl.exe` failures from wiping the
+/// card to "Keine aktuellen Daten" while still allowing explicit `"null"` to
+/// clear expired captures.
+pub fn apply_claude_fetch_output(snapshot: &mut QuotaSnapshot, stdout: Option<&str>) {
+    if let Some(json) = stdout.map(str::trim).filter(|text| !text.is_empty()) {
+        update_snapshot_with_claude_json(snapshot, json);
+    }
 }
 
 /// Qwen payloads already carry remaining percentages (the fetcher converts
@@ -3150,6 +3239,7 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot, show_qwen: bool) -> QuotaSna
         .arg("python3")
         .arg("-c")
         .arg(include_str!("../tools/fetch_agy_quota.py"))
+        .stdin(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|output| output.status.success());
@@ -3168,7 +3258,8 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot, show_qwen: bool) -> QuotaSna
         .arg("-d")
         .arg(&distro)
         .arg("--exec")
-        .arg("/home/simon/projects/herdr-night-watch/tools/fetch_glm.sh");
+        .arg("/home/simon/projects/herdr-night-watch/tools/fetch_glm.sh")
+        .stdin(std::process::Stdio::null());
 
     if let Ok(output) = glm_cmd.output() {
         if output.status.success() {
@@ -3184,12 +3275,15 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot, show_qwen: bool) -> QuotaSna
         .arg("--exec")
         .arg("python3")
         .arg("-c")
-        .arg(include_str!("../tools/fetch_codex_quota.py"));
+        .arg(include_str!("../tools/fetch_codex_quota.py"))
+        .stdin(std::process::Stdio::null());
     let codex_json = codex_cmd.output().ok().filter(|output| output.status.success());
-    update_snapshot_with_codex_json(
+    apply_codex_fetch_output(
         &mut updated,
-        codex_json.as_ref().map(|output| output.stdout.as_slice())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or("null"),
+        codex_json
+            .as_ref()
+            .map(|output| output.stdout.as_slice())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()),
     );
 
     let claude_json = Command::new("wsl.exe")
@@ -3201,16 +3295,16 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot, show_qwen: bool) -> QuotaSna
         .arg("-c")
         .arg(include_str!("../tools/fetch_claude_quota.py"))
         .arg("--read")
+        .stdin(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|output| output.status.success());
-    update_snapshot_with_claude_json(
+    apply_claude_fetch_output(
         &mut updated,
         claude_json
             .as_ref()
             .map(|output| output.stdout.as_slice())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .unwrap_or("null"),
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()),
     );
 
     // The inference key cannot query the QwenCloud billing gateway, so the
@@ -3273,26 +3367,27 @@ pub fn fetch_live_snapshot(current: &QuotaSnapshot, show_qwen: bool) -> QuotaSna
     let codex_json = std::process::Command::new("python3")
         .arg("-c")
         .arg(include_str!("../tools/fetch_codex_quota.py"))
+        .stdin(std::process::Stdio::null())
         .output().ok().filter(|output| output.status.success());
-    update_snapshot_with_codex_json(
+    apply_codex_fetch_output(
         &mut updated,
         codex_json.as_ref().map(|output| output.stdout.as_slice())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or("null"),
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()),
     );
     let claude_json = std::process::Command::new("python3")
         .arg("-c")
         .arg(include_str!("../tools/fetch_claude_quota.py"))
         .arg("--read")
+        .stdin(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|output| output.status.success());
-    update_snapshot_with_claude_json(
+    apply_claude_fetch_output(
         &mut updated,
         claude_json
             .as_ref()
             .map(|output| output.stdout.as_slice())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .unwrap_or("null"),
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()),
     );
     let qwen_json = if show_qwen {
         std::process::Command::new("python3")
@@ -4226,11 +4321,11 @@ mod tests {
 
     #[test]
     fn pool_refill_is_recorded_on_the_active_card_only() {
-        let refill = 1_795_476_540; // 2026-11-23T23:29:00Z
+        let refill = iso_utc_to_epoch("2099-11-23T23:29:00Z").expect("future refill");
         let earlier = agy_pool_json(
             &[
-                agy_account_json("acc1", "personal", false, 0, 0, "2026-11-23T23:29:00Z"),
-                agy_account_json("acc2", "work", true, 98, 40, "2026-11-27T08:08:12Z"),
+                agy_account_json("acc1", "personal", false, 0, 0, "2099-11-23T23:29:00Z"),
+                agy_account_json("acc2", "work", true, 98, 40, "2099-11-27T08:08:12Z"),
             ],
             2,
             Some(refill),
@@ -4242,7 +4337,7 @@ mod tests {
         assert_eq!(snapshot.get_card(ProviderId::Agy, Some("acc1")).expect("acc1").pool_next_refill_epoch, None);
 
         let later = agy_pool_json(
-            &[agy_account_json("acc2", "work", true, 98, 40, "2026-11-20T08:08:12Z")],
+            &[agy_account_json("acc2", "work", true, 98, 40, "2099-11-20T08:08:12Z")],
             2,
             Some(refill),
         );
@@ -4729,11 +4824,12 @@ mod tests {
             Some((10, 17)),
         );
 
-        let elapsed = (24.0 - (19.0 + 44.0 / 60.0) + 10.0 + 17.0 / 60.0) / 24.0;
-        assert!((fc.runway_days.unwrap() - 4.0 * elapsed).abs() < 0.0001);
-        assert!((fc.pace_ratio.unwrap() - 1.4 / elapsed).abs() < 0.0001);
-        assert_eq!(fc.week_runway_text(Language::German), "Reicht noch 2.4 Tage (26.09)");
-        assert!(fc.week_pace_text(Language::German).contains("-4d Defizit"));
+        // Option 1b: ~14.5h into cycle (< 1.0d) uses the 1-day floor (20%/d -> 4.0d runway, ~1.40x pace).
+        assert!(fc.week_is_estimate);
+        assert!((fc.runway_days.unwrap() - 4.0).abs() < 0.0001);
+        assert!((fc.pace_ratio.unwrap() - 1.4).abs() < 0.0001);
+        assert_eq!(fc.week_runway_text(Language::German), "Reicht ~4.0 Tage (28.09)");
+        assert!(fc.week_pace_text(Language::German).contains("~-2d Defizit"));
     }
 
     #[test]
@@ -4744,23 +4840,27 @@ mod tests {
         );
         let elapsed = 629.0 / 1440.0; // 07:35 to 18:04 on cycle day one.
         assert!((fc.remaining_days - (7.0 - elapsed)).abs() < 0.0001);
-        assert!((fc.pace_ratio.unwrap() - 0.35 / elapsed).abs() < 0.0001);
-        assert!((fc.runway_days.unwrap() - 19.0 * elapsed).abs() < 0.0001);
+        // Option 1b: 1-day floor on day one -> 5%/d -> 0.35x pace, 19.0d runway, neutral estimate.
+        assert!(fc.week_is_estimate);
+        assert_eq!(fc.week_state, WeekForecastState::EstimateNeutral);
+        assert!((fc.pace_ratio.unwrap() - 0.35).abs() < 0.0001);
+        assert!((fc.runway_days.unwrap() - 19.0).abs() < 0.0001);
         assert_eq!(fc.health, PacingHealth::Surplus);
         assert!(!fc.week_is_deficit());
-        assert_eq!(fc.week_pace_text(Language::German), "Pace: 0.80x · +2d Reserve");
-        assert_eq!(fc.week_runway_text(Language::German), "Reicht noch 8.3 Tage (20.10)");
     }
 
     #[test]
-    fn weekly_pace_uses_actual_first_hour_instead_of_fixed_elapsed_floor() {
+    fn weekly_pace_on_day_one_uses_one_day_floor_and_estimate_flag() {
         let fc = pacing_forecast_for(
             false, Some(95), Some("18.10. (07:35)"), None, None,
             Some((2026, 10, 11)), Some((8, 35)),
         );
-        assert!((fc.pace_ratio.unwrap() - 8.4).abs() < 0.001);
-        assert!((fc.runway_days.unwrap() - 19.0 / 24.0).abs() < 0.0001);
-        assert!(fc.week_is_deficit());
+        // 1 hour into cycle with 5% used must not extrapolate to 8.4x/day alarm.
+        assert!(fc.week_is_estimate);
+        assert_eq!(fc.week_state, WeekForecastState::EstimateNeutral);
+        assert!((fc.pace_ratio.unwrap() - 0.35).abs() < 0.001);
+        assert!((fc.runway_days.unwrap() - 19.0).abs() < 0.0001);
+        assert!(!fc.week_is_deficit());
     }
 
     #[test]
@@ -5339,14 +5439,18 @@ pub fn standby_five_hour_hint(
     pool.map(|reach| reach.standby_hint_text(language))
 }
 
-/// Dämpft Alarm-Rot der aktiven Wochenkarte auf Gelb, solange der Pool bis zum frühesten Reset trägt.
+/// Dämpft Alarm-Rot der aktiven Wochenkarte auf Gelb, solange der Pool bis zum frühesten Reset trägt
+/// (entweder belastbar `covered` oder am Tag 1 im Schätzton `PoolTone::Estimate`).
 pub fn pool_damps_alarm(
     pool: Option<&crate::quota::PoolReach>,
     is_active: bool,
     is_five_hour: bool,
     is_throttled: bool,
 ) -> bool {
-    is_active && !is_five_hour && !is_throttled && pool.is_some_and(|reach| reach.covered)
+    is_active
+        && !is_five_hour
+        && !is_throttled
+        && pool.is_some_and(|reach| reach.covered || reach.tone() == PoolTone::Estimate)
 }
 
 #[cfg(test)]
@@ -5363,6 +5467,7 @@ mod track56_pool_pacing_tests {
             reset_epoch: Some(NOW + (days_to_reset * DAY) as i64),
             label: Some(label.to_string()),
             is_active: active,
+            is_estimate: false,
         }
     }
 
@@ -5417,6 +5522,9 @@ mod track56_pool_pacing_tests {
                 computed_at_epoch: NOW,
                 covered: false,
                 active_label: None,
+                member_count: 2,
+                combined_pct: 5,
+                is_estimate: false,
             };
             for language in [Language::German, Language::English] {
                 let text = reach.pace_text(language);
@@ -5466,6 +5574,9 @@ mod track56_pool_pacing_tests {
             computed_at_epoch: NOW,
             covered: true,
             active_label: Some("leipzig".to_string()),
+            member_count: 2,
+            combined_pct: 73,
+            is_estimate: false,
         };
         let mut fc = tight_forecast_for_test();
         apply_pool_reach_cap(&mut fc, &reach, NOW, false);
@@ -5482,6 +5593,9 @@ mod track56_pool_pacing_tests {
             computed_at_epoch: NOW,
             covered: false,
             active_label: Some("leipzig".to_string()),
+            member_count: 2,
+            combined_pct: 30,
+            is_estimate: false,
         };
         let mut fc = tight_forecast_for_test();
         apply_pool_reach_cap(&mut fc, &reach, NOW, false);
@@ -5499,6 +5613,9 @@ mod track56_pool_pacing_tests {
             computed_at_epoch: NOW,
             covered: true,
             active_label: None,
+            member_count: 2,
+            combined_pct: 73,
+            is_estimate: false,
         };
         let mut fc = tight_forecast_for_test();
         apply_pool_reach_cap(&mut fc, &reach, NOW + (6.0 * DAY) as i64, false);
@@ -5554,6 +5671,38 @@ mod track56_pool_pacing_tests {
         assert!(burn > 0.0, "Burnrate beim Übernehmen ist {burn}, der Pool wäre fälschlich unbegrenzt");
         let reach = active.pool_reach.as_ref().expect("pool");
         assert!(reach.runway_days.is_finite(), "runway {}", reach.runway_days);
+        assert_eq!(reach.member_count, 2);
+        assert_eq!(reach.combined_pct, 73);
+        assert_eq!(reach.title_text(Language::German), "Gruppen-Limit (2 Konten)");
+        assert_eq!(reach.title_text(Language::English), "Pool Limit (2 accts)");
+    }
+
+    #[test]
+    fn transient_unavailable_preserves_pool_reach_even_when_json_pooled_count_drops_to_one() {
+        let now = current_utc_epoch();
+        let reset_in = |days: f32| iso_for_test(now + (days * 86_400.0) as i64);
+        let healthy = format!(
+            r#"{{"version":1,"active_account":"acc1","pooled_count":2,"pool_next_refill_epoch":null,"accounts":[
+              {{"id":"acc2","label":"leipzig","email":null,"is_active":false,"five_hour_pct":99,"week_pct":99,"week_reset":"{}","auth_state":"ok","auth_error":null}},
+              {{"id":"acc1","label":"privat","email":null,"is_active":true,"five_hour_pct":94,"week_pct":83,"week_reset":"{}","auth_state":"ok","auth_error":null}}
+            ]}}"#,
+            reset_in(6.9),
+            reset_in(6.7),
+        );
+        let flaky = format!(
+            r#"{{"version":1,"active_account":"acc1","pooled_count":1,"pool_next_refill_epoch":null,"accounts":[
+              {{"id":"acc2","label":"leipzig","email":null,"is_active":false,"five_hour_pct":null,"week_pct":null,"week_reset":null,"auth_state":"unavailable","auth_error":"Abruf fehlgeschlagen"}},
+              {{"id":"acc1","label":"privat","email":null,"is_active":true,"five_hour_pct":94,"week_pct":83,"week_reset":"{}","auth_state":"ok","auth_error":null}}
+            ]}}"#,
+            reset_in(6.7),
+        );
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        update_snapshot_with_agy_json(&mut snapshot, &healthy);
+        update_snapshot_with_agy_json(&mut snapshot, &flaky);
+        let active = snapshot.get_card(ProviderId::Agy, Some("acc1")).expect("privat");
+        let reach = active.pool_reach.as_ref().expect("pool_reach must survive transient unavailable");
+        assert_eq!(reach.member_count, 2);
+        assert_eq!(reach.combined_pct, 91);
     }
 
     /// Epoch-Sekunden als ISO-UTC-Zeitstempel (Howard-Hinnant-Umrechnung, nur für Tests).
@@ -5601,6 +5750,9 @@ mod track56_pool_pacing_tests {
             computed_at_epoch: 1_795_000_000,
             covered,
             active_label: Some("leipzig".to_string()),
+            member_count: 2,
+            combined_pct: if covered { 73 } else { 30 },
+            is_estimate: false,
         }
     }
 
@@ -5636,5 +5788,91 @@ mod track56_pool_pacing_tests {
         let uncovered = reach_for_visible_card_test(false);
         assert!(!pool_damps_alarm(Some(&uncovered), true, false, false));
         assert!(!pool_damps_alarm(None, true, false, false));
+    }
+
+    #[test]
+    fn day_one_pool_uses_estimate_tone_without_claiming_covered_and_damps_active_red() {
+        // Heutiges Szenario (Option 1b): 17 % in ~5,5 h am Tag 1 (privat 83 %), Reserve 99 %.
+        // Tagesboden max(elapsed, 1.0) ergibt 17 %/d -> Pool-Runway (83 + 99 - 15) / 17 = 9,82 d.
+        let mut active = member(83.0, 17.0, 6.77, "privat", true);
+        active.is_estimate = true;
+        let reserve = member(99.0, 0.0, 6.98, "leipzig", false);
+        let reach = pool_reach_from_members(&[active, reserve], NOW, None).expect("pool");
+        assert!(reach.is_estimate);
+        assert!(!reach.covered, "am Tag 1 keine vorschnelle grüne Abdeckungs-Zusage");
+        assert_eq!(reach.tone(), PoolTone::Estimate);
+        assert!(reach.runway_days > 9.0 && reach.runway_days < 10.5, "runway={}", reach.runway_days);
+        assert!(reach.pace_text(Language::German).starts_with("Pool-Pace: ~"));
+        assert!(!reach.pace_text(Language::German).contains("Puffer"));
+        assert!(pool_damps_alarm(Some(&reach), true, false, false));
+    }
+
+    #[test]
+    fn day_one_heavy_burn_still_alerts_critical_and_boundary_is_continuous() {
+        // 60 % in 4 h (effective burn = 60 %/d), Reserve 99 %: (40 + 99 - 15) / 60 = 2,07 d < 0,5 * 6,83 d -> Critical (rot).
+        let mut heavy = member(40.0, 60.0, 6.83, "privat", true);
+        heavy.is_estimate = true;
+        let reserve = member(99.0, 0.0, 6.98, "leipzig", false);
+        let reach = pool_reach_from_members(&[heavy, reserve], NOW, None).expect("pool");
+        assert_eq!(reach.tone(), PoolTone::Critical);
+        assert!(!reach.covered);
+        assert!(!pool_damps_alarm(Some(&reach), true, false, false));
+        assert!(reach.pace_text(Language::German).contains("Lücke"));
+
+        // Stetigkeit an elapsed_days == 1.0: 0.958 d und 1.000 d liefern dieselbe Burnrate/Runway.
+        let fc_before = pacing_forecast_with_cycle_days(
+            false,
+            Some(83),
+            Some("02.12. (14:00)"), // 6.000 d übrig -> 1.000 d vergangen
+            None,
+            None,
+            Some(7.0),
+            None,
+            Some((2026, 11, 26)),
+            Some((14, 0)),
+        );
+        let fc_day1 = pacing_forecast_with_cycle_days(
+            false,
+            Some(83),
+            Some("02.12. (15:00)"), // 6.042 d übrig -> 0.958 d vergangen -> Tagesboden 1.0
+            None,
+            None,
+            Some(7.0),
+            None,
+            Some((2026, 11, 26)),
+            Some((14, 0)),
+        );
+        assert!(fc_day1.week_is_estimate);
+        assert!(!fc_before.week_is_estimate);
+        assert!((fc_day1.runway_days.unwrap() - fc_before.runway_days.unwrap()).abs() < 0.05);
+    }
+
+    #[test]
+    fn failed_codex_and_claude_subprocesses_preserve_previous_quota_while_explicit_null_clears() {
+        let mut snapshot = QuotaSnapshot::measured_baseline();
+        apply_codex_fetch_output(
+            &mut snapshot,
+            Some(r#"{"week":{"remaining_percent":28,"consumed_percent":72.0,"reset_epoch":4102444800,"observed_epoch":1795700000,"source":"app_server","window_minutes":10080}}"#),
+        );
+        apply_claude_fetch_output(
+            &mut snapshot,
+            Some(r#"{"week":{"used_percentage":6.0,"resets_at":4102444800}}"#),
+        );
+        assert_eq!(snapshot.get_card(ProviderId::Codex, None).unwrap().week_percent, Some(28));
+        assert_eq!(snapshot.get_card(ProviderId::Claude, None).unwrap().week_percent, Some(94));
+
+        // Transient wsl.exe failure (None) or empty stdout must NOT flash "Keine aktuellen Daten".
+        apply_codex_fetch_output(&mut snapshot, None);
+        apply_codex_fetch_output(&mut snapshot, Some("   "));
+        apply_claude_fetch_output(&mut snapshot, None);
+        apply_claude_fetch_output(&mut snapshot, Some(""));
+        assert_eq!(snapshot.get_card(ProviderId::Codex, None).unwrap().week_percent, Some(28));
+        assert_eq!(snapshot.get_card(ProviderId::Claude, None).unwrap().week_percent, Some(94));
+
+        // Explicit "null" from a healthy fetcher still clears expired/absent data honestly.
+        apply_codex_fetch_output(&mut snapshot, Some("null"));
+        apply_claude_fetch_output(&mut snapshot, Some("null"));
+        assert_eq!(snapshot.get_card(ProviderId::Codex, None).unwrap().week_percent, None);
+        assert_eq!(snapshot.get_card(ProviderId::Claude, None).unwrap().week_percent, None);
     }
 }
