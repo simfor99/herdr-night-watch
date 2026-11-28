@@ -55,6 +55,22 @@ DEFAULT_UNIT_DIR = "~/.config/systemd/user"
 SLOT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 DAY_S = 86400.0
 
+# Retention-Deckel für AGY-Profil-Logs (profiles/agy/<slot>/.gemini/antigravity-cli/log/) und events.jsonl
+AGY_PROFILE_LOG_NAME_RE = re.compile(r"^cli-\d{8}_\d{6}(?:[._-][A-Za-z0-9]+)?\.log$")
+AGY_PROFILE_LOG_MAX_FILES = 100
+AGY_PROFILE_LOG_MAX_AGE_S = 3 * DAY_S
+AGY_PROFILE_LOG_BATCH_LIMIT = 1000
+AGY_PROFILE_LOG_PRUNE_COOLDOWN_S = 600.0
+AGY_PROFILE_LOG_PRUNE_STAMP_NAME = ".log-prune.stamp"
+
+EVENTS_FILE = "events.jsonl"
+EVENTS_LOCK_FILE = "events.lock"
+EVENTS_LOCK_TIMEOUT_S = 0.5
+EVENTS_LOCK_POLL_S = 0.02
+EVENTS_MAX_BYTES = 5 * 1024 * 1024
+EVENTS_MAX_LINES = 5000
+EVENTS_KEEP_LINES = 2500
+
 
 class CliError(Exception):
     def __init__(self, message: str, exit_code: int = 1) -> None:
@@ -122,6 +138,7 @@ class AgyAdapter:
     token_rel = Path(".gemini/antigravity-cli/antigravity-oauth-token")
     scope_rel = Path(".config/antigravity/credential-user-scope")
     onboarding_rel = Path(".gemini/antigravity-cli/cache/onboarding.json")
+    log_dir_rel = Path(".gemini/antigravity-cli/log")
     swap_rels = (token_rel, scope_rel)
     profile_rels = (token_rel, scope_rel, onboarding_rel)
     onboarding_seed = {
@@ -243,13 +260,377 @@ def mirror_live_to_profile(adapter: "AgyAdapter", pdir: Path, token_bytes: bytes
         _unlink_if_present(pdir / adapter.scope_rel)
 
 
+@contextlib.contextmanager
+def _events_lock(lock_path: Path, *, timeout_s: float | None = None) -> Iterator[None]:
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), 0o600)
+    locked = False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("events.lock ist keine reguläre Datei")
+        os.fchmod(fd, 0o600)
+        eff_timeout_s = EVENTS_LOCK_TIMEOUT_S if timeout_s is None else float(timeout_s)
+        deadline = time.monotonic() + max(0.0, eff_timeout_s)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise
+                time.sleep(min(EVENTS_LOCK_POLL_S, remaining))
+        yield
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _compact_events_jsonl_locked(
+    events_path: Path,
+    *,
+    max_bytes: int | None = None,
+    max_lines: int | None = None,
+    keep_lines: int | None = None,
+) -> bool:
+    """Kürzt events.jsonl atomar auf die letzten keep_lines Zeilen, falls über dem Deckel.
+
+    Vorbedingung: _events_lock wird gehalten. Symlinks und Nicht-Regulärdateien werden nie verändert.
+    """
+    eff_max_bytes = EVENTS_MAX_BYTES if max_bytes is None else max_bytes
+    eff_max_lines = EVENTS_MAX_LINES if max_lines is None else max_lines
+    eff_keep_lines = EVENTS_KEEP_LINES if keep_lines is None else keep_lines
+    fd = -1
+    try:
+        fd = os.open(events_path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        size = st.st_size
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            raw = fh.read()
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    lines = raw.splitlines(keepends=True)
+    if size <= eff_max_bytes and len(lines) <= eff_max_lines:
+        return False
+
+    keep_count = max(0, int(eff_keep_lines))
+    kept = lines[-keep_count:] if keep_count > 0 else []
+    if kept and not kept[-1].endswith(b"\n"):
+        kept[-1] = kept[-1] + b"\n"
+    if eff_max_bytes >= 0 and len(kept) > 1:
+        total = sum(len(item) for item in kept)
+        drop_idx = 0
+        while drop_idx < len(kept) - 1 and total > eff_max_bytes:
+            total -= len(kept[drop_idx])
+            drop_idx += 1
+        if drop_idx:
+            kept = kept[drop_idx:]
+    atomic_write(events_path, b"".join(kept), mode=0o600, owner_only=False)
+    return True
+
+
+def compact_events_jsonl(
+    events_path: Path | None = None,
+    *,
+    max_bytes: int | None = None,
+    max_lines: int | None = None,
+    keep_lines: int | None = None,
+) -> bool:
+    """Strikt fail-open Kompaktierung von events.jsonl unter eigenem Kurz-Lock."""
+    try:
+        target = events_path if events_path is not None else (state_dir() / EVENTS_FILE)
+        if target.is_symlink() or not target.exists():
+            return False
+        lock_path = target.parent / EVENTS_LOCK_FILE
+        with _events_lock(lock_path):
+            return _compact_events_jsonl_locked(
+                target,
+                max_bytes=max_bytes,
+                max_lines=max_lines,
+                keep_lines=keep_lines,
+            )
+    except Exception:
+        return False
+
+
+def _open_rel_dir_nofollow(base: Path, rel: Path) -> int | None:
+    """Öffnet base/rel segmentweise mit O_DIRECTORY | O_NOFOLLOW; None wenn ein Segment fehlt oder Symlink ist."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    cur_fd = -1
+    try:
+        cur_fd = os.open(base, flags)
+        for part in rel.parts:
+            if part in ("", ".", ".."):
+                return None
+            next_fd = os.open(part, flags, dir_fd=cur_fd)
+            os.close(cur_fd)
+            cur_fd = next_fd
+        result = cur_fd
+        cur_fd = -1
+        return result
+    except OSError:
+        return None
+    finally:
+        if cur_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(cur_fd)
+
+
+def _prune_cooldown_active(stamp: Path, now: float, cooldown_s: float) -> bool:
+    try:
+        st = os.lstat(stamp)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    elapsed = now - st.st_mtime
+    return 0.0 <= elapsed < cooldown_s
+
+
+def _touch_prune_stamp_safe(stamp: Path, now: float) -> None:
+    fd = -1
+    try:
+        fd = os.open(
+            stamp,
+            os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_TRUNC | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+        )
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return
+        os.fchmod(fd, 0o600)
+        os.write(fd, f"{now:.6f}\n".encode("ascii"))
+        try:
+            os.utime(fd, (now, now))
+        except (TypeError, NotImplementedError, OSError):
+            os.utime(stamp, (now, now), follow_symlinks=False)
+    except OSError:
+        return
+    finally:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _active_cli_log_target_name(profile_dir: Path, log_dir_rel: Path) -> str | None:
+    """Liest den Zielnamen von ../cli.log (falls Symlink in log/), ohne Symlinks zu verfolgen."""
+    try:
+        log_dir = profile_dir / log_dir_rel
+        cli_link = log_dir.parent / "cli.log"
+        if not cli_link.is_symlink():
+            return None
+        target = Path(os.readlink(cli_link))
+        if target.parts == (log_dir.name, target.name):
+            return target.name
+        if target.is_absolute() and target.parent == log_dir:
+            return target.name
+    except OSError:
+        return None
+    return None
+
+
+_UNSET: Any = object()
+
+
+def prune_profile_logs(
+    profile_dir: Path,
+    *,
+    log_dir_rel: Path = AgyAdapter.log_dir_rel,
+    max_files: int | None = None,
+    max_age_s: float | None = _UNSET,
+    batch_limit: int | None = None,
+    cooldown_s: float | None = None,
+    stamp_path: Path | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Ringpuffer-Deckel für zeitgestempelte AGY-Profil-Logs (cli-YYYYMMDD_HHMMSS*.log).
+
+    Strikt fail-open: entfernt ausschließlich reguläre Dateien im log/-Unterordner,
+    niemals cli.log, OAuth-Tokens, .config, brain/, conversations/, accounts.json oder Symlinks.
+    """
+    try:
+        eff_max_files = AGY_PROFILE_LOG_MAX_FILES if max_files is None else max_files
+        eff_max_age_s: float | None = AGY_PROFILE_LOG_MAX_AGE_S if max_age_s is _UNSET else max_age_s
+        eff_batch_limit = AGY_PROFILE_LOG_BATCH_LIMIT if batch_limit is None else batch_limit
+        eff_cooldown_s = AGY_PROFILE_LOG_PRUNE_COOLDOWN_S if cooldown_s is None else cooldown_s
+
+        current = time.time() if now is None else float(now)
+        stamp = stamp_path if stamp_path is not None else (profile_dir / AGY_PROFILE_LOG_PRUNE_STAMP_NAME)
+        if eff_cooldown_s > 0 and _prune_cooldown_active(stamp, current, eff_cooldown_s):
+            return {
+                "checked": False,
+                "deleted": 0,
+                "remaining_excess": 0,
+                "skipped_cooldown": True,
+                "unlink_errors": 0,
+                "error": None,
+            }
+
+        dir_fd = _open_rel_dir_nofollow(profile_dir, log_dir_rel)
+        if dir_fd is None:
+            return {
+                "checked": False,
+                "deleted": 0,
+                "remaining_excess": 0,
+                "skipped_cooldown": False,
+                "unlink_errors": 0,
+                "error": None,
+            }
+
+        try:
+            protected: set[str] = set()
+            active_target = _active_cli_log_target_name(profile_dir, log_dir_rel)
+            if active_target:
+                protected.add(active_target)
+
+            entries: list[tuple[int, str]] = []
+            with os.scandir(dir_fd) as it:
+                for entry in it:
+                    name = entry.name
+                    if not AGY_PROFILE_LOG_NAME_RE.fullmatch(name):
+                        continue
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    entries.append((st.st_mtime_ns, name))
+
+            entries.sort()
+            max_keep = max(0, int(eff_max_files))
+            cutoff_ns = (
+                int((current - eff_max_age_s) * 1_000_000_000)
+                if (eff_max_age_s is not None and eff_max_age_s >= 0)
+                else None
+            )
+            keep_from_idx = max(0, len(entries) - max_keep)
+            candidates: list[str] = []
+            for idx, (mtime_ns, name) in enumerate(entries):
+                if name in protected:
+                    continue
+                if idx < keep_from_idx or (cutoff_ns is not None and mtime_ns < cutoff_ns):
+                    candidates.append(name)
+
+            limit = max(0, int(eff_batch_limit))
+            to_delete = candidates[:limit]
+            deleted = 0
+            unlink_errors = 0
+            first_error: str | None = None
+            for name in to_delete:
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                    deleted += 1
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    unlink_errors += 1
+                    if first_error is None:
+                        first_error = str(exc)
+                    continue
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(dir_fd)
+
+        if eff_cooldown_s > 0:
+            _touch_prune_stamp_safe(stamp, current)
+
+        return {
+            "checked": True,
+            "deleted": deleted,
+            "remaining_excess": max(0, len(candidates) - deleted),
+            "skipped_cooldown": False,
+            "unlink_errors": unlink_errors,
+            "error": first_error,
+        }
+    except Exception as exc:
+        return {
+            "checked": False,
+            "deleted": 0,
+            "remaining_excess": 0,
+            "skipped_cooldown": False,
+            "unlink_errors": 0,
+            "error": str(exc),
+        }
+
+
+def prune_slot_logs(
+    adapter: AgyAdapter,
+    slot_id: str,
+    *,
+    max_files: int | None = None,
+    max_age_s: float | None = _UNSET,
+    batch_limit: int | None = None,
+    cooldown_s: float | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    return prune_profile_logs(
+        profile_root(adapter, slot_id),
+        log_dir_rel=adapter.log_dir_rel,
+        max_files=max_files,
+        max_age_s=max_age_s,
+        batch_limit=batch_limit,
+        cooldown_s=cooldown_s,
+        now=now,
+    )
+
+
+def _prune_provider_logs_safe(adapter: AgyAdapter, *, now: float | None = None) -> None:
+    """Strikt fail-open Retention über alle Profil-Ordner eines Providers und übergroße events.jsonl."""
+    try:
+        profiles_dir = state_dir() / "profiles" / adapter.name
+        if profiles_dir.is_dir() and not profiles_dir.is_symlink():
+            with os.scandir(profiles_dir) as it:
+                for entry in it:
+                    if not SLOT_RE.fullmatch(entry.name):
+                        continue
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    prune_slot_logs(adapter, entry.name, now=now)
+    except Exception:
+        pass
+    try:
+        events_path = state_dir() / EVENTS_FILE
+        st = os.lstat(events_path)
+        if stat.S_ISREG(st.st_mode) and st.st_size > EVENTS_MAX_BYTES:
+            compact_events_jsonl(events_path)
+    except Exception:
+        pass
+
+
 def log_event(event: str, **fields: Any) -> None:
     root = ensure_state()
     record = {"ts": utc_iso(), "event": event}
     record.update({k: v for k, v in fields.items() if v is not None})
-    fd = os.open(root / "events.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    events_path = root / EVENTS_FILE
+    lock_path = root / EVENTS_LOCK_FILE
+    try:
+        with _events_lock(lock_path):
+            fd = os.open(events_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fh.write(line)
+            with contextlib.suppress(Exception):
+                _compact_events_jsonl_locked(events_path)
+    except OSError:
+        fd = os.open(events_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(line)
 
 
 @contextlib.contextmanager
@@ -866,7 +1247,9 @@ def cmd_retire(adapter: AgyAdapter, slot: str, force: bool) -> str:
 
 def cmd_heal(adapter: AgyAdapter) -> str:
     with switch_lock():
-        return heal_locked(adapter)
+        result = heal_locked(adapter)
+    _prune_provider_logs_safe(adapter)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -899,40 +1282,52 @@ def parse_usage_tsv(text: str, adapter: AgyAdapter = ADAPTERS["agy"]) -> dict[st
     return lanes
 
 
-def probe_slot(adapter: AgyAdapter, slot_id: str) -> dict[str, Any]:
+def probe_slot(adapter: AgyAdapter, slot_id: str, *, prune_logs: bool = True) -> dict[str, Any]:
     root = profile_root(adapter, slot_id)
     token = root / adapter.token_rel
     if read_id_email(token) is None:
         return {"auth_state": AUTH_RELOGIN, "lanes": {}}
     env = dict(os.environ, HOME=str(root), BROWSER="false", DISPLAY="", XDG_OPEN="")
     try:
-        proc = subprocess.run(
-            adapter.usage_argv(),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=USAGE_TIMEOUT_S,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, OSError):
+        try:
+            proc = subprocess.run(
+                adapter.usage_argv(),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=USAGE_TIMEOUT_S,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return {"auth_state": AUTH_UNAVAILABLE, "lanes": {}}
+        lanes = parse_usage_tsv(proc.stdout, adapter)
+        if lanes and proc.returncode == 0:
+            return {"auth_state": AUTH_OK, "lanes": lanes}
+        haystack = f"{proc.stdout}\n{proc.stderr}".lower()
+        if any(marker in haystack for marker in adapter.auth_markers):
+            return {"auth_state": AUTH_RELOGIN, "lanes": {}}
         return {"auth_state": AUTH_UNAVAILABLE, "lanes": {}}
-    lanes = parse_usage_tsv(proc.stdout, adapter)
-    if lanes and proc.returncode == 0:
-        return {"auth_state": AUTH_OK, "lanes": lanes}
-    haystack = f"{proc.stdout}\n{proc.stderr}".lower()
-    if any(marker in haystack for marker in adapter.auth_markers):
-        return {"auth_state": AUTH_RELOGIN, "lanes": {}}
-    return {"auth_state": AUTH_UNAVAILABLE, "lanes": {}}
+    finally:
+        if prune_logs:
+            prune_slot_logs(adapter, slot_id)
 
 
-def probe_slots(adapter: AgyAdapter, slots: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def probe_slots(
+    adapter: AgyAdapter,
+    slots: list[dict[str, Any]],
+    *,
+    prune_logs: bool = True,
+) -> dict[str, dict[str, Any]]:
     if not slots:
         return {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(slots)) as pool:
-        futures = {s["id"]: pool.submit(probe_slot, adapter, s["id"]) for s in slots}
+        if prune_logs:
+            futures = {s["id"]: pool.submit(probe_slot, adapter, s["id"]) for s in slots}
+        else:
+            futures = {s["id"]: pool.submit(probe_slot, adapter, s["id"], prune_logs=False) for s in slots}
         return {slot_id: fut.result() for slot_id, fut in futures.items()}
 
 
@@ -1040,7 +1435,8 @@ def fetch_provider_status(
         block = copy.deepcopy(provider_block(load_registry(), adapter))
     # Probes laufen bewusst ohne Lock: agy -p /usage kann bis 12 s dauern.
     active_slots = [s for s in block["slots"] if s.get("state") == ACTIVE]
-    probes = probe_slots(adapter, active_slots)
+    # Bei heal=True bleibt der 2-Argument-Aufruf für bestehende Test-Monkeypatches kompatibel.
+    probes = probe_slots(adapter, active_slots) if heal else probe_slots(adapter, active_slots, prune_logs=False)
     snapshot = build_snapshot(adapter, block, probes, current, heal_result)
     if write_quotas:
         # Ein parallel laufendes retire oder use hat die Auswertung während der Probes überholt. Dann wird
@@ -3346,6 +3742,9 @@ def cmd_auto_switch(
             started_at_utc=started_at_utc,
             deltas_path=deltas_path,
         )
+
+    if not dry_run:
+        _prune_provider_logs_safe(adapter)
 
     result = {
         "provider": adapter.name,
